@@ -1,7 +1,6 @@
 # Build context: monorepo root (.)
 FROM oven/bun:1.3.11 AS base
 WORKDIR /app
-COPY scripts/portless-wrangler.ts /app/scripts/portless-wrangler.ts
 
 FROM base AS pruner
 COPY . .
@@ -15,20 +14,17 @@ RUN apt-get update && \
   rm -rf /var/lib/apt/lists/*
 RUN bun install
 COPY --from=pruner /app/out/full/ ./
-# The production launcher is a root-level script, so Turbo does not include it
-# in the pruned API graph automatically.
-COPY --from=base /app/scripts/portless-wrangler.ts ./scripts/portless-wrangler.ts
 RUN bunx turbo typecheck
 
-FROM oven/bun:1.3.11-slim AS runner
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 
-COPY --from=installer --chown=bun:bun /app /app
-USER bun
+COPY --from=installer --chown=node:node /app /app
+USER node
 
 ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080
 
 WORKDIR /app/apps/api
-CMD ["sh", "-c", "exec bun run dev:app --ip 0.0.0.0"]
+CMD ["sh", "-c", "exec node /app/node_modules/wrangler/bin/wrangler.js dev --ip 0.0.0.0 --port ${PORT:-8080} --inspector-port=$((${PORT:-8080} + 10000))"]
