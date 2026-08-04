@@ -14,6 +14,9 @@ RUN apt-get update && \
   rm -rf /var/lib/apt/lists/*
 RUN bun install
 COPY --from=pruner /app/out/full/ ./
+# The production launcher is a root-level script, so Turbo does not include it
+# in the pruned API graph automatically.
+COPY --from=base /app/scripts/portless-wrangler.ts ./scripts/portless-wrangler.ts
 RUN bunx turbo typecheck
 
 FROM oven/bun:1.3.11-slim AS runner
