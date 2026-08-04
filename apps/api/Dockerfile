@@ -23,8 +23,8 @@ COPY --from=installer --chown=bun:bun /app /app
 USER bun
 
 ENV NODE_ENV=production
-ENV PORT=3472
-EXPOSE 3472
+ENV PORT=8080
+EXPOSE 8080
 
 WORKDIR /app/apps/api
-CMD ["bun", "run", "start"]
+CMD ["sh", "-c", "exec bunx wrangler dev --ip 0.0.0.0 --port ${PORT:-8080}"]
