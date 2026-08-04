@@ -27,4 +27,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 WORKDIR /app/apps/api
-CMD ["sh", "-c", "exec bunx wrangler dev --ip 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "exec bun run dev:app --ip 0.0.0.0 --port ${PORT:-8080} --inspector-port=$((${PORT:-8080} + 10000))"]
