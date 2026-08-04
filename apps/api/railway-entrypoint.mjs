@@ -22,6 +22,7 @@ const varArgs = [
 		"MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY",
 		process.env.MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 	],
+	["MAPLE_ROOT_PASSWORD", process.env.MAPLE_ROOT_PASSWORD ?? "preview-only-root-password"],
 ].flatMap(([name, value]) => ["--var", `${name}:${value}`])
 const child = spawn(
 	process.execPath,
