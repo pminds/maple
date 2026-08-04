@@ -27,4 +27,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 WORKDIR /app/apps/api
-CMD ["sh", "-c", "exec node /app/node_modules/wrangler/bin/wrangler.js dev --ip 0.0.0.0 --port ${PORT:-8080} --inspector-port=$((${PORT:-8080} + 10000))"]
+CMD ["sh", "-c", "exec node /app/apps/api/node_modules/wrangler/bin/wrangler.js dev --ip 0.0.0.0 --port ${PORT:-8080} --inspector-port=$((${PORT:-8080} + 10000))"]
