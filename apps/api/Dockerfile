@@ -16,15 +16,15 @@ RUN bun install
 COPY --from=pruner /app/out/full/ ./
 RUN bunx turbo typecheck
 
-FROM oven/bun:1.3.11-slim AS runner
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 
-COPY --from=installer --chown=bun:bun /app /app
-USER bun
+COPY --from=installer --chown=node:node /app /app
+USER node
 
 ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080
 
 WORKDIR /app/apps/api
-CMD ["sh", "-c", "exec bunx wrangler dev --ip 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["node", "/app/apps/api/railway-entrypoint.mjs"]
