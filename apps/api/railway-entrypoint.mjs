@@ -7,7 +7,7 @@ const config = source.replace(
 	/("localConnectionString"\s*:\s*)"[^"]*"/,
 	(_, prefix) => `${prefix}${JSON.stringify(connectionString)}`,
 )
-const configPath = "/tmp/maple-railway-wrangler.jsonc"
+const configPath = "/app/apps/api/wrangler.railway.jsonc"
 await writeFile(configPath, config)
 
 const port = Number(process.env.PORT ?? "8080")
