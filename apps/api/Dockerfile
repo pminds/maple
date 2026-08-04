@@ -1,6 +1,7 @@
 # Build context: monorepo root (.)
 FROM oven/bun:1.3.11 AS base
 WORKDIR /app
+COPY scripts/portless-wrangler.ts /app/scripts/portless-wrangler.ts
 
 FROM base AS pruner
 COPY . .
