@@ -11,6 +11,18 @@ const configPath = "/app/apps/api/wrangler.railway.jsonc"
 await writeFile(configPath, config)
 
 const port = Number(process.env.PORT ?? "8080")
+const varArgs = [
+	["TINYBIRD_HOST", process.env.TINYBIRD_HOST ?? "https://disabled.invalid"],
+	["TINYBIRD_TOKEN", process.env.TINYBIRD_TOKEN ?? "disabled"],
+	[
+		"MAPLE_INGEST_KEY_ENCRYPTION_KEY",
+		process.env.MAPLE_INGEST_KEY_ENCRYPTION_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+	],
+	[
+		"MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY",
+		process.env.MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+	],
+].flatMap(([name, value]) => ["--var", `${name}:${value}`])
 const child = spawn(
 	process.execPath,
 	[
@@ -25,6 +37,7 @@ const child = spawn(
 		String(port),
 		"--inspector-port",
 		String(port + 10000),
+		...varArgs,
 	],
 	{ env: process.env, stdio: "inherit" },
 )
