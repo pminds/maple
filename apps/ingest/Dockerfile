@@ -14,6 +14,6 @@ RUN apt-get update && \
 
 COPY --from=build /app/target/release/maple-ingest /usr/local/bin/maple-ingest
 
-EXPOSE 3474
+EXPOSE 8080
 
 CMD ["maple-ingest"]
