@@ -46,8 +46,8 @@
 	"dependencies": {},
 	"devDependencies": {
 		"@cloudflare/workers-types": "4.20260603.1",
-		"@effect/platform-node": "4.0.0-beta.101",
-		"@effect/vitest": "4.0.0-beta.101",
+		"@effect/platform-node": "catalog:effect",
+		"@effect/vitest": "catalog:effect",
 		"@maple/infra": "workspace:*",
 		"@tinybirdco/sdk": "catalog:tinybird",
 		"@types/node": "catalog:tooling",
@@ -73,6 +73,8 @@
 			"@effect/atom-react": "4.0.0-beta.101",
 			"@effect/language-service": "^0.86.2",
 			"@effect/platform-bun": "4.0.0-beta.101",
+			"@effect/platform-node": "4.0.0-beta.101",
+			"@effect/vitest": "4.0.0-beta.101",
 			"effect": "4.0.0-beta.101"
 		},
 		"react": {
