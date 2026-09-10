@@ -10,13 +10,11 @@ import {
 	getSpanAttributeValuesResultAtom,
 	getTracesFacetsResultAtom,
 } from "@/lib/services/atoms/warehouse-query-atoms"
-import { QUERY_BUILDER_METRIC_TYPES } from "@/lib/query-builder/model"
+import { QUERY_BUILDER_METRIC_TYPES } from "@maple/query-engine/query-builder"
 import { toNames } from "@/lib/query-builder/autocomplete-utils"
 import type { WhereClauseAutocompleteValues } from "@/lib/query-builder/where-clause-autocomplete"
 
-// ---------------------------------------------------------------------------
 // Context
-// ---------------------------------------------------------------------------
 
 export interface AutocompleteValuesContextType {
 	traces: WhereClauseAutocompleteValues
@@ -44,9 +42,7 @@ export function useAutocompleteValuesContextOptional(): AutocompleteValuesContex
 	return React.use(AutocompleteValuesCtx)
 }
 
-// ---------------------------------------------------------------------------
 // Inner component (must be inside AutocompleteKeysProvider)
-// ---------------------------------------------------------------------------
 
 /**
  * Subscribe to `atom` only once `enabled` is true; until then read a static
@@ -78,7 +74,6 @@ function AutocompleteValuesInner({
 }) {
 	const { activeAttributeKey, activeResourceAttributeKey } = useAutocompleteContext()
 
-	// --- Facets ---
 	const tracesFacetsResult = useGatedAtomValue(
 		getTracesFacetsResultAtom({ data: { startTime, endTime } }),
 		activated,
@@ -88,7 +83,6 @@ function AutocompleteValuesInner({
 		activated,
 	)
 
-	// --- Attribute keys ---
 	const spanAttributeKeysResult = useGatedAtomValue(
 		getSpanAttributeKeysResultAtom({ data: { startTime, endTime } }),
 		activated,
@@ -102,7 +96,6 @@ function AutocompleteValuesInner({
 		activated,
 	)
 
-	// --- Attribute values (lazy, driven by active key) ---
 	const spanAttributeValuesResult = useGatedAtomValue(
 		getSpanAttributeValuesResultAtom({
 			data: { startTime, endTime, attributeKey: activeAttributeKey ?? "" },
@@ -116,7 +109,6 @@ function AutocompleteValuesInner({
 		activated,
 	)
 
-	// --- Derived arrays ---
 	const attributeKeys = React.useMemo(
 		() =>
 			Result.builder(spanAttributeKeysResult)
@@ -161,7 +153,6 @@ function AutocompleteValuesInner({
 		[metricAttributeKeysResult],
 	)
 
-	// --- Assemble autocomplete values ---
 	const value = React.useMemo((): AutocompleteValuesContextType => {
 		const tracesFacets = Result.builder(tracesFacetsResult)
 			.onSuccess((r) => r.data)
@@ -223,9 +214,7 @@ function AutocompleteValuesInner({
 	return <AutocompleteValuesCtx value={value}>{children}</AutocompleteValuesCtx>
 }
 
-// ---------------------------------------------------------------------------
 // Public provider
-// ---------------------------------------------------------------------------
 
 export function AutocompleteValuesProvider({
 	startTime,

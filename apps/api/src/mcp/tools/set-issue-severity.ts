@@ -7,9 +7,9 @@ import {
 } from "./types"
 import { Effect, Option, Schema } from "effect"
 import { createDualContent } from "@/mcp/lib/structured-output"
-import { resolveTenant } from "@/mcp/lib/query-warehouse"
-import { resolveActorId } from "@/mcp/lib/resolve-actor"
-import { ErrorsService } from "@/services/errors/ErrorsService"
+import { CurrentMcpTenant } from "@/mcp/lib/query-warehouse"
+import { resolveActor } from "@/mcp/lib/resolve-actor"
+import { ErrorIssueWorkflowService } from "@/services/errors/ErrorIssueWorkflowService"
 import { ErrorIssueId, IssueSeverity } from "@maple/domain/http"
 
 const decodeIssueId = Schema.decodeUnknownOption(ErrorIssueId)
@@ -27,7 +27,7 @@ export function registerSetIssueSeverityTool(server: McpToolRegistrar) {
 			note: optionalStringParam("Optional reasoning / context, stored on the severity event"),
 		}),
 		Effect.fn("McpTool.setIssueSeverity")(function* ({ issue_id, severity, note }) {
-			const tenant = yield* resolveTenant
+			const tenant = yield* CurrentMcpTenant
 			const decodedIssueId = decodeIssueId(issue_id)
 			if (Option.isNone(decodedIssueId)) {
 				return validationError(
@@ -45,13 +45,14 @@ export function registerSetIssueSeverityTool(server: McpToolRegistrar) {
 			}
 			const target = decodedSeverity.value
 
-			const actorId = yield* resolveActorId(tenant)
-			// API-key-backed agent identities write with "ai" precedence so they
-			// never clobber a human's manual override; interactive user sessions
-			// write the sticky manual override itself.
-			const source = tenant.actorId ? ("ai" as const) : ("manual" as const)
-			const errors = yield* ErrorsService
-			const issue = yield* errors
+			const { actorId, isAgent } = yield* resolveActor(tenant)
+			// Agent identities (pinned via API key/header or derived from the MCP
+			// client name) write with "ai" precedence so they never clobber a
+			// human's manual override; interactive user sessions write the sticky
+			// manual override itself.
+			const source = isAgent ? ("ai" as const) : ("manual" as const)
+			const workflow = yield* ErrorIssueWorkflowService
+			const issue = yield* workflow
 				.setSeverity(tenant.orgId, actorId, decodedIssueId.value, target, { note, source })
 				.pipe(
 					Effect.mapError(

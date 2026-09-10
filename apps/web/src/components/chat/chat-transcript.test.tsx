@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { ChatTranscript, findDiagnosisMessageId } from "./chat-transcript"
@@ -24,9 +24,18 @@ class NoopObserver {
 vi.stubGlobal("ResizeObserver", NoopObserver)
 vi.stubGlobal("IntersectionObserver", NoopObserver)
 
-const message = (id: string, role: "user" | "assistant", text: string): UIMessage =>
-	({ id, role, parts: [{ type: "text", text }] }) as unknown as UIMessage
+/**
+ * The status orb paints to a canvas, and jsdom's `getContext` is a stub that logs
+ * "Not implemented" to stderr on every call. The component already treats a null
+ * context as "don't animate", so returning null is the honest answer here — this
+ * only silences the noise, it doesn't change what's asserted.
+ */
+HTMLCanvasElement.prototype.getContext = () => null
 
+const message = (id: string, role: "user" | "assistant", text: string): UIMessage =>
+	({ id, role, parts: [{ type: "text", text }] }) as UIMessage
+
+// SAFETY: this fixture constructs the exact tool-message variant consumed by ChatTranscript.
 const toolMessage = (id: string, output: unknown): UIMessage =>
 	({
 		id,
@@ -117,6 +126,126 @@ describe("ChatTranscript", () => {
 		expect(items().map((el) => (el as HTMLElement).dataset.messageId)).toEqual(["m1", "__status"])
 	})
 
+	describe("the status orb tracks what the agent is doing", () => {
+		/** An assistant turn stopped mid-call on `toolName`. */
+		// SAFETY: this fixture constructs the in-progress tool variant consumed by ChatTranscript.
+		const runningTool = (id: string, toolName: string): UIMessage =>
+			({
+				id,
+				role: "assistant",
+				parts: [
+					{
+						type: `tool-${toolName}`,
+						toolCallId: `${id}-call`,
+						state: "input-available",
+						input: {},
+					},
+				],
+			}) as unknown as UIMessage
+
+		/** Every animating orb on screen, by accessible name. There should never be more than one. */
+		const orbs = () =>
+			[...document.querySelectorAll("canvas")].map((c) => c.getAttribute("aria-label") ?? "")
+
+		const marker = () => document.querySelector('[data-slot="marker"]')
+
+		it.each([
+			["search_traces", "Searching…"],
+			["run_sql", "Solving…"],
+			["service_map", "Connecting…"],
+			// Unmapped tools fall back rather than needing registration in `toolOrbStates`.
+			["create_dashboard", "Working…"],
+		])("gives a running %s its own orb, and no second one", (toolName, expected) => {
+			render(
+				<ChatTranscript
+					{...baseProps}
+					isLoading
+					messages={[message("m1", "user", "hi"), runningTool("m2", toolName)]}
+				/>,
+			)
+
+			// The tool row is the turn's live edge. A status marker here would repeat it verbatim.
+			expect(orbs()).toEqual([expected])
+			expect(marker()).toBeNull()
+		})
+
+		it("shows the thinking row only when no tool is in flight", () => {
+			render(
+				<ChatTranscript
+					{...baseProps}
+					isLoading
+					messages={[message("m1", "user", "hi"), message("m2", "assistant", "hello")]}
+				/>,
+			)
+
+			expect(marker()?.textContent).toBe("Thinking…")
+			expect(orbs()).toEqual(["Thinking…"])
+		})
+
+		it("puts one orb in the group header, tracking the call actually in flight", () => {
+			// SAFETY: this fixture deliberately mixes settled and in-flight tool parts for the grouping test.
+			const burst = {
+				id: "m2",
+				role: "assistant",
+				parts: [
+					{ type: "tool-search_traces", toolCallId: "a", state: "output-available", output: "{}" },
+					{ type: "tool-list_services", toolCallId: "b", state: "output-available", output: "{}" },
+					{ type: "tool-run_sql", toolCallId: "c", state: "input-available", input: {} },
+				],
+			} as unknown as UIMessage
+
+			render(
+				<ChatTranscript {...baseProps} isLoading messages={[message("m1", "user", "hi"), burst]} />,
+			)
+
+			// Collapsed group: the header is the only live thing, and it reads as the running call.
+			expect(orbs()).toEqual(["Solving…"])
+			expect(marker()).toBeNull()
+			expect(screen.getByText("Run Sql")).toBeTruthy()
+			expect(screen.getByText("2/3")).toBeTruthy()
+		})
+
+		it("keeps a single orb when an expanded group has several calls in flight", () => {
+			const parts = Array.from({ length: 12 }, (_, i) => ({
+				type: "tool-search_traces",
+				toolCallId: `c${i}`,
+				// Two still running: without the live/grouped split these would each add a canvas.
+				state: i < 10 ? "output-available" : "input-available",
+				input: {},
+				output: i < 10 ? "{}" : undefined,
+			}))
+			const burst = { id: "m2", role: "assistant", parts } as UIMessage
+
+			render(
+				<ChatTranscript {...baseProps} isLoading messages={[message("m1", "user", "hi"), burst]} />,
+			)
+			fireEvent.click(screen.getAllByRole("button")[0]!)
+
+			expect(orbs()).toEqual(["Searching…"])
+		})
+
+		it("yields to streaming prose — the text is the progress signal at that point", () => {
+			const streaming = {
+				id: "m2",
+				role: "assistant",
+				parts: [
+					{ type: "tool-search_traces", toolCallId: "a", state: "input-available", input: {} },
+					{ type: "text", text: "Here's what I found", state: "streaming" },
+				],
+			} as UIMessage
+
+			render(
+				<ChatTranscript
+					{...baseProps}
+					isLoading
+					messages={[message("m1", "user", "hi"), streaming]}
+				/>,
+			)
+
+			expect(marker()).toBeNull()
+		})
+	})
+
 	it("offers copy actions on assistant turns only", () => {
 		render(
 			<ChatTranscript
@@ -171,6 +300,7 @@ describe("ChatTranscript", () => {
 	// An agent loop emits one message per round-trip; six of them used to read as six
 	// identical `Used 2 tools` cards stacked down the page.
 	it("collapses a run of tool-only turns into a single tool group", () => {
+		// SAFETY: this fixture constructs the repeated tool-only message variant consumed by ChatTranscript.
 		const burst = (id: string): UIMessage =>
 			({
 				id,
@@ -225,7 +355,7 @@ describe("machine-written turns", () => {
 			id,
 			role: "user",
 			parts: [{ type: "text", text: wrapChatContext(block, said) }],
-		}) as unknown as UIMessage
+		}) as UIMessage
 
 	// `apps/api` opens an investigation by sending a JSON snapshot as a user turn.
 	// Now that user turns are durable it replays to every reader, and nobody typed it.
@@ -242,5 +372,54 @@ describe("machine-written turns", () => {
 
 		expect(screen.getByText("Why is it slow?")).toBeTruthy()
 		expect(screen.queryByText(/subject: api/)).toBeNull()
+	})
+})
+
+describe("ChatTranscript sub-agent cards", () => {
+	const taskMessage = (status: "running" | "completed" = "completed"): UIMessage =>
+		({
+			id: "m1",
+			role: "assistant",
+			parts: [
+				{
+					type: "task",
+					toolCallId: "t1",
+					agent: "explore",
+					description: "trace checkout latency",
+					status,
+					messages: [
+						{
+							id: "c1",
+							role: "assistant",
+							parts: [{ type: "text", text: "p99 is 4.2s in checkout-api.", state: "done" }],
+						},
+					],
+				},
+			],
+		}) as UIMessage
+
+	it("renders a collapsed card naming the sub-agent and what it was asked", () => {
+		render(<ChatTranscript {...baseProps} messages={[taskMessage()]} />)
+
+		expect(screen.getByText("explore")).toBeTruthy()
+		expect(screen.getByText("trace checkout latency")).toBeTruthy()
+		// Collapsed by default: the point of delegating is that the parent thread does not carry
+		// the sub-agent's search.
+		expect(screen.queryByText("p99 is 4.2s in checkout-api.")).toBeNull()
+	})
+
+	it("expands to the sub-agent's own transcript on click", () => {
+		render(<ChatTranscript {...baseProps} messages={[taskMessage()]} />)
+
+		fireEvent.click(screen.getByText("explore"))
+		expect(screen.getByText("p99 is 4.2s in checkout-api.")).toBeTruthy()
+	})
+
+	it("never folds a sub-agent into a Used N tools header", () => {
+		// A sub-agent run is content, not plumbing.
+		render(<ChatTranscript {...baseProps} messages={[taskMessage()]} />)
+
+		expect(screen.queryByText(/Used \d+ tools/)).toBeNull()
+		expect(items().map((el) => (el as HTMLElement).dataset.messageId)).toEqual(["m1"])
 	})
 })

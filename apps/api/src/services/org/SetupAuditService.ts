@@ -19,15 +19,15 @@ import { clickHouseSchemaVersion } from "@maple/domain/clickhouse"
 import type { OrgId } from "@maple/domain/primitives"
 import {
 	type ConfigAuditInputs,
+	SetupAuditUnavailableError,
 	type SetupAuditReport,
 	type TraceCompletenessInputs,
 	type WarehouseAuditInputs,
 	runSetupAudit,
 } from "@maple/domain/setup-audit"
 import { CH, formatWarehouseDateTime } from "@maple/query-engine"
-import { CHNumber } from "@maple/query-engine/ch"
 import { and, eq, sql } from "drizzle-orm"
-import { Clock, Context, Effect, Layer, Schema } from "effect"
+import { Clock, Context, Effect, Layer } from "effect"
 import type { TenantContext } from "@/services/auth/AuthService"
 import { Database, type DatabaseError } from "@/platform/DatabaseLive"
 import { WarehouseQueryService } from "@/services/warehouse/WarehouseQueryService"
@@ -45,33 +45,14 @@ const TRACE_WINDOW_MINUTES = 60
 const TRACE_WINDOW_LAG_MINUTES = 15
 const TRACE_PARENT_LOOKBACK_MINUTES = 60
 
-export class SetupAuditError extends Schema.TaggedErrorClass<SetupAuditError>()(
-	"@maple/api/services/SetupAuditError",
-	{ message: Schema.String },
-) {}
-
-export interface SetupAuditServiceShape {
+export interface SetupAuditServiceApi {
 	/** Runs every check against a fresh snapshot of config + telemetry. */
-	readonly run: (tenant: TenantContext) => Effect.Effect<SetupAuditReport, SetupAuditError>
+	readonly run: (tenant: TenantContext) => Effect.Effect<SetupAuditReport, SetupAuditUnavailableError>
 }
 
 const msOrNull = (value: Date | null | undefined): number | null => value?.getTime() ?? null
 
-/**
- * `serviceUsageQuery` ships without a row schema; the audit needs one because every column is a
- * 64-bit sum, which BYO-ClickHouse serializes as a JSON string.
- */
-const serviceUsageRowSchema = Schema.Struct({
-	serviceName: Schema.String,
-	totalLogCount: CHNumber,
-	totalTraceCount: CHNumber,
-	totalSumMetricCount: CHNumber,
-	totalGaugeMetricCount: CHNumber,
-	totalHistogramMetricCount: CHNumber,
-	totalExpHistogramMetricCount: CHNumber,
-})
-
-const make: Effect.Effect<SetupAuditServiceShape, never, Database | WarehouseQueryService> = Effect.gen(
+const make: Effect.Effect<SetupAuditServiceApi, never, Database | WarehouseQueryService> = Effect.gen(
 	function* () {
 		const database = yield* Database
 		const warehouse = yield* WarehouseQueryService
@@ -79,14 +60,21 @@ const make: Effect.Effect<SetupAuditServiceShape, never, Database | WarehouseQue
 		const runDb = <A>(
 			operation: string,
 			effect: Effect.Effect<A, DatabaseError>,
-		): Effect.Effect<A, SetupAuditError> =>
+		): Effect.Effect<A, SetupAuditUnavailableError> =>
 			effect.pipe(
 				Effect.tapCause((cause) =>
 					Effect.logError("Setup audit database read failed").pipe(
 						Effect.annotateLogs({ operation, cause }),
 					),
 				),
-				Effect.mapError((error) => new SetupAuditError({ message: error.message })),
+				Effect.mapError(
+					(error) =>
+						new SetupAuditUnavailableError({
+							message: "Setup audit configuration could not be read",
+							operation,
+							cause: error,
+						}),
+				),
 			)
 
 		/**
@@ -372,6 +360,10 @@ const make: Effect.Effect<SetupAuditServiceShape, never, Database | WarehouseQue
 				traceSampleModulus: Integrations.auditTraceSampleModulus(spanCountOverLookback),
 			}
 
+			// Warm the route before fanning out, so the org-config read happens on an
+			// empty connection pool rather than queueing behind a sibling's warehouse
+			// fetch. No-op on a warm memo.
+			yield* warehouse.warmRoute(tenant)
 			const joined = yield* Effect.all(
 				{
 					orphans: warehouse.compiledQuery(tenant, Integrations.auditOrphanSpansSQL(window), {
@@ -419,59 +411,38 @@ const make: Effect.Effect<SetupAuditServiceShape, never, Database | WarehouseQue
 				endTime: formatWarehouseDateTime(now),
 			}
 
-			const run = <A>(
-				compiled: Parameters<typeof warehouse.compiledQuery<A>>[1],
-				profile: "discovery" | "list",
-			) => warehouse.compiledQuery(tenant, compiled, { profile, context: "setupAudit" })
+			const run = <A>(compiled: CH.CompiledQueryInput<A>, profile: "discovery" | "list") =>
+				warehouse.compiledQuery(tenant, compiled, { profile, context: "setupAudit" })
 
+			// Same reason as `fetchTraceCompleteness`. Both are independent entry
+			// points, so each warms; whichever runs second finds the memo warm and
+			// pays nothing.
+			yield* warehouse.warmRoute(tenant)
 			const results = yield* Effect.all(
 				{
-					usage: run(
-						CH.compile(CH.serviceUsageQuery({}), window, { rowSchema: serviceUsageRowSchema }),
-						"discovery",
-					),
+					usage: run(CH.compile(CH.serviceUsageQuery({}), window), "discovery"),
 					attributeKeys: run(
-						CH.compile(Integrations.auditAttributeKeyInventoryQuery(), window, {
-							rowSchema: Integrations.auditAttributeKeyInventoryRowSchema,
-						}),
+						CH.compile(Integrations.auditAttributeKeyInventoryQuery(), window),
 						"discovery",
 					),
 					// `list`, not `discovery`: an org whose span names carry IDs — the very thing NAME-02
 					// detects — inflates traces_aggregates_hourly past a 5s budget.
-					spanShape: run(
-						CH.compile(Integrations.auditSpanShapeByServiceQuery(), window, {
-							rowSchema: Integrations.auditSpanShapeRowSchema,
-						}),
-						"list",
-					),
+					spanShape: run(CH.compile(Integrations.auditSpanProfileByServiceQuery(), window), "list"),
 					logSeverity: run(
-						CH.compile(Integrations.auditLogSeverityByServiceQuery(), window, {
-							rowSchema: Integrations.auditLogSeverityRowSchema,
-						}),
+						CH.compile(Integrations.auditLogSeverityByServiceQuery(), window),
 						"discovery",
 					),
 					metricLabels: run(
-						CH.compile(Integrations.auditMetricLabelCardinalityQuery(), window, {
-							rowSchema: Integrations.auditMetricLabelRowSchema,
-						}),
+						CH.compile(Integrations.auditMetricLabelCardinalityQuery(), window),
 						"discovery",
 					),
 					peerValues: run(
-						CH.compile(Integrations.auditPeerValueInventoryQuery(), window, {
-							rowSchema: Integrations.auditPeerValueRowSchema,
-						}),
+						CH.compile(Integrations.auditPeerValueInventoryQuery(), window),
 						"discovery",
 					),
-					dbEdges: run(
-						CH.compile(Integrations.auditDbEdgeIdentityQuery(), window, {
-							rowSchema: Integrations.auditDbEdgeRowSchema,
-						}),
-						"discovery",
-					),
+					dbEdges: run(CH.compile(Integrations.auditDbEdgeIdentityQuery(), window), "discovery"),
 					logCorrelation: run(
-						CH.compile(Integrations.auditLogCorrelationQuery(), logWindow, {
-							rowSchema: Integrations.auditLogCorrelationRowSchema,
-						}),
+						CH.compile(Integrations.auditLogCorrelationQuery(), logWindow),
 						"list",
 					),
 				},
@@ -565,11 +536,11 @@ const make: Effect.Effect<SetupAuditServiceShape, never, Database | WarehouseQue
 			return report
 		})
 
-		return { run } satisfies SetupAuditServiceShape
+		return { run } satisfies SetupAuditServiceApi
 	},
 )
 
-export class SetupAuditService extends Context.Service<SetupAuditService, SetupAuditServiceShape>()(
+export class SetupAuditService extends Context.Service<SetupAuditService, SetupAuditServiceApi>()(
 	"@maple/api/services/SetupAuditService",
 	{ make },
 ) {

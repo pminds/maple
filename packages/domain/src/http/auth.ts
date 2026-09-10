@@ -1,7 +1,7 @@
 import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
 import { Schema } from "effect"
 import { OrgId, UserId } from "../primitives"
-import { Authorization, TenantSchema } from "./current-tenant"
+import { Authorization, TenantSchema, UnauthorizedError } from "./current-tenant"
 
 export class CliDeviceStartRequest extends Schema.Class<CliDeviceStartRequest>("CliDeviceStartRequest")({
 	deviceName: Schema.String,
@@ -68,31 +68,31 @@ export class CliDeviceActionResponse extends Schema.Class<CliDeviceActionRespons
 	},
 ) {}
 
-export class CliDeviceNotFoundError extends Schema.TaggedErrorClass<CliDeviceNotFoundError>()(
+export class CliDeviceNotFoundError extends Schema.TaggedError<CliDeviceNotFoundError>()(
 	"@maple/http/errors/CliDeviceNotFoundError",
 	{ message: Schema.String },
 	{ httpApiStatus: 404 },
 ) {}
 
-export class CliDeviceExpiredError extends Schema.TaggedErrorClass<CliDeviceExpiredError>()(
+export class CliDeviceExpiredError extends Schema.TaggedError<CliDeviceExpiredError>()(
 	"@maple/http/errors/CliDeviceExpiredError",
 	{ message: Schema.String },
 	{ httpApiStatus: 410 },
 ) {}
 
-export class CliDeviceConflictError extends Schema.TaggedErrorClass<CliDeviceConflictError>()(
+export class CliDeviceConflictError extends Schema.TaggedError<CliDeviceConflictError>()(
 	"@maple/http/errors/CliDeviceConflictError",
 	{ message: Schema.String },
 	{ httpApiStatus: 409 },
 ) {}
 
-export class CliDevicePersistenceError extends Schema.TaggedErrorClass<CliDevicePersistenceError>()(
+export class CliDevicePersistenceError extends Schema.TaggedError<CliDevicePersistenceError>()(
 	"@maple/http/errors/CliDevicePersistenceError",
 	{ message: Schema.String },
 	{ httpApiStatus: 503 },
 ) {}
 
-export class CliDeviceRateLimitError extends Schema.TaggedErrorClass<CliDeviceRateLimitError>()(
+export class CliDeviceRateLimitError extends Schema.TaggedError<CliDeviceRateLimitError>()(
 	"@maple/http/errors/CliDeviceRateLimitError",
 	{ message: Schema.String },
 	{ httpApiStatus: 429 },
@@ -116,25 +116,25 @@ export class McpOAuthAuthorizationActionResponse extends Schema.Class<McpOAuthAu
 	redirectUri: Schema.String,
 }) {}
 
-export class McpOAuthAuthorizationNotFoundError extends Schema.TaggedErrorClass<McpOAuthAuthorizationNotFoundError>()(
+export class McpOAuthAuthorizationNotFoundError extends Schema.TaggedError<McpOAuthAuthorizationNotFoundError>()(
 	"@maple/http/errors/McpOAuthAuthorizationNotFoundError",
 	{ message: Schema.String },
 	{ httpApiStatus: 404 },
 ) {}
 
-export class McpOAuthAuthorizationExpiredError extends Schema.TaggedErrorClass<McpOAuthAuthorizationExpiredError>()(
+export class McpOAuthAuthorizationExpiredError extends Schema.TaggedError<McpOAuthAuthorizationExpiredError>()(
 	"@maple/http/errors/McpOAuthAuthorizationExpiredError",
 	{ message: Schema.String },
 	{ httpApiStatus: 410 },
 ) {}
 
-export class McpOAuthAuthorizationConflictError extends Schema.TaggedErrorClass<McpOAuthAuthorizationConflictError>()(
+export class McpOAuthAuthorizationConflictError extends Schema.TaggedError<McpOAuthAuthorizationConflictError>()(
 	"@maple/http/errors/McpOAuthAuthorizationConflictError",
 	{ message: Schema.String },
 	{ httpApiStatus: 409 },
 ) {}
 
-export class McpOAuthPersistenceError extends Schema.TaggedErrorClass<McpOAuthPersistenceError>()(
+export class McpOAuthPersistenceError extends Schema.TaggedError<McpOAuthPersistenceError>()(
 	"@maple/http/errors/McpOAuthPersistenceError",
 	{ message: Schema.String },
 	{ httpApiStatus: 503 },
@@ -144,15 +144,25 @@ export class SelfHostedLoginRequest extends Schema.Class<SelfHostedLoginRequest>
 	password: Schema.String,
 }) {}
 
+/**
+ * `expiresAt` is when THIS token stops verifying; `sessionExpiresAt` is when the
+ * login behind it can no longer be renewed and the root password is required
+ * again. Both are epoch millis (the repo-wide wire convention) even though the
+ * JWT claims they derive from are RFC 7519 seconds — the conversion belongs at
+ * this boundary, not in every client. A client renews before `expiresAt` and
+ * sends the operator back to the login screen at `sessionExpiresAt`.
+ */
 export class SelfHostedLoginResponse extends Schema.Class<SelfHostedLoginResponse>("SelfHostedLoginResponse")(
 	{
 		token: Schema.String,
 		orgId: OrgId,
 		userId: UserId,
+		expiresAt: Schema.Number,
+		sessionExpiresAt: Schema.Number,
 	},
 ) {}
 
-export class SelfHostedAuthDisabledError extends Schema.TaggedErrorClass<SelfHostedAuthDisabledError>()(
+export class SelfHostedAuthDisabledError extends Schema.TaggedError<SelfHostedAuthDisabledError>()(
 	"@maple/http/errors/SelfHostedAuthDisabledError",
 	{
 		message: Schema.String,
@@ -160,7 +170,7 @@ export class SelfHostedAuthDisabledError extends Schema.TaggedErrorClass<SelfHos
 	{ httpApiStatus: 400 },
 ) {}
 
-export class SelfHostedInvalidPasswordError extends Schema.TaggedErrorClass<SelfHostedInvalidPasswordError>()(
+export class SelfHostedInvalidPasswordError extends Schema.TaggedError<SelfHostedInvalidPasswordError>()(
 	"@maple/http/errors/SelfHostedInvalidPasswordError",
 	{
 		message: Schema.String,
@@ -196,6 +206,18 @@ export class AuthApiGroup extends HttpApiGroup.make("auth")
 	.add(
 		HttpApiEndpoint.get("session", "/session", {
 			success: TenantSchema,
+		}),
+	)
+	// Renewal for self-hosted sessions, whose tokens are deliberately short-lived.
+	// It sits in the authenticated group because the presented token IS the
+	// credential: an expired one is rejected by the middleware and the operator
+	// re-enters the root password, which is the intended end of a session.
+	// Clerk-mode deployments get `SelfHostedAuthDisabledError` — Clerk renews its
+	// own sessions.
+	.add(
+		HttpApiEndpoint.post("sessionRefresh", "/session/refresh", {
+			success: SelfHostedLoginResponse,
+			error: [SelfHostedAuthDisabledError, UnauthorizedError],
 		}),
 	)
 	.add(

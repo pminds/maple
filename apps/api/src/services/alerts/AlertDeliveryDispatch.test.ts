@@ -1,5 +1,12 @@
 import type { AlertDestinationRow } from "@maple/db"
-import { AlertDeliveryError, AlertDestinationId } from "@maple/domain/http"
+import {
+	AlertDeliveryAuthError,
+	AlertDeliveryError,
+	AlertDeliveryRejectedError,
+	AlertDeliveryTargetMissingError,
+	AlertDestinationId,
+	UNGROUPED_GROUP_KEY,
+} from "@maple/domain/http"
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Fiber, Schema } from "effect"
 import { TestClock } from "effect/testing"
@@ -10,11 +17,11 @@ import {
 	buildSlackBlocksFromTemplate,
 	buildSlackFallbackText,
 	buildTemplateContext,
-	dispatchDelivery,
 	type DispatchContext,
-	type DispatchDeps,
-	type TemplateRenderContext,
 } from "./AlertDeliveryDispatch"
+import { dispatchDelivery, type DispatchDeps } from "./delivery/dispatch"
+import type { TemplateRenderContext } from "./alert-formatting"
+import { resolveSignalDisplay } from "./alert-signal-display"
 import { renderTemplate } from "./alert-templating/renderer"
 import { DEFAULT_BODY_TEMPLATE, DEFAULT_TITLE_TEMPLATE } from "./alert-templating/defaultTemplates"
 
@@ -105,6 +112,11 @@ describe("buildTemplateContext", () => {
 		assert.strictEqual(ctx.thresholdUpper, "")
 	})
 
+	it("renders the ungrouped sentinel as `all`, never as `__total__`", () => {
+		const ungrouped = buildTemplateContext({ ...baseContext, groupKey: UNGROUPED_GROUP_KEY }, LINK, CHAT)
+		assert.strictEqual(ungrouped.group, "all")
+	})
+
 	it("renders the default templates without any missing variables", () => {
 		const title = renderTemplate(DEFAULT_TITLE_TEMPLATE, ctx)
 		const body = renderTemplate(DEFAULT_BODY_TEMPLATE, ctx)
@@ -163,6 +175,22 @@ describe("buildSlackBlocks (default format)", () => {
 		assert.isTrue(section.fields.some((f) => f.text.includes("\u{1F534} Critical")))
 	})
 
+	/**
+	 * Regression: an ungrouped rule stores `UNGROUPED_GROUP_KEY` ("__total__")
+	 * as its group key — a storage sentinel, not a group anyone named — and it
+	 * was rendering verbatim as a `Group` field reading `__total__`.
+	 */
+	it("treats the ungrouped sentinel as no grouping at all", () => {
+		const fields = (
+			buildSlackBlocks({ ...baseContext, groupKey: UNGROUPED_GROUP_KEY }, LINK, CHAT)[1] as SectionBlock
+		).fields
+		assert.isFalse(
+			fields.some((field) => field.text.startsWith("*Group*")),
+			"the ungrouped sentinel must not render a Group field",
+		)
+		for (const field of fields) assert.notInclude(field.text, "__total__")
+	})
+
 	it("omits the group field when the rule has no grouping, escapes it when present", () => {
 		const without = (buildSlackBlocks(baseContext, LINK, CHAT)[1] as SectionBlock).fields
 		assert.isFalse(without.some((f) => f.text.startsWith("*Group*")))
@@ -196,6 +224,55 @@ describe("buildSlackBlocks (default format)", () => {
 			CHAT,
 		)[1] as SectionBlock
 		assert.include(resolved.text.text, "back within its threshold (between 1% and 5%)")
+	})
+
+	/**
+	 * Regression: a query-driven rule used to render its query-kind enum as the
+	 * metric name and its value as a bare unpunctuated integer —
+	 * "*builder_query* is *1041923*".
+	 */
+	it("names what a builder_query rule measures instead of its query kind", () => {
+		const section = buildSlackBlocks(
+			{
+				...baseContext,
+				ruleName: "Slow DB queries",
+				signalType: "builder_query",
+				signalDisplay: { label: "p95(duration)", unit: "ms" },
+				threshold: 500000,
+				value: 1041923,
+			},
+			LINK,
+			CHAT,
+		)[1] as SectionBlock
+		assert.include(section.text.text, "*p95(duration)* is *1,041,923ms*")
+		assert.include(section.text.text, "above the 500,000ms threshold")
+		assert.notInclude(section.text.text, "builder_query")
+	})
+
+	it("resolves a metrics rule's name from its stored draft, end to end", () => {
+		const section = buildSlackBlocks(
+			{
+				...baseContext,
+				ruleName: "DB duration",
+				signalType: "builder_query",
+				signalDisplay: resolveSignalDisplay({
+					signalType: "builder_query",
+					queryBuilderDraft: {
+						id: "q1",
+						name: "Query A",
+						dataSource: "metrics",
+						aggregation: "sum",
+						metricName: "db.query.duration",
+					},
+				}),
+				threshold: 500000,
+				value: 1041923,
+			},
+			LINK,
+			CHAT,
+		)[1] as SectionBlock
+		assert.include(section.text.text, "*sum(db.query.duration)* is *1,041,923*")
+		assert.include(section.text.text, "above the 500,000 threshold")
 	})
 
 	it("styles buttons per Slack guidance — no danger style on navigation links", () => {
@@ -359,8 +436,12 @@ describe("dispatchDelivery", () => {
 				dispatchDelivery(pagerdutyContext, "{}", fetchFn, 5_000, LINK, CHAT, noEmailDeps),
 			)
 
-			assert.instanceOf(error, AlertDeliveryError)
+			// A 400 is the provider refusing this payload — retrying re-sends the
+			// same rejected request, so it classifies as terminal.
+			assert.instanceOf(error, AlertDeliveryRejectedError)
+			assert.isFalse(error.error.retryable)
 			assert.strictEqual(error.destinationType, "pagerduty")
+			assert.strictEqual(error.providerStatus, 400)
 			assert.include(error.message, "PagerDuty delivery failed with 400")
 			// The PagerDuty rejection reason is now surfaced instead of swallowed.
 			assert.include(error.message, "routing_key is invalid")
@@ -426,6 +507,29 @@ describe("dispatchDelivery", () => {
 		}),
 	)
 
+	it.effect("slack-bot: calls fetch detached from the runtime object", () =>
+		Effect.gen(function* () {
+			// Regression: the unguarded transports used to call `runtime.fetchFn(...)`,
+			// a method call that hands workerd's global `fetch` a `this` of the
+			// runtime object — "Illegal invocation", every Slack delivery dead.
+			// A `function` (not an arrow) is what makes `this` observable here.
+			let called = false
+			let receiver: typeof globalThis | undefined
+			const fetchFn: typeof fetch = function (this: typeof globalThis | undefined) {
+				called = true
+				receiver = this
+				return Promise.resolve(
+					new Response(JSON.stringify({ ok: true, ts: "1700000000.000100" }), { status: 200 }),
+				)
+			}
+
+			yield* dispatchDelivery(slackBotContext, "{}", fetchFn, 5_000, LINK, CHAT, slackTokenDeps())
+
+			assert.isTrue(called)
+			assert.isUndefined(receiver)
+		}),
+	)
+
 	it.effect("slack-bot: surfaces a not_in_channel logical error with an actionable message", () =>
 		Effect.gen(function* () {
 			const fetchFn: typeof fetch = async () =>
@@ -435,8 +539,12 @@ describe("dispatchDelivery", () => {
 				dispatchDelivery(slackBotContext, "{}", fetchFn, 5_000, LINK, CHAT, slackTokenDeps()),
 			)
 
-			assert.instanceOf(error, AlertDeliveryError)
+			// Slack reports this as HTTP 200 + `ok:false`, so only the transport can
+			// classify it. Someone has to re-invite the bot; retrying cannot.
+			assert.instanceOf(error, AlertDeliveryTargetMissingError)
+			assert.isFalse(error.error.retryable)
 			assert.strictEqual(error.destinationType, "slack-bot")
+			assert.strictEqual(error.providerErrorCode, "not_in_channel")
 			assert.include(error.message, "not_in_channel")
 			assert.include(error.message, "invite the Maple bot")
 		}),
@@ -459,6 +567,136 @@ describe("dispatchDelivery", () => {
 			assert.instanceOf(error, AlertDeliveryError)
 			assert.strictEqual(error.destinationType, "slack-bot")
 			assert.include(error.message, "timed out after 5000ms")
+		}),
+	)
+
+	it.effect("slack-bot: the delivery timeout aborts the underlying request", () =>
+		Effect.gen(function* () {
+			// A timeout that leaves the POST running is a duplicate page in waiting:
+			// the queue retries while the "timed-out" request still delivers.
+			let sawSignal = false
+			let aborted = false
+			const fetchFn: typeof fetch = (_input, init) =>
+				new Promise<Response>((_resolve, reject) => {
+					sawSignal = init?.signal != null
+					init?.signal?.addEventListener("abort", () => {
+						aborted = true
+						reject(new DOMException("The operation was aborted", "AbortError"))
+					})
+				})
+
+			const fiber = yield* Effect.forkChild(
+				Effect.flip(
+					dispatchDelivery(slackBotContext, "{}", fetchFn, 5_000, LINK, CHAT, slackTokenDeps()),
+				),
+				{ startImmediately: true },
+			)
+			yield* TestClock.adjust("6 seconds")
+			const error = yield* Fiber.join(fiber)
+
+			assert.instanceOf(error, AlertDeliveryError)
+			assert.include(error.message, "timed out")
+			assert.isTrue(sawSignal)
+			assert.isTrue(aborted)
+		}),
+	)
+
+	it.effect("webhook: the abort signal survives the SSRF-guarded fetch path", () =>
+		Effect.gen(function* () {
+			const webhookContext: DispatchContext = {
+				...pagerdutyContext,
+				destination: { ...destinationRow, name: "Webhook", type: "webhook" },
+				publicConfig: { summary: "POST hooks.example.test", channelLabel: null },
+				secretConfig: {
+					type: "webhook",
+					url: "https://hooks.example.test/maple",
+					signingSecret: null,
+				},
+			}
+			let aborted = false
+			const fetchFn: typeof fetch = (_input, init) =>
+				new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener("abort", () => {
+						aborted = true
+						reject(new DOMException("The operation was aborted", "AbortError"))
+					})
+				})
+
+			const fiber = yield* Effect.forkChild(
+				Effect.flip(dispatchDelivery(webhookContext, "{}", fetchFn, 5_000, LINK, CHAT, noEmailDeps)),
+				{ startImmediately: true },
+			)
+			yield* TestClock.adjust("6 seconds")
+			const error = yield* Fiber.join(fiber)
+
+			assert.instanceOf(error, AlertDeliveryError)
+			assert.include(error.message, "timed out")
+			assert.isTrue(aborted)
+		}),
+	)
+
+	it.effect("slack-bot: an auth error code is terminal, not retried forever", () =>
+		Effect.gen(function* () {
+			const fetchFn: typeof fetch = async () =>
+				new Response(JSON.stringify({ ok: false, error: "invalid_auth" }), { status: 200 })
+
+			const error = yield* Effect.flip(
+				dispatchDelivery(slackBotContext, "{}", fetchFn, 5_000, LINK, CHAT, slackTokenDeps()),
+			)
+
+			// Slack reports auth failure as HTTP 200 + `ok:false`. Retrying replays
+			// the same dead token; only classifying it terminal lets the failure
+			// streak disable the destination and surface it in the setup audit.
+			assert.instanceOf(error, AlertDeliveryAuthError)
+			assert.isFalse(error.error.retryable)
+			assert.strictEqual(error.providerErrorCode, "invalid_auth")
+		}),
+	)
+
+	it.effect("slack-bot: an archived channel is a missing target", () =>
+		Effect.gen(function* () {
+			const fetchFn: typeof fetch = async () =>
+				new Response(JSON.stringify({ ok: false, error: "is_archived" }), { status: 200 })
+
+			const error = yield* Effect.flip(
+				dispatchDelivery(slackBotContext, "{}", fetchFn, 5_000, LINK, CHAT, slackTokenDeps()),
+			)
+
+			assert.instanceOf(error, AlertDeliveryTargetMissingError)
+			assert.isFalse(error.error.retryable)
+			assert.strictEqual(error.providerErrorCode, "is_archived")
+		}),
+	)
+
+	it.effect("slack-bot: a permanently rejected payload is not retryable", () =>
+		Effect.gen(function* () {
+			const fetchFn: typeof fetch = async () =>
+				new Response(JSON.stringify({ ok: false, error: "invalid_blocks" }), { status: 200 })
+
+			const error = yield* Effect.flip(
+				dispatchDelivery(slackBotContext, "{}", fetchFn, 5_000, LINK, CHAT, slackTokenDeps()),
+			)
+
+			assert.instanceOf(error, AlertDeliveryRejectedError)
+			assert.isFalse(error.error.retryable)
+			assert.strictEqual(error.providerErrorCode, "invalid_blocks")
+		}),
+	)
+
+	it.effect("slack-bot: an unrecognized error code stays retryable", () =>
+		Effect.gen(function* () {
+			const fetchFn: typeof fetch = async () =>
+				new Response(JSON.stringify({ ok: false, error: "fatal_error" }), { status: 200 })
+
+			const error = yield* Effect.flip(
+				dispatchDelivery(slackBotContext, "{}", fetchFn, 5_000, LINK, CHAT, slackTokenDeps()),
+			)
+
+			// Mis-classifying transient as terminal costs a destination its
+			// enablement; unknown codes err on the retry side.
+			assert.instanceOf(error, AlertDeliveryError)
+			assert.isTrue(error.error.retryable)
+			assert.strictEqual(error.providerErrorCode, "fatal_error")
 		}),
 	)
 

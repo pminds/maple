@@ -1,12 +1,11 @@
-import { Link } from "@tanstack/react-router"
-import { useOrganization } from "@clerk/clerk-react"
 import { useMapleCustomer } from "@/hooks/use-maple-customer"
 
 import { Result, useAtomValue } from "@/lib/effect-atom"
 import { isClerkAuthEnabled } from "@/lib/services/common/auth-mode"
 import { hasBringYourOwnCloudAddOn } from "@/lib/billing/plan-gating"
+import { useOrganizationFeatureFlags } from "@/hooks/use-organization-feature-flags"
 import { useIsOrgAdmin } from "@/hooks/use-is-org-admin"
-import { MapleApiAtomClient } from "@/lib/services/common/atom-client"
+import { retainedQuery } from "@/lib/services/common/atom-client"
 import {
 	BellIcon,
 	CircleCheckIcon,
@@ -15,6 +14,7 @@ import {
 	DatabaseIcon,
 	GearIcon,
 	GridIcon,
+	HistoryIcon,
 	KeyIcon,
 	ServerIcon,
 	ShieldIcon,
@@ -22,11 +22,12 @@ import {
 	UserIcon,
 	type IconComponent,
 } from "@/components/icons"
-import { cn } from "@maple/ui/lib/utils"
+import { SettingsNavShell } from "@/components/settings/settings-nav-shell"
 
 export const settingsTabValues = [
 	"organization",
 	"members",
+	"audit-log",
 	"setup-audit",
 	"ingestion",
 	"api-keys",
@@ -42,6 +43,7 @@ export type SettingsTab = (typeof settingsTabValues)[number]
 export const settingsTabLabels: Record<SettingsTab, string> = {
 	organization: "Organization",
 	members: "Members",
+	"audit-log": "Audit Log",
 	"setup-audit": "Setup Audit",
 	ingestion: "Ingestion",
 	"api-keys": "API Keys",
@@ -51,7 +53,7 @@ export const settingsTabLabels: Record<SettingsTab, string> = {
 	automation: "Automation",
 	billing: "Billing",
 	"data-platform": "Data Platform",
-}
+} satisfies Record<SettingsTab, string>
 
 interface NavItem {
 	id: SettingsTab
@@ -109,6 +111,7 @@ const navSections: SettingsNavSection[] = [
 		items: [
 			{ id: "organization", label: "Organization", icon: GearIcon },
 			{ id: "members", label: "Members", icon: UserIcon },
+			{ id: "audit-log", label: "Audit Log", icon: HistoryIcon },
 			// Spans alerting, ingestion and integrations, so it sits at workspace level rather than
 			// under any one of them.
 			{ id: "setup-audit", label: "Setup Audit", icon: CircleCheckIcon },
@@ -150,10 +153,13 @@ export function useVisibleSettingsSections() {
 	// in the Clerk-auth path below. `isClerkAuthEnabled` is a build-time constant
 	// today, but keeping the hooks above the early return avoids a conditional-hook
 	// hazard if it ever becomes dynamic.
-	const sessionResult = useAtomValue(MapleApiAtomClient.query("auth", "session", {}))
+	const sessionResult = useAtomValue(retainedQuery("auth", "session", {}))
 	const isAdmin = useIsOrgAdmin()
 	const { data: customer, isLoading: isCustomerLoading } = useMapleCustomer()
-	const { organization } = useOrganization()
+	// Shared with the main sidebar and the flagged routes, so a flag can't be read
+	// one way here and another way there (it already force-enables when self-hosted,
+	// which is what the `!isClerkAuthEnabled` branch below used to do inline).
+	const { flags: featureFlags } = useOrganizationFeatureFlags()
 
 	const visibleSections = navSections
 		.map((section) => ({
@@ -185,14 +191,16 @@ export function useVisibleSettingsSections() {
 	}
 
 	const canAccessDataPlatform = isAdmin && hasBringYourOwnCloudAddOn(customer)
-	const hasAiMetadataFlag = organization?.publicMetadata?.bringyourownai === true
-	const canAccessAi = isAdmin && hasAiMetadataFlag
+	const canAccessAi = isAdmin && featureFlags.aiAutoTriage
 
 	const dataSections = navSections
 		.map((section) => ({
 			...section,
 			items: section.items.filter((item) => {
 				if (item.id === "data-platform") return canAccessDataPlatform
+				// `GET /v2/audit_log` is admin-only; hide the tab rather than let a
+				// member open it into a 403.
+				if (item.id === "audit-log") return isAdmin
 				return true
 			}),
 		}))
@@ -214,18 +222,6 @@ export function useVisibleSettingsSections() {
 	}
 }
 
-const rowClass = (isActive: boolean) =>
-	cn(
-		"group relative flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors text-left",
-		isActive
-			? "bg-accent text-accent-foreground font-medium"
-			: "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-	)
-
-function ActiveIndicator() {
-	return <span aria-hidden className="absolute inset-y-1.5 left-0 w-[2px] rounded-full bg-primary" />
-}
-
 export function SettingsNav({
 	sections,
 	active,
@@ -236,42 +232,5 @@ export function SettingsNav({
 	active: SettingsTab | "integrations"
 	onSelectTab: (tab: SettingsTab) => void
 }) {
-	return (
-		<nav className="flex flex-col gap-5">
-			{sections.map((section) => (
-				<div key={section.id} className="flex flex-col gap-1">
-					<div className="px-2.5 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">
-						{section.title}
-					</div>
-					<div className="flex flex-col gap-0.5">
-						{section.items.map((item) => {
-							const isActive = item.id === active
-							return (
-								<button
-									key={item.id}
-									type="button"
-									onClick={() => onSelectTab(item.id)}
-									className={rowClass(isActive)}
-								>
-									{isActive && <ActiveIndicator />}
-									<item.icon size={16} className="shrink-0" />
-									{item.label}
-								</button>
-							)
-						})}
-						{section.links?.map((link) => {
-							const isActive = link.id === active
-							return (
-								<Link key={link.to} to={link.to} className={rowClass(isActive)}>
-									{isActive && <ActiveIndicator />}
-									<link.icon size={16} className="shrink-0" />
-									{link.label}
-								</Link>
-							)
-						})}
-					</div>
-				</div>
-			))}
-		</nav>
-	)
+	return <SettingsNavShell sections={sections} active={active} onSelectTab={onSelectTab} />
 }

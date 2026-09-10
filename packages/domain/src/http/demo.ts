@@ -1,6 +1,6 @@
 import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
 import { Schema } from "effect"
-import { Authorization } from "./current-tenant"
+import { SessionAuthorization } from "./current-tenant"
 
 export class DemoSeedRequest extends Schema.Class<DemoSeedRequest>("DemoSeedRequest")({
 	hours: Schema.optional(Schema.Number),
@@ -14,7 +14,7 @@ export class DemoSeedResponse extends Schema.Class<DemoSeedResponse>("DemoSeedRe
 	metricsSent: Schema.Number,
 }) {}
 
-export class DemoSeedError extends Schema.TaggedErrorClass<DemoSeedError>()(
+export class DemoSeedError extends Schema.TaggedError<DemoSeedError>()(
 	"@maple/http/errors/DemoSeedError",
 	{
 		message: Schema.String,
@@ -30,5 +30,5 @@ export class DemoApiGroup extends HttpApiGroup.make("demo")
 			error: DemoSeedError,
 		}),
 	)
-	.prefix("/api/demo")
-	.middleware(Authorization) {}
+	.prefix("/internal/demo")
+	.middleware(SessionAuthorization) {}

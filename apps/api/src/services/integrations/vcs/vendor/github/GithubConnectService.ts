@@ -22,8 +22,8 @@ import { VcsRepository } from "@/services/integrations/vcs/VcsRepository"
 import { BACKFILL_WINDOW_MS } from "@/services/integrations/vcs/VcsSyncService"
 import { VcsSyncQueue } from "@/services/integrations/vcs/VcsSyncQueue"
 import { GithubAppClient, type GithubAppError } from "./GithubAppClient"
+import { githubWebBaseUrl } from "./github-hosts"
 
-// ---------------------------------------------------------------------------
 // The dashboard connect flow for the GitHub App. Bridges a real GitHub
 // installation into a `vcs_installations` row owned by a Maple org, then hands
 // off to the existing sync engine (enqueues an InstallationSyncJob).
@@ -38,13 +38,9 @@ import { GithubAppClient, type GithubAppError } from "./GithubAppClient"
 // we sync someone's private repos we prove they own it. Two checks: (1) the OAuth
 // `code` must show the user can manage that installation, and (2) we never bind an
 // installation that already belongs to a different org.
-// ---------------------------------------------------------------------------
 
 const GITHUB_PROVIDER = "github" as const
-const GITHUB_WEB_BASE = "https://github.com"
 const STATE_TTL_MS = 10 * 60_000 // 10 minutes
-
-// ---- Service shape --------------------------------------------------------
 
 interface GithubBranchStatus {
 	readonly name: string
@@ -75,7 +71,7 @@ interface GithubConnectStatus {
 	readonly repositories: ReadonlyArray<GithubRepoStatus>
 }
 
-export interface GithubConnectServiceShape {
+export interface GithubConnectServiceApi {
 	/** Create a single-use state row and the GitHub install URL to open. */
 	readonly startConnect: (
 		orgId: OrgId,
@@ -148,10 +144,10 @@ const fromGithubError = (error: GithubAppError) =>
 			})
 		: new IntegrationsUpstreamError({
 				message: error.message,
-				...(error.status === undefined ? {} : { status: error.status }),
+				...(!(error.status === undefined) ? { status: error.status } : undefined),
 			})
 
-export class GithubConnectService extends Context.Service<GithubConnectService, GithubConnectServiceShape>()(
+export class GithubConnectService extends Context.Service<GithubConnectService, GithubConnectServiceApi>()(
 	"@maple/api/services/vcs/vendor/github/GithubConnectService",
 	{
 		make: Effect.gen(function* () {
@@ -198,7 +194,7 @@ export class GithubConnectService extends Context.Service<GithubConnectService, 
 				})
 				const params = new URLSearchParams({ state })
 				return {
-					redirectUrl: `${GITHUB_WEB_BASE}/apps/${slug}/installations/new?${params.toString()}`,
+					redirectUrl: `${githubWebBaseUrl(env.GITHUB_API_BASE_URL)}/apps/${slug}/installations/new?${params.toString()}`,
 					state,
 				}
 			})
@@ -325,7 +321,9 @@ export class GithubConnectService extends Context.Service<GithubConnectService, 
 								error.status === 404 || error.status === 410
 									? "installation gone/missing"
 									: "github upstream failure",
-							...(error.status === undefined ? {} : { "vcs.github.status": error.status }),
+							...(!(error.status === undefined)
+								? { "vcs.github.status": error.status }
+								: undefined),
 						}),
 					),
 					Effect.mapError(fromGithubError),
@@ -347,7 +345,7 @@ export class GithubConnectService extends Context.Service<GithubConnectService, 
 
 				yield* asPersistence(
 					repo.upsertInstallation({
-						orgId: stateRow.orgId as OrgId,
+						orgId: stateRow.orgId,
 						provider: GITHUB_PROVIDER,
 						externalInstallationId: installationId,
 						accountLogin: account.login,
@@ -355,7 +353,7 @@ export class GithubConnectService extends Context.Service<GithubConnectService, 
 						externalAccountId: String(account.id),
 						accountAvatarUrl: account.avatar_url ?? null,
 						repositorySelection,
-						installedByUserId: stateRow.initiatedByUserId as UserId,
+						installedByUserId: stateRow.initiatedByUserId,
 					}),
 				)
 
@@ -375,7 +373,7 @@ export class GithubConnectService extends Context.Service<GithubConnectService, 
 					"vcs.account.type": accountType,
 					"vcs.repository.selection": repositorySelection,
 				})
-				return { orgId: stateRow.orgId as OrgId, returnTo: stateRow.returnTo ?? null }
+				return { orgId: stateRow.orgId, returnTo: stateRow.returnTo ?? null }
 			})
 
 			// Resolve an installation's repositories into the dashboard summary shape
@@ -662,7 +660,7 @@ export class GithubConnectService extends Context.Service<GithubConnectService, 
 				disconnect,
 				deleteRepository,
 				setTrackedBranch,
-			} satisfies GithubConnectServiceShape
+			} satisfies GithubConnectServiceApi
 		}),
 	},
 ) {

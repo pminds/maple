@@ -1,24 +1,18 @@
-import { Hyperdrive } from "@maple/effect-cloudflare/hyperdrive-connection"
-import { Effect, Layer } from "effect"
-import { Database, type DatabaseClient, DatabaseError, type DatabaseShape } from "./DatabaseLive"
-import { executeOnFreshPgClient } from "./pg-execute"
+import { Effect, Layer, Option } from "effect"
+import { MapleDbConnection } from "./bindings"
+import { Env } from "./Env"
+import { Database, type DatabaseClient, DatabaseError, type DatabaseApi } from "./DatabaseLive"
+import { executeOnFreshPgClient, PgConnectionScope } from "./pg-connection-scope"
 
-const MAPLE_DB = Hyperdrive("MAPLE_DB")
-
-// Workers constraint: this layer lives for the isolate, but TCP sockets are
-// tied to the request that opened them. So the layer holds only the Hyperdrive
-// connection string and defers the dial to `executeOnFreshPgClient` — see
-// pg-execute.ts for why that is per-call.
+// Worker TCP sockets are request-bound, so this layer holds only the connection
+// string and defers the dial to whoever owns the invocation: `PgConnectionScope`
+// on the request and cron paths (one socket, reused by every execute), else a
+// dial per execute.
 const makePgDatabase = Effect.gen(function* () {
-	const conn = yield* Hyperdrive.bind(MAPLE_DB)
-	const binding = yield* conn.raw
-	if (!binding) {
-		// Stages deployed without an application database (PR previews since
-		// 2026-08 — see resolveDatabaseMode in packages/infra). Dying here would
-		// abort construction of the ENTIRE isolate layer graph (layerPg is
-		// provideMerge'd into the handler in worker.ts), 504-ing every route
-		// including /health. Failing per `execute` keeps DB-free routes serving
-		// and turns DB-backed ones into ordinary 500s.
+	const connection = yield* MapleDbConnection
+
+	if (Option.isNone(connection)) {
+		// Fail per execute so an absent DB does not abort the isolate layer graph.
 		return Database.of({
 			execute: () =>
 				Effect.fail(
@@ -27,29 +21,21 @@ const makePgDatabase = Effect.gen(function* () {
 						cause: undefined,
 					}),
 				),
-		} satisfies DatabaseShape)
+		} satisfies DatabaseApi)
 	}
 
-	const connectionString = binding.connectionString
-	// Hyperdrive presents itself to the driver as `<config-id>.hyperdrive.local`
-	// with the 32-char config id as the database name. Maple's read path
-	// deliberately collapses both spellings to the `hyperdrive` sentinel node
-	// (see OPAQUE_DB_NAMESPACE_RE in @maple/domain/tinybird/db-query-shape-sql),
-	// so emitting them as-is is correct — the node is branded "Hyperdrive" and
-	// the frontend resolves the real database behind it from the org's
-	// Hyperdrive config inventory.
-	const databaseName = binding.database
-	const serverAddress = binding.host
-	const serverPort = binding.port
-
+	const { connectionString, attributes } = connection.value
 	return Database.of({
 		execute: <T>(fn: (db: DatabaseClient) => Promise<T>) =>
-			executeOnFreshPgClient(connectionString, fn, {
-				"db.namespace": databaseName,
-				"server.address": serverAddress,
-				"server.port": serverPort,
-			}),
-	} satisfies DatabaseShape)
+			Effect.flatMap(PgConnectionScope, (scope) =>
+				scope === undefined
+					? executeOnFreshPgClient(connectionString, fn, attributes)
+					: scope.run(fn),
+			),
+	} satisfies DatabaseApi)
 })
 
 export const layerPg = Layer.effect(Database, makePgDatabase)
+
+/** What every background event's graph starts from: the config-backed `Env` and the database. */
+export const EventBaseLive = Layer.mergeAll(Env.layer, layerPg)

@@ -8,8 +8,8 @@ import {
 } from "./types"
 import { Effect, Option, Schema } from "effect"
 import { createDualContent } from "@/mcp/lib/structured-output"
-import { resolveTenant } from "@/mcp/lib/query-warehouse"
-import { ErrorsService } from "@/services/errors/ErrorsService"
+import { CurrentMcpTenant } from "@/mcp/lib/query-warehouse"
+import { ErrorPolicyService } from "@/services/errors/ErrorPolicyService"
 import { AlertDestinationId, AlertSeverity, ErrorNotificationPolicyUpsertRequest } from "@maple/domain/http"
 
 const decodeSeverity = Schema.decodeUnknownOption(AlertSeverity)
@@ -54,8 +54,8 @@ export function registerUpdateErrorNotificationPolicyTool(server: McpToolRegistr
 			}
 			const decodedSeverity = Option.getOrUndefined(parsedSeverity)
 
-			const tenant = yield* resolveTenant
-			const errors = yield* ErrorsService
+			const tenant = yield* CurrentMcpTenant
+			const policies = yield* ErrorPolicyService
 
 			const patch: Partial<{
 				enabled: boolean
@@ -65,7 +65,15 @@ export function registerUpdateErrorNotificationPolicyTool(server: McpToolRegistr
 				notifyOnResolve: boolean
 				minOccurrenceCount: number
 				severity: AlertSeverity
-			}> = {}
+			}> = {} satisfies Partial<{
+				enabled: boolean
+				destinationIds: ReadonlyArray<AlertDestinationId>
+				notifyOnFirstSeen: boolean
+				notifyOnRegression: boolean
+				notifyOnResolve: boolean
+				minOccurrenceCount: number
+				severity: AlertSeverity
+			}>
 			if (enabled !== undefined) patch.enabled = enabled
 			if (destination_ids !== undefined) {
 				const tokens = destination_ids
@@ -91,9 +99,7 @@ export function registerUpdateErrorNotificationPolicyTool(server: McpToolRegistr
 			if (min_occurrence_count !== undefined) patch.minOccurrenceCount = min_occurrence_count
 			if (decodedSeverity !== undefined) patch.severity = decodedSeverity
 
-			const decodedPatch = yield* Schema.decodeUnknownEffect(ErrorNotificationPolicyUpsertRequest)(
-				patch,
-			).pipe(
+			const decodedPatch = yield* Schema.decodeEffect(ErrorNotificationPolicyUpsertRequest)(patch).pipe(
 				Effect.mapError(
 					(error) =>
 						new McpQueryError({
@@ -104,10 +110,18 @@ export function registerUpdateErrorNotificationPolicyTool(server: McpToolRegistr
 				),
 			)
 
-			const policy = yield* errors
-				.upsertNotificationPolicy(tenant.orgId, tenant.userId, decodedPatch)
+			const policy = yield* policies
+				.upsertNotificationPolicy(tenant.orgId, tenant.userId, tenant.roles, decodedPatch)
 				.pipe(
 					Effect.catchTags({
+						"@maple/http/errors/ErrorForbiddenError": (error) =>
+							Effect.fail(
+								new McpQueryError({
+									message: `${error._tag}: ${error.message}`,
+									pipeName: "update_error_notification_policy",
+									cause: error,
+								}),
+							),
 						"@maple/http/errors/ErrorPersistenceError": (error) =>
 							Effect.fail(
 								new McpQueryError({

@@ -1,21 +1,38 @@
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { Schema } from "effect"
 import { HazelChannelId, HazelOrganizationId, PostgresTransactionId, UserId } from "../../primitives"
-import { AlertDestinationType, MAX_EMAIL_RECIPIENTS } from "../alerts"
-import { AuthorizationV2, V2SchemaErrors } from "./auth"
-import { ListOf, ListQuery, Timestamp } from "./envelopes"
 import {
-	V2ConflictError,
-	V2InvalidRequestError,
-	V2NotFoundError,
-	V2PermissionError,
-	V2ServiceUnavailableError,
-	V2UpstreamError,
-} from "./errors"
+	AlertDeliveryAuthError,
+	AlertDeliveryError,
+	AlertDeliveryRejectedError,
+	AlertDeliveryTargetMissingError,
+	AlertDestinationDecryptionError,
+	AlertDestinationEncryptionError,
+	AlertDestinationNotFoundError,
+	AlertDestinationStoredConfigInvalidError,
+	AlertDestinationInUseError,
+	AlertDestinationType,
+	AlertForbiddenError,
+	AlertMemberDirectoryNotConfiguredError,
+	AlertMemberDirectoryUnavailableError,
+	AlertPersistenceError,
+	AlertRecipientSelectionError,
+	AlertRuleStoredConfigInvalidError,
+	AlertValidationError,
+	MAX_EMAIL_RECIPIENTS,
+} from "../alerts"
+import {
+	IntegrationsNotConnectedError,
+	IntegrationsPersistenceError,
+	IntegrationsRevokedError,
+	IntegrationsUpstreamError,
+	IntegrationsValidationError,
+} from "../integrations"
+import { AuthorizationV2 } from "./auth"
+import { wireExample, ListOf, ListQuery, Timestamp } from "./envelopes"
+import { V2ParameterInvalid } from "./errors"
+import { publicError, publicErrors } from "./public-error"
 import { AlertDestinationPublicId } from "./resource-ids"
-
-/** See api-keys.ts: examples are authored in wire (encoded) shape. */
-const wireExample = <A>(example: object): A => example as A
 
 export { AlertDestinationPublicId } from "./resource-ids"
 
@@ -62,7 +79,7 @@ export const V2AlertDestination = Schema.Struct({
 	}),
 	type: AlertDestinationType.annotate({
 		description:
-			"The delivery channel: `slack-bot`, `pagerduty`, `webhook`, `hazel-oauth`, `discord`, or `email`. Immutable after creation.",
+			"The delivery channel: `slack-bot`, `pagerduty`, `webhook`, `hazel-oauth`, `discord`, `telegram`, or `email`. Immutable after creation.",
 		examples: ["slack-bot"],
 	}),
 	enabled: Schema.Boolean.annotate({
@@ -76,7 +93,8 @@ export const V2AlertDestination = Schema.Struct({
 		examples: ["Slack bot → #incidents"],
 	}),
 	channel_label: Schema.NullOr(Schema.String).annotate({
-		description: "Optional display label for the target channel (Slack destinations), or `null`.",
+		description:
+			"Optional display label for the target channel — the channel name for Slack, the chat ID for Telegram — or `null`.",
 		examples: ["#incidents"],
 	}),
 	member_user_ids: Schema.NullOr(Schema.Array(Schema.String)).annotate({
@@ -96,7 +114,7 @@ export const V2AlertDestination = Schema.Struct({
 	identifier: "AlertDestination",
 	title: "Alert Destination",
 	description:
-		"A notification channel that alert rules deliver to (Slack bot, PagerDuty, generic webhook, Hazel OAuth, Discord, or workspace-member email). Channel secrets are write-only: responses carry a redacted `summary` instead.",
+		"A notification channel that alert rules deliver to (Slack bot, PagerDuty, generic webhook, Hazel OAuth, Discord, Telegram, or workspace-member email). Channel secrets are write-only: responses carry a redacted `summary` instead.",
 	examples: [wireExample(alertDestinationExample)],
 })
 export type V2AlertDestination = Schema.Schema.Type<typeof V2AlertDestination>
@@ -111,8 +129,6 @@ export const V2AlertDestinationMutationResponse = Schema.Struct({
 	examples: [wireExample({ ...alertDestinationExample, txid: "81234" })],
 })
 export type V2AlertDestinationMutationResponse = Schema.Schema.Type<typeof V2AlertDestinationMutationResponse>
-
-// --- Create params: discriminated union on `type`, one arm per channel. ---
 
 const enabledField = Schema.optionalKey(
 	Schema.Boolean.annotate({
@@ -198,6 +214,20 @@ const V2DiscordDestinationCreateParams = Schema.Struct({
 	enabled: enabledField,
 }).annotate({ identifier: "AlertDestinationCreateDiscord", title: "Discord destination" })
 
+const V2TelegramDestinationCreateParams = Schema.Struct({
+	type: Schema.Literal("telegram"),
+	name: nameField,
+	bot_token: NonEmptyString.annotate({
+		description: "The bot token issued by @BotFather. Write-only — never returned.",
+	}),
+	chat_id: NonEmptyString.annotate({
+		description:
+			"The target chat: a numeric id such as `-1001234567890`, or an `@channelusername`. The bot must be a member of the chat.",
+		examples: ["-1001234567890"],
+	}),
+	enabled: enabledField,
+}).annotate({ identifier: "AlertDestinationCreateTelegram", title: "Telegram destination" })
+
 const V2EmailDestinationCreateParams = Schema.Struct({
 	type: Schema.Literal("email"),
 	name: nameField,
@@ -213,6 +243,7 @@ export const V2AlertDestinationCreateParams = Schema.Union([
 	V2WebhookDestinationCreateParams,
 	V2HazelOAuthDestinationCreateParams,
 	V2DiscordDestinationCreateParams,
+	V2TelegramDestinationCreateParams,
 	V2EmailDestinationCreateParams,
 ]).annotate({
 	identifier: "AlertDestinationCreateParams",
@@ -230,8 +261,6 @@ export const V2AlertDestinationCreateParams = Schema.Union([
 	],
 })
 export type V2AlertDestinationCreateParams = Schema.Schema.Type<typeof V2AlertDestinationCreateParams>
-
-// --- Update params: same discriminant, every config field optional. ---
 
 const optionalNameField = Schema.optionalKey(
 	NonEmptyString.annotate({ description: "New label for the destination." }),
@@ -277,6 +306,13 @@ export const V2AlertDestinationUpdateParams = Schema.Union([
 		webhook_url: Schema.optionalKey(Schema.String),
 		enabled: Schema.optionalKey(Schema.Boolean),
 	}).annotate({ identifier: "AlertDestinationUpdateDiscord", title: "Discord destination update" }),
+	Schema.Struct({
+		type: Schema.Literal("telegram"),
+		name: optionalNameField,
+		bot_token: Schema.optionalKey(Schema.String),
+		chat_id: Schema.optionalKey(Schema.String),
+		enabled: Schema.optionalKey(Schema.Boolean),
+	}).annotate({ identifier: "AlertDestinationUpdateTelegram", title: "Telegram destination update" }),
 	Schema.Struct({
 		type: Schema.Literal("email"),
 		name: optionalNameField,
@@ -342,7 +378,97 @@ export const V2AlertDestinationTestResult = Schema.Struct({
 })
 export type V2AlertDestinationTestResult = Schema.Schema.Type<typeof V2AlertDestinationTestResult>
 
-const commonErrors = [V2InvalidRequestError, V2ServiceUnavailableError, V2UpstreamError] as const
+const [alertForbidden, alertValidation, alertPersistence, alertNotFound] = publicErrors(
+	AlertForbiddenError,
+	AlertValidationError,
+	AlertPersistenceError,
+	AlertDestinationNotFoundError,
+)
+/**
+ * Delivery fails as one of four classes, split by whether the failure is worth
+ * retrying (see `alerts.ts`). All four must be declared here — an endpoint that
+ * can produce an error it cannot encode answers 500 instead of the real status.
+ */
+const alertDeliveryErrors = publicErrors(
+	AlertDeliveryError,
+	AlertDeliveryAuthError,
+	AlertDeliveryTargetMissingError,
+	AlertDeliveryRejectedError,
+)
+const hazelWebhookProvisionErrors = publicErrors(
+	IntegrationsNotConnectedError,
+	IntegrationsRevokedError,
+	IntegrationsUpstreamError,
+	IntegrationsPersistenceError,
+	IntegrationsValidationError,
+)
+const emailRecipientErrors = publicErrors(
+	AlertRecipientSelectionError,
+	AlertMemberDirectoryNotConfiguredError,
+	AlertMemberDirectoryUnavailableError,
+)
+export const V2TelegramChatsParams = Schema.Struct({
+	bot_token: NonEmptyString.annotate({
+		description:
+			"The bot token to inspect. Write-only, and not stored by this call — it is used for one `getUpdates` read and discarded.",
+	}),
+}).annotate({
+	identifier: "TelegramChatsParams",
+	title: "Telegram chat discovery parameters",
+})
+export type V2TelegramChatsParams = Schema.Schema.Type<typeof V2TelegramChatsParams>
+
+export const V2TelegramChat = Schema.Struct({
+	id: Schema.String.annotate({
+		description:
+			"The chat ID, as a string. Negative for groups and channels — pass it verbatim as `chat_id` when creating the destination.",
+		examples: ["-1001234567890"],
+	}),
+	title: Schema.String.annotate({
+		description: "Display name of the chat: its title, or the username for a one-to-one chat.",
+		examples: ["Acme On-call"],
+	}),
+	type: Schema.Literals(["private", "group", "supergroup", "channel"]).annotate({
+		description: "Telegram's chat type.",
+		examples: ["supergroup"],
+	}),
+}).annotate({
+	identifier: "TelegramChat",
+	title: "Telegram chat",
+	description: "A chat the bot can currently see.",
+	examples: [wireExample({ id: "-1001234567890", title: "Acme On-call", type: "supergroup" })],
+})
+export type V2TelegramChat = Schema.Schema.Type<typeof V2TelegramChat>
+
+export const V2TelegramChatList = Schema.Struct({
+	object: Schema.Literal("alert_destination.telegram_chat_list").annotate({
+		description: 'The object type — always `"alert_destination.telegram_chat_list"`.',
+	}),
+	chats: Schema.Array(V2TelegramChat).annotate({
+		description:
+			'The chats the bot has seen recently, most recent first. Telegram retains updates for about 24 hours, so an empty array means "nothing recent" — add the bot to the chat, or send it a message, and try again.',
+	}),
+}).annotate({
+	identifier: "TelegramChatList",
+	title: "Telegram chat list",
+	description:
+		"Chats discovered from the bot's pending updates. Not the standard list envelope: there is no cursor, because Telegram exposes a short retention window rather than a paginated inventory.",
+	examples: [
+		wireExample({
+			object: "alert_destination.telegram_chat_list",
+			chats: [{ id: "-1001234567890", title: "Acme On-call", type: "supergroup" }],
+		}),
+	],
+})
+export type V2TelegramChatList = Schema.Schema.Type<typeof V2TelegramChatList>
+
+const [destinationEncryption, destinationDecryption, destinationStoredConfigInvalid] = publicErrors(
+	AlertDestinationEncryptionError,
+	AlertDestinationDecryptionError,
+	AlertDestinationStoredConfigInvalidError,
+)
+const destinationReadErrors = [destinationDecryption, destinationStoredConfigInvalid] as const
+const ruleStoredConfigInvalid = publicError(AlertRuleStoredConfigInvalidError)
 
 const AlertDestinationList = ListOf(V2AlertDestination).annotate({
 	identifier: "AlertDestinationList",
@@ -355,7 +481,7 @@ export class V2AlertDestinationsApiGroup extends HttpApiGroup.make("alertDestina
 		HttpApiEndpoint.get("list", "/", {
 			query: ListQuery,
 			success: AlertDestinationList,
-			error: [...commonErrors],
+			error: [V2ParameterInvalid.schema, alertPersistence, destinationStoredConfigInvalid],
 		}).annotateMerge(
 			OpenApi.annotations({
 				identifier: "listAlertDestinations",
@@ -369,7 +495,14 @@ export class V2AlertDestinationsApiGroup extends HttpApiGroup.make("alertDestina
 		HttpApiEndpoint.post("create", "/", {
 			payload: V2AlertDestinationCreateParams,
 			success: V2AlertDestinationMutationResponse,
-			error: [...commonErrors, V2PermissionError],
+			error: [
+				alertForbidden,
+				alertValidation,
+				alertPersistence,
+				destinationEncryption,
+				...hazelWebhookProvisionErrors,
+				...emailRecipientErrors,
+			],
 		}).annotateMerge(
 			OpenApi.annotations({
 				identifier: "createAlertDestination",
@@ -380,10 +513,24 @@ export class V2AlertDestinationsApiGroup extends HttpApiGroup.make("alertDestina
 		),
 	)
 	.add(
+		HttpApiEndpoint.post("telegramChats", "/telegram/chats", {
+			payload: V2TelegramChatsParams,
+			success: V2TelegramChatList,
+			error: [alertForbidden, alertValidation],
+		}).annotateMerge(
+			OpenApi.annotations({
+				identifier: "listTelegramChats",
+				summary: "List the chats a Telegram bot can see",
+				description:
+					"Reads a bot's pending updates and returns the chats it can currently post to, so a destination can be created by picking a chat instead of transcribing its numeric ID. The token is used for one read and never stored. Telegram retains updates for about 24 hours; a bot with a webhook registered cannot be inspected this way. Requires an org-admin role and the `alerts:write` scope.",
+			}),
+		),
+	)
+	.add(
 		HttpApiEndpoint.get("retrieve", "/:id", {
 			params: { id: AlertDestinationPublicId },
 			success: V2AlertDestination,
-			error: [...commonErrors, V2NotFoundError],
+			error: [alertNotFound, alertPersistence, destinationStoredConfigInvalid],
 		}).annotateMerge(
 			OpenApi.annotations({
 				identifier: "getAlertDestination",
@@ -398,7 +545,16 @@ export class V2AlertDestinationsApiGroup extends HttpApiGroup.make("alertDestina
 			params: { id: AlertDestinationPublicId },
 			payload: V2AlertDestinationUpdateParams,
 			success: V2AlertDestinationMutationResponse,
-			error: [...commonErrors, V2PermissionError, V2NotFoundError],
+			error: [
+				alertForbidden,
+				alertValidation,
+				alertPersistence,
+				alertNotFound,
+				destinationEncryption,
+				...destinationReadErrors,
+				...hazelWebhookProvisionErrors,
+				...emailRecipientErrors,
+			],
 		}).annotateMerge(
 			OpenApi.annotations({
 				identifier: "updateAlertDestination",
@@ -412,7 +568,13 @@ export class V2AlertDestinationsApiGroup extends HttpApiGroup.make("alertDestina
 		HttpApiEndpoint.delete("delete", "/:id", {
 			params: { id: AlertDestinationPublicId },
 			success: V2AlertDestinationDeleteResponse,
-			error: [...commonErrors, V2PermissionError, V2NotFoundError, V2ConflictError],
+			error: [
+				alertForbidden,
+				alertPersistence,
+				alertNotFound,
+				publicError(AlertDestinationInUseError),
+				ruleStoredConfigInvalid,
+			],
 		}).annotateMerge(
 			OpenApi.annotations({
 				identifier: "deleteAlertDestination",
@@ -426,7 +588,13 @@ export class V2AlertDestinationsApiGroup extends HttpApiGroup.make("alertDestina
 		HttpApiEndpoint.post("test", "/:id/test", {
 			params: { id: AlertDestinationPublicId },
 			success: V2AlertDestinationTestResult,
-			error: [...commonErrors, V2PermissionError, V2NotFoundError],
+			error: [
+				alertForbidden,
+				alertPersistence,
+				alertNotFound,
+				...alertDeliveryErrors,
+				...destinationReadErrors,
+			],
 		}).annotateMerge(
 			OpenApi.annotations({
 				identifier: "testAlertDestination",
@@ -438,11 +606,10 @@ export class V2AlertDestinationsApiGroup extends HttpApiGroup.make("alertDestina
 	)
 	.prefix("/v2/alerts/destinations")
 	.middleware(AuthorizationV2)
-	.middleware(V2SchemaErrors)
 	.annotateMerge(
 		OpenApi.annotations({
 			title: "Alert Destinations",
 			description:
-				"Notification channels for alert rules — Slack bot, PagerDuty, generic webhooks, Hazel OAuth, Discord, and workspace-member email. Create and manage destinations, then reference them from alert rules via `destination_ids`. Mutations are admin-only; channel secrets are write-only.",
+				"Notification channels for alert rules — Slack bot, PagerDuty, generic webhooks, Hazel OAuth, Discord, Telegram, and workspace-member email. Create and manage destinations, then reference them from alert rules via `destination_ids`. Mutations are admin-only; channel secrets are write-only.",
 		}),
 	) {}

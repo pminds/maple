@@ -3,10 +3,11 @@ import { Schema } from "effect"
 import {
 	ChatHistoryResponse,
 	ChatSendResponse,
+	ChatEvent,
 	decodeChatEvent,
 	makeChatSessionId,
-	type ChatEvent,
 	type ChatMessage as ChatSessionMessage,
+	type ChatTaskRef,
 	type ChatToolCall,
 } from "@maple/domain/chat-session"
 import type { ChatStatus, UIMessage, UIMessagePart } from "@/components/ai-elements/types"
@@ -87,7 +88,35 @@ const errorTextOf = (output: unknown): string => {
 	}
 }
 
+/** A `task` call's description, as the model supplied it. Untyped on the wire, so read defensively. */
+const taskDescriptionOf = (input: unknown): string => {
+	const raw = (input as { description?: unknown })?.description
+	return typeof raw === "string" ? raw : "sub-agent"
+}
+
 function toolCallToPart(call: ChatToolCall): UIMessagePart {
+	// A sub-agent run renders as its own collapsible transcript, not a tool row.
+	if (call.task !== undefined) {
+		return {
+			type: "task",
+			toolCallId: call.id,
+			agent: call.task.agent,
+			description: taskDescriptionOf(call.input),
+			status: call.task.status,
+			messages: call.task.messages.map((message) => ({
+				id: message.id,
+				role: message.role,
+				parts: [
+					...(message.text
+						? [{ type: "text" as const, text: message.text, state: "done" as const }]
+						: []),
+					...message.toolCalls.map((sub) =>
+						toolCallToPart({ ...sub, proposed: undefined, task: undefined } as ChatToolCall),
+					),
+				],
+			})),
+		}
+	}
 	if (call.output === undefined) {
 		return {
 			type: "dynamic-tool",
@@ -169,18 +198,102 @@ function finalizeStreamingText(message: UIMessage): UIMessage {
 	return { ...message, parts }
 }
 
+/**
+ * Retract text produced by an attempt that failed and is being retried.
+ *
+ * Only the trailing text part can be affected: within one step the server emits tool calls only
+ * after the model stream completed, so a failed attempt contributed nothing but text. Clamped
+ * because appends can be dropped between the delta and the retraction that accounts for it.
+ */
+function retractText(message: UIMessage, chars: number): UIMessage {
+	const last = message.parts[message.parts.length - 1]
+	if (!last || last.type !== "text") return message
+	const text = last.text.slice(0, Math.max(0, last.text.length - chars))
+	const parts = message.parts.slice(0, -1)
+	// An emptied part would render as a blank bubble; drop it and let the retry start a fresh one.
+	if (text !== "") parts.push({ ...last, text })
+	return { ...message, parts }
+}
+
+/** The sub-agent a `task` call named, read defensively off untyped wire input. */
+const subagentTypeOf = (input: unknown): string => {
+	const raw = (input as { subagent_type?: unknown })?.subagent_type
+	return typeof raw === "string" ? raw : "agent"
+}
+
 function addToolCall(message: UIMessage, event: Extract<ChatEvent, { type: "tool-call" }>): UIMessage {
 	const finalized = finalizeStreamingText(message)
-	const part: UIMessagePart = {
-		type: "dynamic-tool",
-		toolCallId: event.callId,
-		toolName: event.name,
-		// `proposed` means the turn stopped here and the tool did NOT run; the transcript renders
-		// an approval card rather than a running tool row, and no `tool-result` is coming.
-		state: event.proposed === true ? "proposed" : "input-available",
-		input: event.input,
-	}
+	// A `task` call opens a sub-agent card, which the child's own events then fill in. Its result
+	// still arrives as a normal `tool-result`, but the card shows the transcript, not the payload.
+	const part: UIMessagePart =
+		event.name === "task"
+			? {
+					type: "task",
+					toolCallId: event.callId,
+					agent: subagentTypeOf(event.input),
+					description: taskDescriptionOf(event.input),
+					status: "running",
+					messages: [],
+				}
+			: {
+					type: "dynamic-tool",
+					toolCallId: event.callId,
+					toolName: event.name,
+					// `proposed` means the turn stopped here and the tool did NOT run; the transcript
+					// renders an approval card rather than a running tool row, and no `tool-result`
+					// is coming.
+					state: event.proposed === true ? "proposed" : "input-available",
+					input: event.input,
+				}
 	return { ...finalized, parts: [...finalized.parts, part] }
+}
+
+/**
+ * Fold a sub-agent's event into the `task` part it belongs to.
+ *
+ * Recurses through the *same* reducer on the nested array, so the child transcript gets identical
+ * handling to the top-level one — including delta batching, tool settling and retry retraction —
+ * without a second implementation to keep in sync.
+ *
+ * Deny by default, matching the server's fold: an event whose parent message or task part is
+ * missing is dropped rather than materialising a stray top-level message.
+ */
+function applyTaskEvent(messages: UIMessage[], event: ChatEvent, task: ChatTaskRef): UIMessage[] {
+	return updateMessage(messages, task.parentMessageId, (message) => ({
+		...message,
+		parts: message.parts.map((part) => {
+			if (part.type !== "task" || part.toolCallId !== task.id) return part
+			return {
+				...part,
+				status:
+					event.type === "turn-end"
+						? event.reason === "stop"
+							? "completed"
+							: event.reason === "error"
+								? "error"
+								: "aborted"
+						: part.status,
+				messages: applyChatEvent(part.messages, event),
+			}
+		}),
+	}))
+}
+
+function settleTaskResult(
+	messages: UIMessage[],
+	event: Extract<ChatEvent, { type: "tool-result" }>,
+): UIMessage[] {
+	// The task tool's own result is the `<task_result>` wrapper, which the card does not render —
+	// the child's transcript is already there. Only an error is worth surfacing.
+	if (event.isError !== true) return messages
+	return updateMessage(messages, event.messageId, (message) => ({
+		...message,
+		parts: message.parts.map((part) =>
+			part.type === "task" && part.toolCallId === event.callId
+				? { ...part, status: "error" as const }
+				: part,
+		),
+	}))
 }
 
 function settleToolCall(message: UIMessage, event: Extract<ChatEvent, { type: "tool-result" }>): UIMessage {
@@ -209,30 +322,55 @@ function settleToolCall(message: UIMessage, event: Extract<ChatEvent, { type: "t
 }
 
 /**
+ * The sub-agent task an event belongs to, if any. `user-message` and `compaction` are the two
+ * members that never carry one; every other event is task-scoped exactly when `task` is set.
+ */
+const taskOf = ChatEvent.matchOrElse(
+	{ "user-message": () => undefined, compaction: () => undefined },
+	(event) => event.task,
+)
+
+/**
  * Fold one live `ChatEvent` into the transcript. `user-message` is a no-op: the
  * optimistic send already rendered it under the same id the server assigns (see
  * `sendMessage`), so replaying it here would either duplicate it or land on a
  * message that's already there — either way there's nothing new to show.
  */
 function applyChatEvent(messages: UIMessage[], event: ChatEvent): UIMessage[] {
-	switch (event.type) {
-		case "user-message":
-			return messages
-		case "turn-start":
-			return ensureAssistantMessage(messages, event.messageId)
-		case "text-delta": {
-			const withMessage = ensureAssistantMessage(messages, event.messageId)
-			return updateMessage(withMessage, event.messageId, (m) => appendTextDelta(m, event.text))
-		}
-		case "tool-call": {
-			const withMessage = ensureAssistantMessage(messages, event.messageId)
-			return updateMessage(withMessage, event.messageId, (m) => addToolCall(m, event))
-		}
-		case "tool-result":
-			return updateMessage(messages, event.messageId, (m) => settleToolCall(m, event))
-		case "turn-end":
-			return updateMessage(messages, event.messageId, finalizeStreamingText)
-	}
+	return ChatEvent.matchOrElse(
+		event,
+		{
+			"user-message": () => messages,
+			// Model-facing bookkeeping. Only the server's `toLlmMessages` reads a compaction; the
+			// transcript the user scrolls back through is deliberately left intact.
+			compaction: () => messages,
+		},
+		(event) => {
+			// A sub-agent's event belongs to the `task` part that started it, never to this transcript.
+			const task = event.task
+			if (task !== undefined) return applyTaskEvent(messages, event, task)
+			switch (event.type) {
+				case "turn-start":
+					return ensureAssistantMessage(messages, event.messageId)
+				case "text-delta": {
+					const withMessage = ensureAssistantMessage(messages, event.messageId)
+					return updateMessage(withMessage, event.messageId, (m) => appendTextDelta(m, event.text))
+				}
+				case "tool-call": {
+					const withMessage = ensureAssistantMessage(messages, event.messageId)
+					return updateMessage(withMessage, event.messageId, (m) => addToolCall(m, event))
+				}
+				case "tool-result":
+					return updateMessage(settleTaskResult(messages, event), event.messageId, (m) =>
+						settleToolCall(m, event),
+					)
+				case "turn-retry":
+					return updateMessage(messages, event.messageId, (m) => retractText(m, event.retractChars))
+				case "turn-end":
+					return updateMessage(messages, event.messageId, finalizeStreamingText)
+			}
+		},
+	)
 }
 
 /** Consecutive-failure budget for a dropped `events` stream before surfacing an error. */
@@ -403,6 +541,11 @@ export function useMapleChat({ tabId, context }: UseMapleChatOptions): UseMapleC
 							if (!event) continue
 							seq = event.seq
 							enqueueEvent(event)
+							// A sub-agent's lifecycle is not the conversation's: its `turn-end` closes the
+							// task card, not the stream. Without this guard the first sub-agent to
+							// finish ended the parent's read loop, so the rest of the parent's answer
+							// only appeared on the next reconnect.
+							if (taskOf(event) !== undefined) continue
 							if (event.type === "turn-start") setStatus("streaming")
 							if (event.type === "turn-end") {
 								sawTurnEnd = true

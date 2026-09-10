@@ -1,12 +1,12 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router"
-import { formatBackendError } from "@/lib/error-messages"
+import { displayError } from "@/lib/error-messages"
 import { Result, useAtomSet, useAtomValue } from "@/lib/effect-atom"
 import { Exit, Schema } from "effect"
 import { Fragment, useCallback, useMemo, useRef, useState } from "react"
 import { toastManager } from "@maple/ui/components/ui/toast"
 
 import { DashboardLayout } from "@/components/layout/dashboard-layout"
-import { MapleApiV2AtomClient } from "@/lib/services/common/v2-atom-client"
+import { MapleApiV2AtomClient, retainedQueryV2 } from "@/lib/services/common/v2-atom-client"
 import { useAlertRuleChecks } from "@/hooks/use-alert-rule-checks"
 import { useEffectiveTimeRange } from "@/hooks/use-effective-time-range"
 import { TimeRangeHeaderControls } from "@/components/time-range-picker/time-range-header-controls"
@@ -14,7 +14,8 @@ import { PageRefreshProvider } from "@/components/time-range-picker/page-refresh
 import { TimeRangeSearchFields, applyTimeRangeSearch } from "@/components/time-range-picker/search"
 import { LONG_RANGE_PRESET_OPTIONS, presetLabel, formatTimeRangeDisplay } from "@/lib/time-utils"
 import { normalizeTimestampInput } from "@/lib/timezone-format"
-import { AlertRuleChart, SIGNAL_SOURCE_LABEL, type SignalSource } from "@/components/alerts/alert-rule-chart"
+import { AlertRuleChart } from "@/components/alerts/alert-rule-chart"
+import { SIGNAL_SOURCE_LABEL, type SignalSource } from "@/lib/alerts/chart-series"
 import { AlertStatusBadge } from "@/components/alerts/alert-status-badge"
 import { AlertSeverityBadge } from "@/components/alerts/alert-severity-badge"
 import { AlertStatStrip } from "@/components/alerts/alert-stat-card"
@@ -75,7 +76,7 @@ type RuleDetailTab = (typeof tabValues)[number]
 const SIGNAL_SOURCE_DESCRIPTION: Record<SignalSource, string> = {
 	preview: "The rule's query, replayed now over the selected window.",
 	checks: "What the evaluator actually observed and stored, one point per check.",
-}
+} satisfies Record<SignalSource, string>
 
 function formatBucketRange(bucket: { start: number; end: number }): string {
 	const time = (ms: number) =>
@@ -152,7 +153,7 @@ function RuleDetailContent() {
 	const ruleStates = useAlertRuleStates(ruleId)
 	const { result: destinationsResult } = useAlertDestinationsList()
 	const deliveryEventsResult = useAtomValue(
-		MapleApiV2AtomClient.query("alertDeliveries", "list", {
+		retainedQueryV2("alertDeliveries", "list", {
 			query: { limit: 100 },
 			reactivityKeys: ["alertDeliveryEvents"],
 		}),
@@ -363,7 +364,7 @@ function RuleDetailContent() {
 					type: "incident",
 					incident_kind: "alert",
 					incident_id: incident.id,
-					...(incident.errorIssueId ? { issue_id: incident.errorIssueId } : {}),
+					...(incident.errorIssueId ? { issue_id: incident.errorIssueId } : undefined),
 				} as never,
 				snapshot: {
 					title: rule.name,
@@ -489,7 +490,7 @@ function RuleDetailContent() {
 									<EmptyTitle>Failed to load alert rule</EmptyTitle>
 									<EmptyDescription>
 										{Result.builder(rulesResult)
-											.onError((error) => formatBackendError(error).description)
+											.onError((error) => displayError(error).message)
 											.orElse(() => undefined) ?? "Try refreshing or check API logs."}
 									</EmptyDescription>
 								</EmptyHeader>
@@ -885,7 +886,7 @@ function RuleDetailContent() {
 													</EmptyMedia>
 													<EmptyTitle>Failed to load checks</EmptyTitle>
 													<EmptyDescription>
-														{formatBackendError(error).description}
+														{displayError(error).message}
 													</EmptyDescription>
 												</EmptyHeader>
 												<Button
@@ -934,9 +935,7 @@ function RuleDetailContent() {
 												<CircleWarningIcon size={18} />
 											</EmptyMedia>
 											<EmptyTitle>Failed to load incidents</EmptyTitle>
-											<EmptyDescription>
-												{formatBackendError(error).description}
-											</EmptyDescription>
+											<EmptyDescription>{displayError(error).message}</EmptyDescription>
 										</EmptyHeader>
 										<Button
 											variant="outline"
@@ -1347,7 +1346,7 @@ function ChecksPanel({
 						until,
 						limit: 100,
 						cursor: nextCursor,
-						...(statusFilter === "all" ? {} : { status: statusFilter }),
+						...(!(statusFilter === "all") ? { status: statusFilter } : undefined),
 					},
 				}),
 			)

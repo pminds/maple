@@ -2,6 +2,7 @@ import {
 	type BranchUpsertInput,
 	type CommitUpsertInput,
 	GitCommitSha,
+	type PullRequestSummary,
 	type RepoUpsertInput,
 	type VcsInstallation,
 	VcsInstallationGoneError,
@@ -10,6 +11,7 @@ import {
 	type VcsProviderId,
 	VcsRateLimitedError,
 	type VcsRepositoryRef,
+	VcsRepositoryBlockedError,
 	VcsRepoUnavailableError,
 	type VcsSyncJob,
 	VcsWebhookParseError,
@@ -19,7 +21,12 @@ import { Clock, Context, Effect, Layer, Match, Option, Redacted, Schema } from "
 import { Env } from "@/platform/Env"
 import type { VcsProviderClient, VcsWebhookRequest } from "@/services/integrations/vcs/VcsProviderClient"
 import { QUEUE_MESSAGE_LIMIT_BYTES } from "@/services/integrations/vcs/VcsSyncQueue"
-import { type GithubApiCommit, GithubAppClient, GithubAppError } from "./GithubAppClient"
+import {
+	type GithubApiCommit,
+	type GithubApiPullRequest,
+	GithubAppClient,
+	GithubAppError,
+} from "./GithubAppClient"
 
 const PROVIDER: VcsProviderId = "github"
 
@@ -32,8 +39,6 @@ const PROVIDER: VcsProviderId = "github"
 // independent and idempotent (commits upsert by unique index), so splitting across
 // jobs is safe and order-independent.
 const PUSH_JOB_MAX_BYTES = QUEUE_MESSAGE_LIMIT_BYTES - 16 * 1024 // 16 KB reserve ⇒ 112 KB target
-
-// ---- Webhook payload schemas (minimal, permissive) ------------------------
 
 const PushAuthor = Schema.Struct({
 	name: Schema.optionalKey(Schema.NullOr(Schema.String)),
@@ -78,7 +83,31 @@ const RefEventPayload = Schema.Struct({
 	installation: Schema.Struct({ id: Schema.Number }),
 })
 
+// `pull_request` events. Only the fields the issue link and the verification
+// window need: the PR's identity, its text (scanned for a Maple issue
+// reference), and — the load-bearing part — whether this `closed` action was a
+// merge or an abandonment.
+const PullRequestPayload = Schema.Struct({
+	action: Schema.String,
+	number: Schema.Number,
+	pull_request: Schema.Struct({
+		html_url: Schema.String,
+		title: Schema.optionalKey(Schema.NullOr(Schema.String)),
+		body: Schema.optionalKey(Schema.NullOr(Schema.String)),
+		user: Schema.optionalKey(Schema.NullOr(Schema.Struct({ login: Schema.optionalKey(Schema.String) }))),
+		merged: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+		merge_commit_sha: Schema.optionalKey(Schema.NullOr(Schema.String)),
+		merged_at: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	}),
+	repository: Schema.Struct({
+		id: Schema.Number,
+		full_name: Schema.String,
+	}),
+	installation: Schema.Struct({ id: Schema.Number }),
+})
+
 const decodePush = Schema.decodeUnknownEffect(PushPayload)
+const decodePullRequest = Schema.decodeUnknownEffect(PullRequestPayload)
 const decodeInstallationEvent = Schema.decodeUnknownEffect(InstallationPayload)
 const decodeRefEvent = Schema.decodeUnknownEffect(RefEventPayload)
 
@@ -115,13 +144,32 @@ const parsePayload = <A, E>(event: string, decoded: Effect.Effect<A, E>) =>
 // everything else (incl. 401/403/5xx) is transient and retryable.
 const isGone = (status?: number) => status === 404 || status === 410
 
+// GitHub answers 451 for a repository taken down for legal reasons, and carries
+// the same `{"block":{"reason":"dmca"}}` body on the 403 variant. Neither clears
+// on retry, so both are terminal — matched on the body rather than on 403 alone,
+// which is otherwise an ordinary (retryable) permission failure.
+const BLOCK_BODY = /"block"\s*:|Repository access blocked/
+const isBlocked = (error: GithubAppError) =>
+	error.status === 451 || (error.status === 403 && BLOCK_BODY.test(error.message))
+
 const toVcsError = (
 	error: GithubAppError,
-): VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRateLimitedError => {
+):
+	| VcsProviderError
+	| VcsInstallationGoneError
+	| VcsRepoUnavailableError
+	| VcsRepositoryBlockedError
+	| VcsRateLimitedError => {
 	if (error.retryAfterSeconds !== undefined) {
 		return new VcsRateLimitedError({
 			message: error.message,
 			retryAfterSeconds: error.retryAfterSeconds,
+		})
+	}
+	if (isBlocked(error)) {
+		return new VcsRepositoryBlockedError({
+			message: error.message,
+			...(!(error.status === undefined) ? { status: error.status } : undefined),
 		})
 	}
 	if (isGone(error.status)) {
@@ -130,8 +178,8 @@ const toVcsError = (
 	}
 	return new VcsProviderError({
 		message: error.message,
-		...(error.status === undefined ? {} : { status: error.status }),
-		...(error.cause === undefined ? {} : { cause: error.cause }),
+		...(!(error.status === undefined) ? { status: error.status } : undefined),
+		...(!(error.cause === undefined) ? { cause: error.cause } : undefined),
 	})
 }
 
@@ -140,7 +188,7 @@ const toVcsError = (
 // `fetchCommits` keeps the port's 3-way error channel (no VcsRateLimitedError).
 const toVcsCommitError = (
 	error: GithubAppError,
-): VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError => {
+): VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRepositoryBlockedError => {
 	const mapped = toVcsError(error)
 	return mapped._tag === "@maple/http/errors/VcsRateLimitedError"
 		? new VcsProviderError({ message: mapped.message })
@@ -233,8 +281,8 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 					return yield* new VcsWebhookSignatureError({ message })
 				})
 
-			const verifySignature = (rawBody: string, signatureHeader: string | undefined) =>
-				Effect.gen(function* () {
+			const verifySignature = Effect.fn("GithubProvider.verifySignature")(
+				function* (rawBody: string, signatureHeader: string | undefined) {
 					const secret = env.GITHUB_APP_WEBHOOK_SECRET
 					if (Option.isNone(secret)) {
 						yield* Effect.logWarning(
@@ -292,11 +340,9 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 						return yield* signatureRejected("mismatch", "Webhook signature mismatch")
 					}
 					yield* Effect.annotateCurrentSpan({ "vcs.webhook.signature_result": "ok" })
-				}).pipe(
-					Effect.withSpan("GithubProvider.verifySignature", {
-						attributes: { "vcs.provider": PROVIDER },
-					}),
-				)
+				},
+				Effect.annotateSpans({ "vcs.provider": PROVIDER }),
+			)
 
 			const mapPush = (raw: unknown, now: number) =>
 				Effect.gen(function* () {
@@ -475,26 +521,81 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 					return [job]
 				})
 
+			// Actions that can change what a PR link means. `assigned`, `labeled`,
+			// `review_requested` and the rest of GitHub's long tail carry nothing this
+			// feature reads, and mapping them would enqueue a job per label click.
+			//
+			// The guard narrows rather than asserts, so the job's `action` union is
+			// proved here instead of cast at the call site — GitHub sends `action` as
+			// an open string and a new value must skip, not slip through mistyped.
+			const PULL_REQUEST_ACTIONS = ["opened", "edited", "reopened", "closed", "synchronize"] as const
+			type PullRequestAction = (typeof PULL_REQUEST_ACTIONS)[number]
+			const isPullRequestAction = (action: string): action is PullRequestAction =>
+				PULL_REQUEST_ACTIONS.some((candidate) => candidate === action)
+
+			const mapPullRequest = (raw: unknown) =>
+				Effect.gen(function* () {
+					const payload = yield* parsePayload("pull_request", decodePullRequest(raw))
+					const externalInstallationId = String(payload.installation.id)
+					const externalRepoId = String(payload.repository.id)
+					yield* Effect.annotateCurrentSpan({
+						"vcs.provider.installation_id": externalInstallationId,
+						"vcs.repository.external_id": externalRepoId,
+						"vcs.pull_request.number": payload.number,
+						"vcs.pull_request.action": payload.action,
+					})
+					if (!isPullRequestAction(payload.action)) {
+						yield* Effect.annotateCurrentSpan({
+							"vcs.webhook.outcome": "skipped",
+							"vcs.webhook.skip_reason": "unhandled_pull_request_action",
+						})
+						return []
+					}
+					const pr = payload.pull_request
+					const merged = pr.merged ?? false
+					const mergedAtMs = pr.merged_at ? finiteOrNull(Date.parse(pr.merged_at)) : null
+					yield* Effect.annotateCurrentSpan({
+						"vcs.webhook.outcome": "handled",
+						"vcs.pull_request.merged": merged,
+					})
+					const job: VcsSyncJob = {
+						kind: "pull-request-event",
+						provider: PROVIDER,
+						externalInstallationId,
+						externalRepoId,
+						repoFullName: payload.repository.full_name,
+						number: payload.number,
+						action: payload.action,
+						url: pr.html_url,
+						title: pr.title ?? null,
+						body: pr.body ?? null,
+						authorLogin: pr.user?.login ?? null,
+						merged,
+						mergeCommitSha: pr.merge_commit_sha ?? null,
+						mergedAtMs,
+					}
+					return [job]
+				})
+
 			// Dispatch a verified, parsed event to its mapper. Annotations (outcome /
 			// skip_reason / identifiers) are made by each mapper onto the surrounding
 			// `webhookToJobs` span.
 			const mapEvent = (event: string | undefined, parsed: unknown, now: number) =>
-				Effect.gen(function* () {
-					return yield* Match.value(event).pipe(
-						Match.when("push", () => mapPush(parsed, now)),
-						Match.when("installation", () => mapInstallation(parsed)),
-						Match.when("installation_repositories", () => mapInstallationRepositories(parsed)),
-						Match.when("create", () => mapRefEvent("created")(parsed)),
-						Match.when("delete", () => mapRefEvent("deleted")(parsed)),
-						Match.orElse(() =>
-							// ping and unhandled events are accepted no-ops.
-							Effect.annotateCurrentSpan({
-								"vcs.webhook.outcome": "skipped",
-								"vcs.webhook.skip_reason": "unhandled_event",
-							}).pipe(Effect.as([])),
-						),
-					)
-				})
+				Match.value(event).pipe(
+					Match.when("push", () => mapPush(parsed, now)),
+					Match.when("pull_request", () => mapPullRequest(parsed)),
+					Match.when("installation", () => mapInstallation(parsed)),
+					Match.when("installation_repositories", () => mapInstallationRepositories(parsed)),
+					Match.when("create", () => mapRefEvent("created")(parsed)),
+					Match.when("delete", () => mapRefEvent("deleted")(parsed)),
+					Match.orElse(() =>
+						// ping and unhandled events are accepted no-ops.
+						Effect.annotateCurrentSpan({
+							"vcs.webhook.outcome": "skipped",
+							"vcs.webhook.skip_reason": "unhandled_event",
+						}).pipe(Effect.as([])),
+					),
+				)
 
 			const webhookToJobs = (input: VcsWebhookRequest) =>
 				Effect.gen(function* () {
@@ -559,9 +660,11 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 						.listCommits(installation.externalInstallationId, repo.owner, repo.name, {
 							sha: opts.branch,
 							sinceIso: new Date(opts.sinceMs).toISOString(),
-							...(opts.untilMs === undefined
-								? {}
-								: { untilIso: new Date(opts.untilMs).toISOString() }),
+							...(!(opts.untilMs === undefined)
+								? {
+										untilIso: new Date(opts.untilMs).toISOString(),
+									}
+								: undefined),
 						})
 						.pipe(Effect.mapError(toVcsCommitError))
 					const normalized = result.commits.map((c) => normalizeFetchedCommit(c, now))
@@ -602,7 +705,7 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 							// A 404 means this repo doesn't contain the SHA (or access was lost) —
 							// for a SHA-only probe that's "look in the next repo", not a failure.
 							// Every other GitHub failure is mapped to the port's semantic errors.
-							Effect.catchTag("GithubAppError", (error) =>
+							Effect.catchTag("@maple/api/vcs/GithubAppError", (error) =>
 								error.status === 404
 									? Effect.succeed(Option.none<CommitUpsertInput>())
 									: Effect.fail(toVcsCommitError(error)),
@@ -625,6 +728,51 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 					),
 					Effect.mapError(toVcsError),
 				)
+
+			// GitHub reports open/closed in `state` and merged-ness separately in
+			// `merged_at`, so a merged PR arrives as `state: "closed"`. Collapsing the
+			// two here is the same rule `mapPullRequest` applies to a webhook payload —
+			// the port only ever speaks the three-way `PullRequestLinkState`.
+			const normalizePullRequest = (pr: GithubApiPullRequest): PullRequestSummary => {
+				const mergedAtMs = pr.merged_at === null ? null : Date.parse(pr.merged_at)
+				const merged = mergedAtMs !== null && Number.isFinite(mergedAtMs)
+				const updatedAtMs = Date.parse(pr.updated_at)
+				return {
+					number: pr.number,
+					title: pr.title,
+					url: pr.html_url,
+					authorLogin: pr.user?.login ?? null,
+					state: merged ? "merged" : pr.state === "closed" ? "closed" : "open",
+					headRef: pr.head.ref,
+					baseRef: pr.base.ref,
+					isDraft: pr.draft ?? false,
+					updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
+					mergedAtMs: merged ? mergedAtMs : null,
+					mergeCommitSha: pr.merge_commit_sha,
+				}
+			}
+
+			const fetchPullRequests: VcsProviderClient["fetchPullRequests"] = (installation, repo, opts) =>
+				client
+					.listPullRequests(installation.externalInstallationId, repo.owner, repo.name, opts.limit)
+					.pipe(
+						Effect.map((prs) => prs.map(normalizePullRequest)),
+						Effect.mapError(toVcsError),
+					)
+
+			const fetchPullRequest: VcsProviderClient["fetchPullRequest"] = (installation, repo, number) =>
+				client
+					.getPullRequest(installation.externalInstallationId, repo.owner, repo.name, number)
+					.pipe(
+						// The client already turns a 404 into `null` — no such PR in this
+						// repo is an expected answer, not a failure.
+						Effect.map((pr) =>
+							pr === null
+								? Option.none<PullRequestSummary>()
+								: Option.some(normalizePullRequest(pr)),
+						),
+						Effect.mapError(toVcsError),
+					)
 
 			const searchCode: VcsProviderClient["searchCode"] = (installation, repo, query, opts) =>
 				client
@@ -666,7 +814,7 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 										: file.content,
 							}),
 						),
-						Effect.catchTag("GithubAppError", (error) =>
+						Effect.catchTag("@maple/api/vcs/GithubAppError", (error) =>
 							error.status === 404
 								? Effect.succeed(Option.none())
 								: Effect.fail(toVcsCommitError(error)),
@@ -680,6 +828,8 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 				fetchCommits,
 				fetchBranches,
 				fetchCommit,
+				fetchPullRequests,
+				fetchPullRequest,
 				searchCode,
 				fetchSourceFile,
 			} satisfies VcsProviderClient

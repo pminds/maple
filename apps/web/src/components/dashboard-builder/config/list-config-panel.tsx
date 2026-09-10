@@ -1,9 +1,10 @@
-import * as React from "react"
+import { useMemo, useState } from "react"
 import { Reorder, useDragControls } from "motion/react"
 import { Button } from "@maple/ui/components/ui/button"
 import { Input } from "@maple/ui/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@maple/ui/components/ui/select"
 import { cn } from "@maple/ui/lib/utils"
+import { WIDGET_UNITS } from "@maple/domain/http"
 import { WhereClauseEditor } from "@/components/query-builder/where-clause-editor"
 import { useWidgetBuilder } from "@/hooks/use-widget-builder"
 import { useAutocompleteValuesContext } from "@/hooks/use-autocomplete-values"
@@ -12,30 +13,14 @@ import { Switch } from "@maple/ui/components/ui/switch"
 import { getListPerformanceHints } from "@/lib/query-builder/performance-hints"
 import { GripDotsIcon } from "@/components/icons"
 
-type ListDataSource = "traces" | "logs"
-
-interface ListColumnDraft {
-	field: string
-	header: string
-	unit?: ValueUnit
-	align?: "left" | "center" | "right"
-}
+import {
+	LOG_DEFAULT_COLUMNS,
+	TRACE_DEFAULT_COLUMNS,
+	type ListColumnDraft,
+	type ListDataSource,
+} from "@/lib/query-builder/list-widget-config"
 
 // Props interface removed — ListConfigPanel now reads from context
-
-const TRACE_DEFAULT_COLUMNS: ListColumnDraft[] = [
-	{ field: "serviceName", header: "Service" },
-	{ field: "spanName", header: "Span" },
-	{ field: "durationMs", header: "Duration", unit: "duration_ms", align: "right" },
-	{ field: "statusCode", header: "Status" },
-]
-
-const LOG_DEFAULT_COLUMNS: ListColumnDraft[] = [
-	{ field: "timestamp", header: "Time" },
-	{ field: "severityText", header: "Severity" },
-	{ field: "serviceName", header: "Service" },
-	{ field: "body", header: "Message" },
-]
 
 // These are the fields returned by the query engine's list query
 // (raw traces table, not the materialized view)
@@ -53,19 +38,12 @@ const TRACE_FIELDS = [
 
 const LOG_FIELDS = ["timestamp", "severityText", "severityNumber", "serviceName", "body", "traceId", "spanId"]
 
-const UNIT_OPTIONS: Array<{ value: string; label: string }> = [
-	{ value: "none", label: "None" },
-	{ value: "number", label: "Number" },
-	{ value: "percent", label: "Percent (0–1)" },
-	{ value: "percent_100", label: "Percent (0–100)" },
-	{ value: "duration_ms", label: "Duration (ms)" },
-	{ value: "duration_us", label: "Duration (us)" },
-	{ value: "bytes", label: "Bytes" },
-	{ value: "requests_per_sec", label: "Req/s" },
-]
-
-export { TRACE_DEFAULT_COLUMNS, LOG_DEFAULT_COLUMNS }
-export type { ListColumnDraft, ListDataSource }
+// Derived from the shared catalog so a token added there shows up here, and so
+// the picker can never offer one the formatter does not handle.
+const UNIT_OPTIONS: Array<{ value: string; label: string }> = WIDGET_UNITS.map((unit) => ({
+	value: unit.token,
+	label: unit.label,
+}))
 
 function DraggableColumnRow({
 	id,
@@ -77,6 +55,7 @@ function DraggableColumnRow({
 	allSuggestedFields,
 	updateColumn,
 	removeColumn,
+	onMoveBy,
 }: {
 	id: string
 	column: ListColumnDraft
@@ -87,6 +66,7 @@ function DraggableColumnRow({
 	allSuggestedFields: string[]
 	updateColumn: (index: number, updates: Partial<ListColumnDraft>) => void
 	removeColumn: (index: number) => void
+	onMoveBy: (delta: -1 | 1) => void
 }) {
 	const controls = useDragControls()
 
@@ -96,7 +76,7 @@ function DraggableColumnRow({
 			dragListener={false}
 			dragControls={controls}
 			as="div"
-			className="flex items-center gap-2 rounded-md bg-background py-1 relative"
+			className="relative flex items-center gap-2 rounded-md bg-background py-1"
 			whileDrag={{
 				scale: 1.02,
 				boxShadow: "0 4px 14px rgba(0,0,0,0.12)",
@@ -106,8 +86,18 @@ function DraggableColumnRow({
 		>
 			<button
 				type="button"
-				className="shrink-0 cursor-grab active:cursor-grabbing text-muted-foreground/50 hover:text-muted-foreground touch-none"
-				onPointerDown={(e) => controls.start(e)}
+				aria-label={`Reorder ${column.header || column.field || `column ${index + 1}`}`}
+				className="shrink-0 cursor-grab touch-none text-muted-foreground/50 hover:text-muted-foreground active:cursor-grabbing"
+				onPointerDown={(event) => controls.start(event)}
+				onKeyDown={(event) => {
+					if (event.key === "ArrowUp") {
+						event.preventDefault()
+						onMoveBy(-1)
+					} else if (event.key === "ArrowDown") {
+						event.preventDefault()
+						onMoveBy(1)
+					}
+				}}
 			>
 				<GripDotsIcon size={14} />
 			</button>
@@ -220,12 +210,12 @@ export function ListConfigPanel() {
 		listRootOnly?: boolean
 		listColumns?: ListColumnDraft[]
 	}) => setState((current) => ({ ...current, ...updates }))
-	const [showFieldSuggestions, setShowFieldSuggestions] = React.useState<number | null>(null)
+	const [showFieldSuggestions, setShowFieldSuggestions] = useState<number | null>(null)
 
 	// Stable IDs for Reorder — kept in sync with columns array.
 	// addColumn/removeColumn/reorderColumns update the state before calling onChange,
 	// so a length mismatch here means an external reset (e.g. parent replaced columns).
-	const [storedColumnIds, setStoredColumnIds] = React.useState<string[]>(() =>
+	const [storedColumnIds, setStoredColumnIds] = useState<string[]>(() =>
 		columns.map(() => crypto.randomUUID()),
 	)
 	let columnIds = storedColumnIds
@@ -240,8 +230,8 @@ export function ListConfigPanel() {
 	const attributePrefix = listDataSource === "traces" ? "spanAttributes." : "logAttributes."
 	const resourcePrefix = "resourceAttributes."
 
-	const dynamicAttributeKeys = React.useMemo(() => {
-		const vals = autocompleteValues[listDataSource]
+	const dynamicAttributeKeys = useMemo(() => {
+		const vals = listDataSource === "traces" ? autocompleteValues.traces : autocompleteValues.logs
 		const keys: string[] = []
 		if (vals && "attributeKeys" in vals && Array.isArray(vals.attributeKeys)) {
 			for (const k of vals.attributeKeys) {
@@ -256,7 +246,7 @@ export function ListConfigPanel() {
 		return keys
 	}, [autocompleteValues, listDataSource, attributePrefix])
 
-	const allSuggestedFields = React.useMemo(
+	const allSuggestedFields = useMemo(
 		() => [...knownFields, ...dynamicAttributeKeys],
 		[knownFields, dynamicAttributeKeys],
 	)
@@ -298,6 +288,23 @@ export function ListConfigPanel() {
 		})
 		setStoredColumnIds(newIdOrder)
 		onChange({ listColumns: reordered })
+	}
+
+	const moveColumn = (id: string, targetId: string) => {
+		const from = columnIds.indexOf(id)
+		const to = columnIds.indexOf(targetId)
+		if (from < 0 || to < 0 || from === to) return
+		const next = [...columnIds]
+		next.splice(from, 1)
+		next.splice(to, 0, id)
+		reorderColumns(next)
+	}
+
+	const moveColumnBy = (id: string, delta: -1 | 1) => {
+		const from = columnIds.indexOf(id)
+		const to = Math.max(0, Math.min(columnIds.length - 1, from + delta))
+		const target = columnIds[to]
+		if (target) moveColumn(id, target)
 	}
 
 	return (
@@ -440,6 +447,7 @@ export function ListConfigPanel() {
 							allSuggestedFields={allSuggestedFields}
 							updateColumn={updateColumn}
 							removeColumn={removeColumn}
+							onMoveBy={(delta) => moveColumnBy(columnIds[i]!, delta)}
 						/>
 					))}
 				</Reorder.Group>

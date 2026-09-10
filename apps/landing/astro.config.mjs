@@ -2,8 +2,11 @@
 import fs from "node:fs"
 import path from "node:path"
 import { defineConfig } from "astro/config"
+import { transformerNotationDiff, transformerNotationHighlight } from "@shikijs/transformers"
+import { unified } from "@astrojs/markdown-remark"
+import rehypeTableWrap from "./src/lib/rehype-table-wrap.mjs"
 import mdx from "@astrojs/mdx"
-import paraglide from "@inlang/paraglide-astro"
+import { paraglideVitePlugin } from "@inlang/paraglide-js"
 import react from "@astrojs/react"
 import sitemap from "@astrojs/sitemap"
 import tailwindcss from "@tailwindcss/vite"
@@ -47,9 +50,6 @@ const telemetryEnv = {
 			rootEnv.VITE_INGEST_URL?.trim() ||
 			"",
 	),
-	"import.meta.env.PUBLIC_MAPLE_REPLAY_SAMPLE_RATE": JSON.stringify(
-		process.env.PUBLIC_MAPLE_REPLAY_SAMPLE_RATE?.trim() || "0.1",
-	),
 	// Local dev only: browsers make `*.localhost` cookies host-only, so
 	// landing.localhost and web.localhost can't share a visitor id without help.
 	"import.meta.env.PUBLIC_MAPLE_COOKIE_DOMAIN": JSON.stringify(
@@ -61,6 +61,9 @@ const telemetryEnv = {
 export default defineConfig({
 	site: "https://maple.dev",
 	trailingSlash: "ignore",
+	redirects: {
+		"/docs/sdks/overview": "/docs/instrumentation",
+	},
 	i18n: {
 		locales: ["en", "ja", "ko"],
 		defaultLocale: "en",
@@ -72,18 +75,26 @@ export default defineConfig({
 			fallbackType: "rewrite",
 		},
 	},
+	// Astro 7's HTML compressor strips whitespace with JSX rules by default,
+	// silently joining adjacent inline elements across the marketing pages.
+	compressHTML: true,
 	markdown: {
+		// Stay on the remark pipeline: Sätteri doesn't run the Shiki transformers
+		// configured below. Revisit when the transformer story lands there.
+		processor: unified({ rehypePlugins: [rehypeTableWrap] }),
 		shikiConfig: {
 			theme: "vitesse-dark",
 			wrap: true,
+			// Line classes only ("diff add" / "highlighted"); the colors live in
+			// global.css under .blog-content.
+			transformers: [
+				transformerNotationDiff({ matchAlgorithm: "v3" }),
+				transformerNotationHighlight({ matchAlgorithm: "v3" }),
+			],
 		},
 	},
 	integrations: [
 		mdx(),
-		paraglide({
-			project: "./project.inlang",
-			outdir: "./src/paraglide",
-		}),
 		react(),
 		sitemap({
 			i18n: {
@@ -102,7 +113,16 @@ export default defineConfig({
 		}),
 	],
 	vite: {
-		plugins: [tailwindcss()],
+		plugins: [
+			tailwindcss(),
+			// Keep these options in sync with the `sync:i18n` script, which compiles
+			// the same output for typecheck/knip without going through Vite.
+			paraglideVitePlugin({
+				project: "./project.inlang",
+				outdir: "./src/paraglide",
+				strategy: ["url", "baseLocale"],
+			}),
+		],
 		envDir: "../../",
 		define: telemetryEnv,
 	},

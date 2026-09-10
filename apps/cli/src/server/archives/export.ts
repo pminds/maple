@@ -1,3 +1,4 @@
+// SAFETY-FILE: JSON rows here come from fixed internal formats and are validated before domain use.
 import { createHash } from "node:crypto"
 import {
 	closeSync,
@@ -60,10 +61,13 @@ import { type ArchiveSignal } from "./signals"
  * an EXPLICIT isNull(c) flag as a separate hash argument, so NULL-ness is never
  * conflated with a value. An unknown value fails closed.
  */
-export const COMPLEX_DIGEST_ALGORITHM = "cityhash64-multiset-v3"
+export const COMPLEX_DIGEST_ALGORITHM = "cityhash64-bounded-multiset-v4"
 
 /** Digest algorithms this reader accepts in a manifest shard record. */
-export const KNOWN_COMPLEX_DIGEST_ALGORITHMS: ReadonlySet<string> = new Set(["cityhash64-multiset-v3"])
+export const KNOWN_COMPLEX_DIGEST_ALGORITHMS: ReadonlySet<string> = new Set([
+	"cityhash64-multiset-v3",
+	COMPLEX_DIGEST_ALGORITHM,
+])
 
 export interface ExportSettings {
 	readonly writerThreads: number
@@ -125,15 +129,6 @@ const parseCount = (text: string): number => {
 	return count
 }
 
-/**
- * Count the rows in `table` whose event time falls on a given UTC date using
- * toDate() equality (robust against the chDB toDateTime64 aggregate miscount).
- */
-export const countRowsForDay = (db: Chdb, signal: ArchiveSignal, rangeDate: string): number => {
-	const sql = `SELECT count() FROM ${signal.name} WHERE toDate(${signal.eventTimeColumn}, 'UTC') = '${rangeDate}'`
-	return parseCount(db.query(sql, "JSONEachRow"))
-}
-
 const sha256File = (path: string): string => {
 	const hash = createHash("sha256")
 	hash.update(readFileSync(path))
@@ -161,9 +156,7 @@ const assertSafePath = (path: string): void => {
 const hourPredicate = (signal: ArchiveSignal, rangeDate: string, hour: number): string =>
 	`toDate(${signal.eventTimeColumn}, 'UTC') = '${rangeDate}' AND toHour(${signal.eventTimeColumn}, 'UTC') = ${hour}`
 
-// ---------------------------------------------------------------------------
 // Schema comparison (blocker #4) — recursive, grounded in measured transforms.
-// ---------------------------------------------------------------------------
 
 /** A source column's name and type, captured before export for round-trip comparison. */
 export interface SourceColumn {
@@ -176,7 +169,10 @@ export interface SourceColumn {
  * shard's reopened schema is compared against this to prove the schema
  * round-tripped — not just that it has "some" columns.
  */
-export const captureSourceSchema = (db: Chdb, signal: ArchiveSignal): ReadonlyArray<SourceColumn> => {
+export const captureSourceSchema = (
+	db: Pick<Chdb, "query">,
+	signal: ArchiveSignal,
+): ReadonlyArray<SourceColumn> => {
 	const rows = readRows(db.query(`DESCRIBE ${signal.name} FORMAT JSONEachRow`, "JSONEachRow"))
 	const cols = rows.map((r) => ({ name: String(r.name), type: String(r.type) }))
 	if (cols.length === 0) throw new Error(`source table ${signal.name} has no columns`)
@@ -336,23 +332,36 @@ const normalizeValueForHash = (name: string, type: string): string => {
 }
 
 /**
- * The multiset complex-value digest of a slice: the sorted multiset of per-row
- * position-bound hashes, folded into one hash. Order-independent (sorted) so it
- * tolerates row-order differences between source and reopened Parquet, yet it
- * preserves row identity + multiplicity — so it detects:
+ * A fixed-memory multiset digest of a slice. Four independent commutative
+ * accumulators over position-bound row hashes make it order-independent while
+ * retaining row identity and multiplicity. Unlike the former sorted
+ * `groupArray`, memory usage does not grow with the number of rows. It detects:
  *   - a same-typed column swap (each affected row's hash changes),
  *   - cross-row value reassociation (a row's hash changes),
  *   - duplicate-one/drop-another (the multiset of row hashes changes),
  * all of which preserve count and time extrema and defeated the round-4
- * commutative per-column sum. Measured at maxShardRows (500k): 41ms, +15MiB RSS.
+ * commutative per-column sum.
  *
  * `sliceFrom` is the FROM clause (e.g. `traces` or `file('p', Parquet)`, with a
  * WHERE predicate already applied where needed). The sort is inside chDB; no
  * rows are materialized in JavaScript.
  */
-const multisetDigestSql = (sourceSchema: ReadonlyArray<SourceColumn>, sliceFrom: string): string => {
+export const multisetDigestSql = (sourceSchema: ReadonlyArray<SourceColumn>, sliceFrom: string): string => {
 	const args = perRowHashArgs(sourceSchema)
-	return `SELECT toString(cityHash64(groupArray(h))) AS d FROM (SELECT cityHash64(${args}) AS h FROM ${sliceFrom} ORDER BY h)`
+	return `SELECT concat(toString(count()), ':', toString(sumWithOverflow(h)), ':', toString(groupBitXor(h)), ':', toString(sumWithOverflow(cityHash64(h)))) AS d FROM (SELECT cityHash64(${args}) AS h FROM ${sliceFrom})`
+}
+
+/** Compute the canonical order-independent digest used by archive validation. */
+export const computeMultisetDigest = (
+	db: Pick<Chdb, "query">,
+	sourceSchema: ReadonlyArray<SourceColumn>,
+	sliceFrom: string,
+): string => {
+	const rows = readRows(db.query(multisetDigestSql(sourceSchema, sliceFrom), "JSONEachRow"))
+	const digest = rows[0]?.d
+	if (typeof digest !== "string" || !/^\d+:\d+:\d+:\d+$/.test(digest))
+		throw new Error(`invalid multiset digest result: ${String(digest)}`)
+	return digest
 }
 
 /**
@@ -401,14 +410,10 @@ export const compareSchema = (
 	return parquetCols.map((c) => c.name)
 }
 
-// ---------------------------------------------------------------------------
 // Per-shard validation (H-1 reopen, H-A schema, H-B source count, H-D digest).
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Per-shard validation: H-1 reopen, H-A schema, H-B source count, H-D multiset
 // digest, H-E explicit source-vs-Parquet nanosecond event-time bounds.
-// ---------------------------------------------------------------------------
 
 /**
  * The physical slice a shard covers: one part, a half-open `_part_offset` range,
@@ -570,10 +575,8 @@ export const measureShardBytes = (
 	return { uncompressed: Number(row?.uncompressed ?? 0), onDiskBytes: statSync(shardPath).size }
 }
 
-// ---------------------------------------------------------------------------
 // Sharding plan — enumerate each active MergeTree part and split its
 // _part_offset domain into half-open ranges (no ORDER BY; D-016).
-// ---------------------------------------------------------------------------
 
 /**
  * A planned shard: one part, a half-open `_part_offset` range, and the UTC

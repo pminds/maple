@@ -1,14 +1,12 @@
 import * as React from "react"
 
-import type { BaseChartProps } from "../_shared/chart-types"
+import type { QueryBuilderHbarChartProps } from "../_shared/chart-types"
 import { cn } from "../../../lib/utils"
 import { formatNumber, formatValueByUnit } from "../../../lib/format"
-import { hbarSampleData } from "../_shared/sample-data"
 import { pickValueField, toBreakdownRows, type BreakdownRow } from "../_shared/breakdown-rows"
 import { resolveSeriesColors } from "../../../lib/semantic-series-colors"
 import { useContainerSize } from "../../../hooks/use-container-size"
 
-// ---------------------------------------------------------------------------
 // Ranked horizontal bars — the "top N by volume" panel.
 //
 // The funnel used to be the only row-per-category chart, so every ranking was
@@ -17,7 +15,6 @@ import { useContainerSize } from "../../../hooks/use-container-size"
 // bar, so four unrelated operations of equal size all render "100%". Here rows
 // are sorted by value and each percentage is a share of the **total**, which is
 // the only reading that sums to 100% across the panel.
-// ---------------------------------------------------------------------------
 
 interface Bar extends BreakdownRow {
 	color: string
@@ -44,11 +41,13 @@ const ROW_FULL_H = ROW_MIN_H + ROW_GAP
 const BAR_MIN_PCT = 0.02
 const MORE_ROW_H = 16
 
-export function QueryBuilderHbarChart({ data, className, unit }: BaseChartProps) {
-	const source: ReadonlyArray<Record<string, unknown>> =
-		Array.isArray(data) && data.length > 0
-			? data
-			: (hbarSampleData as ReadonlyArray<Record<string, unknown>>)
+// No sample-data fallback: substituting fixtures for real rows made every
+// misconfigured or mis-fed chart draw a plausible-looking picture instead of an
+// empty one. Gallery thumbnails pass their sample rows in explicitly via `data`.
+const EMPTY_ROWS: ReadonlyArray<Record<string, unknown>> = []
+
+export function QueryBuilderHbarChart({ data, className, unit }: QueryBuilderHbarChartProps) {
+	const source: ReadonlyArray<Record<string, unknown>> = Array.isArray(data) ? data : EMPTY_ROWS
 
 	const valueField = React.useMemo(() => pickValueField(source), [source])
 

@@ -1,5 +1,7 @@
+// BOUNDARY: Test doubles preserve opaque values so the consuming boundary can be exercised.
 import { describe, it } from "@effect/vitest"
-import { Effect, Exit, Option } from "effect"
+import { Clock, Duration, Effect, Exit, Option } from "effect"
+import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { deepStrictEqual, match, ok, rejects, strictEqual, throws } from "node:assert"
 import {
 	existsSync,
@@ -20,6 +22,7 @@ import {
 	type CheckpointId,
 	type CheckpointOperationId,
 	type CheckpointQuarantineId,
+	checkpointAvailability,
 	checkpointRoot,
 	checkpointSnapshotDir,
 	checkpointStatePath,
@@ -29,6 +32,7 @@ import {
 	newCheckpointOperationId,
 	newCheckpointQuarantineId,
 	parseCheckpointManifest,
+	postCheckpointBackup,
 	parseCheckpointState,
 	readCheckpointState,
 	reconcileCheckpointRecovery,
@@ -51,7 +55,7 @@ import {
 	syncDirectory,
 	syncTree,
 } from "../src/server/durable-files"
-import { SCHEMA_FINGERPRINT } from "../src/server/serve"
+import { SCHEMA_FINGERPRINT } from "../src/server/schema-identity"
 import { storeMarkerPath, storeOpenMarkerPath } from "../src/server/store-version"
 import { CHDB_VERSION, MAPLE_VERSION } from "../src/version"
 
@@ -337,6 +341,29 @@ describe("checkpoint state resolution", () => {
 			rmSync(checkpointRoot(dataDir), { recursive: true })
 			mkdirSync(join(checkpointRoot(dataDir), "current"), { recursive: true })
 			await rejects(readCheckpointState(dataDir), /legacy preview/)
+		})
+	})
+
+	it("reports checkpoint availability so recovery advice can name a command that works", async () => {
+		await withDataDir(async (dataDir) => {
+			// Never checkpointed: the ordinary state, not a fault.
+			deepStrictEqual(await checkpointAvailability(dataDir), { available: false, reason: "none" })
+
+			const current = newCheckpointId()
+			writeSnapshot(dataDir, current)
+			writeState(dataDir, current, null)
+			deepStrictEqual(await checkpointAvailability(dataDir), { available: true, checkpointId: current })
+
+			// Present but unreadable state is "unusable", never silently "none".
+			writeFileSync(checkpointStatePath(dataDir), "{bad json")
+			const corrupt = await checkpointAvailability(dataDir)
+			strictEqual(corrupt.available, false)
+			strictEqual(corrupt.available === false ? corrupt.reason : undefined, "unusable")
+
+			// Snapshot data beside a missing state file is a fault too.
+			rmSync(checkpointStatePath(dataDir))
+			const orphaned = await checkpointAvailability(dataDir)
+			strictEqual(orphaned.available === false ? orphaned.reason : undefined, "unusable")
 		})
 	})
 
@@ -1048,3 +1075,48 @@ const throwsMessage = (run: () => unknown, expected: RegExp): void => {
 		match(error instanceof Error ? error.message : String(error), expected)
 	}
 }
+
+describe("checkpoint backup request has no client-side timeout", () => {
+	// The server executes BACKUP through a synchronous db.exec that cannot
+	// observe client cancellation. A client timeout unwound checkpoint creation
+	// and released the maintenance lock while the snapshot was still being
+	// written — so a legitimately slow BACKUP must be waited out, not raced.
+	//
+	// Simulated time: every Clock.sleep runs 1000x faster, so the removed 30s
+	// ceiling would fire at ~30ms real time while the stub server answers at
+	// ~600ms — the old code deterministically failed here with its TimeoutError.
+	const scaledClock: Clock.Clock = {
+		currentTimeMillisUnsafe: () => Date.now(),
+		currentTimeMillis: Effect.sync(() => Date.now()),
+		currentTimeNanosUnsafe: () => BigInt(Date.now()) * 1_000_000n,
+		currentTimeNanos: Effect.sync(() => BigInt(Date.now()) * 1_000_000n),
+		monotonicTimeNanosUnsafe: () => process.hrtime.bigint(),
+		monotonicTimeNanos: Effect.sync(() => process.hrtime.bigint()),
+		sleep: (duration) =>
+			Effect.promise(() => new Promise<void>((r) => setTimeout(r, Duration.toMillis(duration) / 1000))),
+	}
+
+	it("waits out a backup slower than the old 30s ceiling", async () => {
+		const root = mkdtempSync(join(tmpdir(), "maple-backup-timeout-"))
+		const dataDir = join(root, "data")
+		mkdirSync(dataDir, { recursive: true })
+		writeFileSync(`${dataDir}.maintenance-token`, "token\n")
+		const slowClient = HttpClient.make((request) =>
+			Effect.succeed(
+				HttpClientResponse.fromWeb(request, new Response('{"ok":true}', { status: 200 })),
+			).pipe(Effect.delay("10 minutes")),
+		)
+		try {
+			const exit = await Effect.runPromise(
+				postCheckpointBackup("127.0.0.1", 4318, dataDir, newCheckpointId()).pipe(
+					Effect.exit,
+					Effect.provideService(HttpClient.HttpClient, slowClient),
+					Effect.provideService(Clock.Clock, scaledClock),
+				),
+			)
+			ok(Exit.isSuccess(exit), `slow backup must succeed, got ${JSON.stringify(exit)}`)
+		} finally {
+			rmSync(root, { recursive: true, force: true })
+		}
+	})
+})

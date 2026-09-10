@@ -13,14 +13,12 @@ import {
 	runLocalStoreMigration,
 	type MigrationPlan,
 } from "../server/local-store-migrations"
+import { maintenanceOperation } from "../server/checkpoints"
 import { readMarker } from "../server/store-version"
 
-class SchemaCommandError extends Schema.TaggedErrorClass<SchemaCommandError>()(
-	"@maple/cli/SchemaCommandError",
-	{
-		message: Schema.String,
-	},
-) {}
+class SchemaCommandError extends Schema.TaggedError<SchemaCommandError>()("@maple/cli/SchemaCommandError", {
+	message: Schema.String,
+}) {}
 
 const defaultDataDir = (): string => join(homedir(), ".maple", "data")
 
@@ -135,7 +133,8 @@ export const schemaMigrate = Command.make("migrate", {
 	Command.withHandler(
 		Effect.fnUntraced(function* (args) {
 			const dataDir = resolvedDataDir(args.dataDir)
-			const preview = yield* Effect.tryPromise({
+			const preview = yield* maintenanceOperation({
+				operation: "schema.migrate_preview",
 				try: () => runLocalStoreMigration({ dataDir, dryRun: true }),
 				catch: (error) =>
 					new SchemaCommandError({
@@ -157,7 +156,8 @@ export const schemaMigrate = Command.make("migrate", {
 					return
 				}
 			}
-			const result = yield* Effect.tryPromise({
+			const result = yield* maintenanceOperation({
+				operation: "schema.migrate_apply",
 				try: () =>
 					runLocalStoreMigration({
 						dataDir,
@@ -201,7 +201,8 @@ export const schemaAbandon = Command.make("abandon", {
 				)
 				return
 			}
-			const quarantine = yield* Effect.tryPromise({
+			const quarantine = yield* maintenanceOperation({
+				operation: "schema.abandon",
 				try: () => abandonLocalStoreMigrationPreservingSource(dataDir),
 				catch: (error) =>
 					new SchemaCommandError({

@@ -1,6 +1,6 @@
-import { optionalNumberParam, optionalStringParam, type McpToolRegistrar } from "./types"
+import { optionalNumberParam, optionalStringParam, optionalTimeParam, type McpToolRegistrar } from "./types"
 import { toMcpQueryError } from "@/mcp/lib/map-warehouse-error"
-import { resolveTenant } from "@/mcp/lib/query-warehouse"
+import { CurrentMcpTenant } from "@/mcp/lib/query-warehouse"
 import { queryWarehouse } from "@/mcp/lib/query-warehouse"
 import { resolveTimeRange, rangeExceededResult, MCP_DISCOVERY_MAX_HOURS } from "@/mcp/lib/time"
 import { clampLimit } from "@/mcp/lib/limits"
@@ -9,7 +9,7 @@ import { Array as Arr, Effect, Schema } from "effect"
 import { createDualContent } from "@/mcp/lib/structured-output"
 import { formatNextSteps } from "@/mcp/lib/next-steps"
 import { exploreAttributeKeys, exploreAttributeValues } from "@maple/query-engine/observability"
-import { makeWarehouseExecutorFromTenant } from "@/services/warehouse/WarehouseQueryService"
+import { provideWarehouseExecutorFromTenant } from "@/services/warehouse/WarehouseQueryService"
 
 export function registerExploreAttributesTool(server: McpToolRegistrar) {
 	server.tool(
@@ -30,8 +30,8 @@ export function registerExploreAttributesTool(server: McpToolRegistrar) {
 				"When provided, returns values for this key instead of listing all keys",
 			),
 			service_name: optionalStringParam("Filter by service name"),
-			start_time: optionalStringParam("Start time (YYYY-MM-DD HH:mm:ss)"),
-			end_time: optionalStringParam("End time (YYYY-MM-DD HH:mm:ss)"),
+			start_time: optionalTimeParam("Start time (YYYY-MM-DD HH:mm:ss)"),
+			end_time: optionalTimeParam("End time (YYYY-MM-DD HH:mm:ss)"),
 			limit: optionalNumberParam("Max results (default 50)"),
 		}),
 		Effect.fn("McpTool.exploreAttributes")(function* (params) {
@@ -42,8 +42,8 @@ export function registerExploreAttributesTool(server: McpToolRegistrar) {
 			if (range.exceeded) return rangeExceededResult(range, "explore_attributes")
 			const lim = clampLimit(params.limit, { defaultValue: 50, max: 500 })
 			const scope = (params.scope ?? "span") as "span" | "resource"
-			const tenant = yield* resolveTenant
-			const executorLayer = makeWarehouseExecutorFromTenant(tenant)
+			const tenant = yield* CurrentMcpTenant
+			const provideExecutor = provideWarehouseExecutorFromTenant(tenant)
 			const mapError = toMcpQueryError("explore_attributes")
 
 			const baseInput = {
@@ -55,9 +55,8 @@ export function registerExploreAttributesTool(server: McpToolRegistrar) {
 			}
 
 			if (params.key) {
-				// Return values for a specific key
 				const values = yield* exploreAttributeValues({ ...baseInput, key: params.key }).pipe(
-					Effect.provide(executorLayer),
+					provideExecutor,
 					Effect.mapError(mapError),
 				)
 
@@ -175,7 +174,7 @@ export function registerExploreAttributesTool(server: McpToolRegistrar) {
 
 			// List keys for traces or metrics
 			const keys = yield* exploreAttributeKeys(baseInput).pipe(
-				Effect.provide(executorLayer),
+				provideExecutor,
 				Effect.mapError(mapError),
 			)
 

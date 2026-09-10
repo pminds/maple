@@ -1,7 +1,7 @@
+import type { OrgId } from "@maple/domain"
 import { sql } from "drizzle-orm"
 import { index, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core"
 
-// ---------------------------------------------------------------------------
 // Slack workspace installations. One row per Slack team (workspace) that has
 // installed the Maple Slack app via OAuth. A row binds a Slack `teamId` to a
 // Maple org and stores, encrypted, both the Slack bot token (used to post
@@ -18,13 +18,12 @@ import { index, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-cor
 // in this schema references them. Org deletion is handled by the explicit
 // `ORG_SCOPED_TABLES` purge list in `apps/api/src/services/OrganizationService.ts`
 // — this table must be listed there.
-// ---------------------------------------------------------------------------
 
 export const slackWorkspaces = pgTable(
 	"slack_workspaces",
 	{
 		id: text("id").notNull().primaryKey(),
-		orgId: text("org_id").notNull(),
+		orgId: text("org_id").$type<OrgId>().notNull(),
 		/** Slack workspace (team) id, e.g. `T0123ABCD`. Unique across all orgs. */
 		teamId: text("team_id").notNull(),
 		teamName: text("team_name"),

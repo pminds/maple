@@ -4,17 +4,15 @@ import { eq, lt } from "drizzle-orm"
 import { Context, Effect, Layer, Option } from "effect"
 import { Database, type DatabaseError } from "@/platform/DatabaseLive"
 
-// ---------------------------------------------------------------------------
 // Generic, provider-agnostic repo over the shared `oauth_auth_states` table —
 // the short-lived CSRF nonce store for any OAuth / App-install redirect flow.
 // Callers supply `provider` in the insert row and verify it on read, so this
 // repo is reusable across integrations (GitHub install, Hazel OAuth, …).
-// ---------------------------------------------------------------------------
 
 const toPersistenceError = (error: DatabaseError) =>
 	new OAuthStatePersistenceError({ message: error.message })
 
-export interface OAuthStateRepositoryShape {
+export interface OAuthStateRepositoryApi {
 	readonly purgeExpired: (now: number) => Effect.Effect<void, OAuthStatePersistenceError>
 	readonly insert: (row: OAuthAuthStateInsert) => Effect.Effect<void, OAuthStatePersistenceError>
 	readonly findByState: (
@@ -23,7 +21,7 @@ export interface OAuthStateRepositoryShape {
 	readonly deleteByState: (state: string) => Effect.Effect<void, OAuthStatePersistenceError>
 }
 
-export class OAuthStateRepository extends Context.Service<OAuthStateRepository, OAuthStateRepositoryShape>()(
+export class OAuthStateRepository extends Context.Service<OAuthStateRepository, OAuthStateRepositoryApi>()(
 	"@maple/api/services/OAuthStateRepository",
 	{
 		make: Effect.gen(function* () {
@@ -58,7 +56,7 @@ export class OAuthStateRepository extends Context.Service<OAuthStateRepository, 
 					.pipe(Effect.mapError(toPersistenceError))
 			})
 
-			return { purgeExpired, insert, findByState, deleteByState } satisfies OAuthStateRepositoryShape
+			return { purgeExpired, insert, findByState, deleteByState } satisfies OAuthStateRepositoryApi
 		}),
 	},
 ) {

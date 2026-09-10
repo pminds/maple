@@ -1,15 +1,13 @@
-import { WorkerEnvironment } from "@maple/effect-cloudflare/worker-environment"
-import { Duration, Effect, Layer, Schema, Context } from "effect"
+import { WorkerEnvironment } from "@maple/infra/worker-runtime"
+import { Context, Duration, Effect, Layer, Schema } from "effect"
 import { Env } from "./Env"
 
-class EmailDeliveryError extends Schema.TaggedErrorClass<EmailDeliveryError>()(
-	"@maple/errors/EmailDeliveryError",
-	{
-		message: Schema.String,
-	},
+class EmailDeliveryError extends Schema.TaggedError<EmailDeliveryError>()(
+	"@maple/api/platform/EmailDeliveryError",
+	{ message: Schema.String },
 ) {}
 
-export interface EmailServiceShape {
+export interface EmailServiceApi {
 	readonly isConfigured: boolean
 	readonly send: (
 		to: string,
@@ -37,7 +35,7 @@ interface SendEmailBinding {
 
 const EMAIL_TIMEOUT = Duration.seconds(15)
 
-export class EmailService extends Context.Service<EmailService, EmailServiceShape>()(
+export class EmailService extends Context.Service<EmailService, EmailServiceApi>()(
 	"@maple/api/lib/EmailService",
 	{
 		make: Effect.gen(function* () {
@@ -51,7 +49,7 @@ export class EmailService extends Context.Service<EmailService, EmailServiceShap
 			// (branched DBs, Clerk members), so a live binding there would deliver
 			// duplicate copies of every cron-driven email. The alchemy configs no
 			// longer attach EMAIL outside prd; this guard covers any binding that
-			// still reaches a non-prod worker (wrangler dev, manual deploys).
+			// still reaches a non-prod worker (`alchemy dev`, manual deploys).
 			const emailAllowed =
 				env.MAPLE_ENVIRONMENT === "production" || env.MAPLE_EMAIL_ALLOW_NONPROD === "true"
 			const isConfigured = binding !== undefined && emailAllowed
@@ -89,7 +87,7 @@ export class EmailService extends Context.Service<EmailService, EmailServiceShap
 							to,
 							subject,
 							html,
-							...(replyTo ? { replyTo } : {}),
+							...(replyTo ? { replyTo } : undefined),
 						}),
 					catch: (error) => {
 						const code =
@@ -121,7 +119,7 @@ export class EmailService extends Context.Service<EmailService, EmailServiceShap
 				)
 			})
 
-			return { isConfigured, send } satisfies EmailServiceShape
+			return { isConfigured, send } satisfies EmailServiceApi
 		}),
 	},
 ) {

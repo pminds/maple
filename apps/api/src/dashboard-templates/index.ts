@@ -1,4 +1,4 @@
-import { widgetTypeByVisualization } from "@maple/domain/http"
+import { chartFamilyForChartId, widgetTypeByVisualization } from "@maple/domain/http"
 import type { DashboardTemplateId, DashboardTemplatePreviewKind } from "@maple/domain/http"
 import { blankTemplate } from "./application/blank"
 import { errorTrackingTemplate } from "./application/error-tracking"
@@ -18,6 +18,7 @@ import { cloudflareTemplate } from "./infrastructure/cloudflare"
 import { planetscaleTemplate } from "./infrastructure/planetscale"
 import { hostMetricsTemplate } from "./infrastructure/host-metrics"
 import { kubernetesClusterTemplate } from "./infrastructure/kubernetes-cluster"
+import { dockerContainersTemplate } from "./infrastructure/docker-containers"
 import { kubernetesPodTemplate } from "./infrastructure/kubernetes-pod"
 import { kafkaTemplate } from "./messaging/kafka"
 import { natsTemplate } from "./messaging/nats"
@@ -47,6 +48,7 @@ export const DASHBOARD_TEMPLATES: ReadonlyArray<TemplateDefinition> = [
 	hostMetricsTemplate,
 	kubernetesClusterTemplate,
 	kubernetesPodTemplate,
+	dockerContainersTemplate,
 	// Messaging
 	kafkaTemplate,
 	natsTemplate,
@@ -71,11 +73,7 @@ export function getTemplateById(id: DashboardTemplateId): TemplateDefinition | u
  */
 function previewKindForWidget(visualization: string, chartId: unknown): DashboardTemplatePreviewKind {
 	if (visualization === "chart") {
-		if (typeof chartId === "string") {
-			if (chartId.endsWith("-area")) return "area"
-			if (chartId.endsWith("-bar")) return "bar"
-		}
-		return "line"
+		return chartFamilyForChartId(typeof chartId === "string" ? chartId : undefined)
 	}
 	return widgetTypeByVisualization(visualization)?.panelType ?? "line"
 }
@@ -118,6 +116,5 @@ export type {
 	TemplateMetadata,
 	TemplateParameterValues,
 	TemplatePreviewWidget,
-	TemplateRequirement,
 	WidgetDef,
 } from "./types"

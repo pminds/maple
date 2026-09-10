@@ -4,7 +4,7 @@
 
 Maple is a multi-tenant OpenTelemetry observability platform. A TanStack
 Start SPA (`apps/web`) talks to an Effect HTTP API (`apps/api`, deployed
-on Cloudflare Workers + D1), which proxies queries to a warehouse
+on Cloudflare Workers + PlanetScale Postgres), which proxies queries to a warehouse
 (Tinybird SDK or self-hosted ClickHouse). A Rust ingest gateway
 (`apps/ingest`) accepts OTLP from customer apps after key auth and
 forwards to the OTel collector. An MCP server lives under `/mcp` of the
@@ -28,7 +28,7 @@ API for AI-agent access; a Cloudflare Workers chat agent
   `"org:admin"` in `routes/integrations.http.ts`,
   `OrganizationService`, `OrgOpenRouterSettingsService`. There is no
   central middleware for this — every admin route opts in.
-- **Warehouse scoping:** `WarehouseQueryService.sqlQuery` refuses any
+- **Warehouse scoping:** `WarehouseQueryService.compiledQuery` refuses any
   SQL that does not literally contain `"OrgId"`. This is the only
   tenant guard between the API and the warehouse — bypassing it
   bypasses tenancy.
@@ -44,7 +44,7 @@ API for AI-agent access; a Cloudflare Workers chat agent
 ## Threat model
 
 Highest impact: **cross-tenant data leakage** through warehouse queries
-that skip `WarehouseQueryService.sqlQuery` or build SQL without an
+that skip `WarehouseQueryService.compiledQuery` or build SQL without an
 `OrgId` filter. **Self-hosted mode** is unusual — the root password
 doubles as the JWT signing key, so password disclosure = unlimited
 session forgery. Ingest-key disclosure (especially private keys) lets
@@ -54,7 +54,7 @@ in `resolveMcpTenant` or in the api-key lookup are critical.
 
 ## Project-specific patterns to flag
 
-- Warehouse access that **bypasses `WarehouseQueryService.sqlQuery`** —
+- Warehouse access that **bypasses `WarehouseQueryService.compiledQuery`** —
   raw `fetch()` to `/v0/sql`, direct `createClickHouseClient` /
   `Tinybird` SDK calls, or `executeSql` callers that omit an `OrgId`
   filter in the compiled SQL.

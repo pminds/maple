@@ -1,11 +1,10 @@
-// ---------------------------------------------------------------------------
+// BOUNDARY: This module intentionally carries opaque values; callers decode them before domain use.
 // Shared plumbing for the ClickHouse-backed e2e tests.
 //
 // Both suites need the same three things: connection settings from the CI job's
 // env, a raw HTTP exec, and a database with every migration replayed into it.
 // Gated on `CLICKHOUSE_E2E=1` so a plain `bun run test` never reaches for a
 // server that isn't running.
-// ---------------------------------------------------------------------------
 
 import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
@@ -27,7 +26,8 @@ const findRepoRoot = (): string => {
 	let dir = dirname(fileURLToPath(import.meta.url))
 	while (!existsSync(join(dir, "turbo.json"))) {
 		const parent = dirname(dir)
-		if (parent === dir) throw new Error("Could not locate the workspace root: no turbo.json above this file")
+		if (parent === dir)
+			throw new Error("Could not locate the workspace root: no turbo.json above this file")
 		dir = parent
 	}
 	return dir
@@ -117,7 +117,7 @@ export interface DescribedColumn {
  */
 export const ANALYZER_STRICTNESS: Record<string, string> = {
 	use_variant_as_common_type: "0",
-}
+} satisfies Record<string, string>
 
 /**
  * Run a query through ClickHouse's analyzer without reading a row.
@@ -170,6 +170,24 @@ export const syntheticRow = (
 	}
 	return row
 }
+
+/** Output columns the analyzer resolved as `Nullable(...)`. */
+export const nullableColumns = (columns: ReadonlyArray<DescribedColumn>): ReadonlyArray<DescribedColumn> =>
+	columns.filter((column) => column.type.startsWith("Nullable("))
+
+/**
+ * The same row with one column set to `null`.
+ *
+ * `sampleValue` strips the `Nullable(...)` wrapper before picking a value, so
+ * the ordinary synthetic row never contains a null and a row schema that cannot
+ * decode one passes the sweep unchallenged. A query whose SELECT the builder
+ * typed non-nullably while ClickHouse resolved it as `Nullable` is a 500 on the
+ * first row that actually comes back null.
+ */
+export const rowWithNull = (row: Record<string, unknown>, columnName: string): Record<string, unknown> => ({
+	...row,
+	[columnName]: null,
+})
 
 const sampleValue = (type: string, quote64Bit: boolean): unknown => {
 	const inner = type.replace(/^(?:Nullable|LowCardinality)\((.*)\)$/, "$1")

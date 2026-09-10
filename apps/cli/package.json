@@ -20,6 +20,7 @@
 	},
 	"devDependencies": {
 		"@effect/language-service": "catalog:effect",
+		"@effect/vitest": "catalog:effect",
 		"@types/bun": "^1.3.11",
 		"@types/node": "catalog:tooling",
 		"typescript": "catalog:tooling",

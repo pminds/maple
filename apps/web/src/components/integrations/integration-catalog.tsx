@@ -1,9 +1,10 @@
-import { motion, useReducedMotion } from "motion/react"
-
+import { useState } from "react"
 import { Badge } from "@maple/ui/components/ui/badge"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@maple/ui/components/ui/collapsible"
 import { Skeleton } from "@maple/ui/components/ui/skeleton"
 import { cn } from "@maple/ui/lib/utils"
 import {
+	ChevronDownIcon,
 	ChevronRightIcon,
 	CloudflareIcon,
 	GithubIcon,
@@ -16,8 +17,8 @@ import {
 import { PLANETSCALE_COLOR } from "@/components/infra/planetscale/metrics"
 import { formatRelativeTime } from "@maple/ui/lib/time-format"
 import { Result, useAtomValue } from "@/lib/effect-atom"
-import { MapleApiAtomClient } from "@/lib/services/common/atom-client"
-import { MapleApiV2AtomClient } from "@/lib/services/common/v2-atom-client"
+import { retainedQuery } from "@/lib/services/common/atom-client"
+import { retainedQueryV2 } from "@/lib/services/common/v2-atom-client"
 import { scrapeTargetsListAtom } from "@/lib/services/atoms/scrape-target-atoms"
 
 export type IntegrationId =
@@ -149,6 +150,15 @@ const CATALOG: ReadonlyArray<CatalogEntry> = [
 	},
 ]
 
+/**
+ * The three shown up front on an empty hub. Every other entry serves a specific
+ * piece of infrastructure and only matters to the orgs running it, so it waits
+ * behind "Discover more integrations" rather than padding the first screen.
+ *
+ * Order is the order they appear in.
+ */
+const RECOMMENDED: ReadonlyArray<IntegrationId> = ["cloudflare", "github", "slack"]
+
 export const catalogEntry = (id: IntegrationId): CatalogEntry => CATALOG.find((entry) => entry.id === id)!
 
 /**
@@ -175,28 +185,28 @@ const STATUS_UNAVAILABLE: CardStatus = { label: "Status unavailable", variant: "
  */
 export function useIntegrationStatuses(): Partial<Record<IntegrationId, CardStatus | null>> {
 	const cloudflareAccountResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "cloudflareStatus", {
+		retainedQuery("integrations", "cloudflareStatus", {
 			reactivityKeys: ["cloudflareIntegrationStatus"],
 		}),
 	)
 	const scrapeResult = useAtomValue(scrapeTargetsListAtom)
 	const planetscaleResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "planetscaleStatus", {
-			reactivityKeys: ["planetscaleIntegrationStatus"],
+		retainedQueryV2("planetscaleIntegration", "status", {
+			reactivityKeys: ["planetscaleIntegration"],
 		}),
 	)
 	const hazelResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "hazelStatus", {
+		retainedQuery("integrations", "hazelStatus", {
 			reactivityKeys: ["hazelIntegrationStatus"],
 		}),
 	)
 	const githubResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "githubStatus", {
+		retainedQuery("integrations", "githubStatus", {
 			reactivityKeys: ["githubIntegrationStatus"],
 		}),
 	)
 	const slackResult = useAtomValue(
-		MapleApiV2AtomClient.query("slackIntegration", "status", {
+		retainedQueryV2("slackIntegration", "status", {
 			reactivityKeys: ["slackIntegration"],
 		}),
 	)
@@ -230,7 +240,7 @@ export function useIntegrationStatuses(): Partial<Record<IntegrationId, CardStat
 	const planetscale: CardStatus | null = Result.builder(planetscaleResult)
 		.onSuccess((status): CardStatus | null => {
 			if (!status.connected) return scrapeStatus("planetscale")
-			const failing = status.scrapeTarget?.lastScrapeError != null
+			const failing = status.scrape_target?.last_scrape_error != null
 			return {
 				label: status.organization ?? "Connected",
 				variant: failing ? "warning" : "success",
@@ -285,22 +295,6 @@ export function useIntegrationStatuses(): Partial<Record<IntegrationId, CardStat
 		github,
 		slack,
 	}
-}
-
-const GRID_VARIANTS = {
-	hidden: {},
-	show: {
-		transition: { staggerChildren: 0.05, delayChildren: 0.05 },
-	},
-}
-
-const ITEM_VARIANTS = {
-	hidden: { opacity: 0, y: 6 },
-	show: {
-		opacity: 1,
-		y: 0,
-		transition: { duration: 0.32, ease: [0.16, 1, 0.3, 1] as const },
-	},
 }
 
 /**
@@ -359,11 +353,9 @@ export function IntegrationIconPlate({
 	)
 }
 
-// ---------------------------------------------------------------------------
 // Overview model — the dense connected-row / available-card split. Derived from
 // the same list queries as `useIntegrationStatuses` (plus the cheap PlanetScale
 // inventory read); deliberately NO warehouse queries at hub level.
-// ---------------------------------------------------------------------------
 
 interface ConnectedOverview {
 	readonly kind: "connected"
@@ -407,34 +399,34 @@ const maxMs = (values: ReadonlyArray<number | null | undefined>): number | null 
 
 export function useIntegrationOverviews(): Record<IntegrationId, IntegrationOverview> {
 	const cloudflareResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "cloudflareStatus", {
+		retainedQuery("integrations", "cloudflareStatus", {
 			reactivityKeys: ["cloudflareIntegrationStatus"],
 		}),
 	)
 	const scrapeResult = useAtomValue(scrapeTargetsListAtom)
 	const planetscaleResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "planetscaleStatus", {
-			reactivityKeys: ["planetscaleIntegrationStatus"],
+		retainedQueryV2("planetscaleIntegration", "status", {
+			reactivityKeys: ["planetscaleIntegration"],
 		}),
 	)
 	// Poller-inventory read (no warehouse) — feeds the "N databases tracked" stat.
 	const planetscaleDbResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "planetscaleDatabases", {
-			reactivityKeys: ["planetscaleIntegrationStatus"],
+		retainedQueryV2("planetscaleIntegration", "databases", {
+			reactivityKeys: ["planetscaleIntegration"],
 		}),
 	)
 	const hazelResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "hazelStatus", {
+		retainedQuery("integrations", "hazelStatus", {
 			reactivityKeys: ["hazelIntegrationStatus"],
 		}),
 	)
 	const githubResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "githubStatus", {
+		retainedQuery("integrations", "githubStatus", {
 			reactivityKeys: ["githubIntegrationStatus"],
 		}),
 	)
 	const slackResult = useAtomValue(
-		MapleApiV2AtomClient.query("slackIntegration", "status", {
+		retainedQueryV2("slackIntegration", "status", {
 			reactivityKeys: ["slackIntegration"],
 		}),
 	)
@@ -506,13 +498,13 @@ export function useIntegrationOverviews(): Record<IntegrationId, IntegrationOver
 		.onSuccess((status): IntegrationOverview => {
 			// Manual (user-created scrape target) escape hatch — derive from targets.
 			if (!status.connected) return scrapeOverview("planetscale")
-			const issue = status.pendingOrgSelection
+			const issue = status.pending_org_selection
 				? "Finish org selection"
-				: status.metricsAuth === "missing"
+				: status.metrics_auth === "missing"
 					? "Metrics setup pending"
-					: status.scrapeTarget?.lastScrapeError != null
+					: status.scrape_target?.last_scrape_error != null
 						? "Scrape failing"
-						: status.lastInventoryError != null
+						: status.last_inventory_error != null
 							? "Inventory failing"
 							: null
 			return {
@@ -523,11 +515,15 @@ export function useIntegrationOverviews(): Record<IntegrationId, IntegrationOver
 				stat:
 					planetscaleDbCount != null && planetscaleDbCount > 0
 						? `${plural(planetscaleDbCount, "database")} tracked`
-						: status.scrapeTarget?.enabled
+						: status.scrape_target?.enabled
 							? "Metrics scraping on"
 							: null,
 				lastSyncLabel: syncedLabel(
-					maxMs([status.scrapeTarget?.lastScrapeAt, status.lastInventoryAt]),
+					maxMs(
+						[status.scrape_target?.last_scrape_at, status.last_inventory_at].map((iso) =>
+							iso ? Date.parse(iso) : null,
+						),
+					),
 				),
 				issue,
 			}
@@ -683,9 +679,8 @@ function ConnectedRow({
 }) {
 	const connected = overview.kind === "connected" ? overview : null
 	return (
-		<motion.button
+		<button
 			type="button"
-			variants={ITEM_VARIANTS}
 			onClick={() => onSelect(entry.id)}
 			className="group flex w-full items-center gap-4 px-4 py-3 text-left outline-none transition-colors hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/40"
 		>
@@ -696,7 +691,7 @@ function ConnectedRow({
 				plateClassName="size-8 rounded-lg"
 				size={18}
 			/>
-			<span className="flex w-44 min-w-0 shrink-0 flex-col gap-0.5 2xl:w-52">
+			<span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:w-44 sm:flex-none 2xl:w-52">
 				<span className="truncate text-sm font-semibold">{entry.name}</span>
 				{connected?.context && (
 					<span className="truncate text-xs text-muted-foreground">{connected.context}</span>
@@ -727,7 +722,7 @@ function ConnectedRow({
 					className="text-muted-foreground/70 transition-colors group-hover:text-foreground"
 				/>
 			</span>
-		</motion.button>
+		</button>
 	)
 }
 
@@ -741,9 +736,8 @@ function AvailableCard({
 	onSelect: (id: IntegrationId) => void
 }) {
 	return (
-		<motion.button
+		<button
 			type="button"
-			variants={ITEM_VARIANTS}
 			onClick={() => onSelect(entry.id)}
 			className="group flex items-center gap-4 rounded-lg border border-border/60 bg-card p-4 text-left outline-none transition-colors hover:border-border hover:bg-muted/40 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
 		>
@@ -767,7 +761,7 @@ function AvailableCard({
 			>
 				{cta} →
 			</span>
-		</motion.button>
+		</button>
 	)
 }
 
@@ -792,9 +786,54 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 	)
 }
 
+/**
+ * The collapsed shelf for everything not connected and not recommended. The
+ * overlapping marks are the preview — they say which integrations are inside
+ * without spending a row each.
+ */
+function DiscoverMore({
+	entries,
+	onSelect,
+}: {
+	entries: ReadonlyArray<{ entry: CatalogEntry; overview: AvailableOverview }>
+	onSelect: (id: IntegrationId) => void
+}) {
+	const [open, setOpen] = useState(false)
+	return (
+		<Collapsible open={open} onOpenChange={setOpen}>
+			<CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-3 rounded-lg border border-border/60 border-dashed bg-card/50 px-4 py-3 text-left outline-none transition-colors hover:border-border hover:bg-muted/40 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40 data-panel-open:border-solid">
+				<span className="flex shrink-0 items-center -space-x-2" aria-hidden>
+					{entries.map(({ entry }) => (
+						<IntegrationIconPlate
+							key={entry.id}
+							icon={entry.icon}
+							accent={entry.accent}
+							iconClassName={entry.iconClassName}
+							plateClassName="size-7 rounded-md"
+							size={14}
+						/>
+					))}
+				</span>
+				<span className="truncate text-sm font-medium">Discover more integrations</span>
+				<span className="hidden text-xs text-muted-foreground sm:inline">
+					{entries.length} available
+				</span>
+				<ChevronDownIcon
+					size={14}
+					className="ml-auto shrink-0 text-muted-foreground/70 transition-transform duration-200 group-hover:text-foreground group-data-panel-open:rotate-180 motion-reduce:transition-none"
+				/>
+			</CollapsibleTrigger>
+			<CollapsibleContent className="grid grid-cols-1 gap-3 pt-3 lg:grid-cols-2">
+				{entries.map(({ entry, overview }) => (
+					<AvailableCard key={entry.id} entry={entry} cta={overview.cta} onSelect={onSelect} />
+				))}
+			</CollapsibleContent>
+		</Collapsible>
+	)
+}
+
 export function IntegrationCatalog({ onSelect }: { onSelect: (id: IntegrationId) => void }) {
 	const overviews = useIntegrationOverviews()
-	const reduceMotion = useReducedMotion()
 
 	const connected = CATALOG.flatMap((entry) => {
 		const overview = overviews[entry.id]
@@ -808,14 +847,17 @@ export function IntegrationCatalog({ onSelect }: { onSelect: (id: IntegrationId)
 	})
 	const loading = CATALOG.filter((entry) => overviews[entry.id] === null)
 
+	// Nothing connected yet, and nothing still resolving that could change that:
+	// lead with the three broadly useful integrations so the hub opens on a
+	// choice rather than a catalog. A partially loaded hub isn't empty — wait.
+	const showRecommended = connected.length === 0 && loading.length === 0
+	const recommended = showRecommended
+		? RECOMMENDED.flatMap((id) => available.filter(({ entry }) => entry.id === id))
+		: []
+	const more = available.filter(({ entry }) => !recommended.some((r) => r.entry.id === entry.id))
+
 	return (
-		<motion.div
-			className="flex flex-col gap-6"
-			variants={GRID_VARIANTS}
-			// Reduced motion: render everything in place with no staggered transform.
-			initial={reduceMotion ? false : "hidden"}
-			animate="show"
-		>
+		<div className="flex flex-col gap-6 animate-in fade-in slide-in-from-bottom-1 [animation-duration:300ms] motion-reduce:animate-none">
 			{(connected.length > 0 || loading.length > 0) && (
 				<section className="flex flex-col gap-2">
 					<SectionLabel>Connected</SectionLabel>
@@ -834,11 +876,11 @@ export function IntegrationCatalog({ onSelect }: { onSelect: (id: IntegrationId)
 					</div>
 				</section>
 			)}
-			{available.length > 0 && (
+			{recommended.length > 0 && (
 				<section className="flex flex-col gap-2">
-					<SectionLabel>Available</SectionLabel>
+					<SectionLabel>Start here</SectionLabel>
 					<div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-						{available.map(({ entry, overview }) => (
+						{recommended.map(({ entry, overview }) => (
 							<AvailableCard
 								key={entry.id}
 								entry={entry}
@@ -849,6 +891,7 @@ export function IntegrationCatalog({ onSelect }: { onSelect: (id: IntegrationId)
 					</div>
 				</section>
 			)}
-		</motion.div>
+			{more.length > 0 && <DiscoverMore entries={more} onSelect={onSelect} />}
+		</div>
 	)
 }

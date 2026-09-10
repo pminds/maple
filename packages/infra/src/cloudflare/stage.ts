@@ -15,6 +15,12 @@ export interface MapleDomains {
 	ingest?: string
 	/** Standalone ElectricSQL shape-proxy worker (`apps/electric-sync`). */
 	sync?: string
+	/**
+	 * Self-hosted ElectricSQL sync service (`apps/electric`, ECS Fargate). Only
+	 * the `sync` worker ever dials it; it is public because that worker runs at
+	 * the Cloudflare edge, and `ELECTRIC_SECRET` is what actually guards it.
+	 */
+	electric?: string
 	/** Auto-updating local-mode dashboard SPA (the `maple` binary points users here by default). */
 	local?: string
 }
@@ -26,6 +32,7 @@ const PRD_DOMAINS: MapleDomains = {
 	api: "api.maple.dev",
 	ingest: "ingest.maple.dev",
 	sync: "sync.maple.dev",
+	electric: "electric.maple.dev",
 	landing: "maple.dev",
 	local: "local.maple.dev",
 }
@@ -35,6 +42,7 @@ const STG_DOMAINS: MapleDomains = {
 	api: "api-staging.maple.dev",
 	ingest: "ingest-staging.maple.dev",
 	sync: "sync-staging.maple.dev",
+	electric: "electric-staging.maple.dev",
 	landing: "staging-landing.maple.dev",
 	local: "local-staging.maple.dev",
 }
@@ -153,61 +161,32 @@ export function resolveDatabaseMode(stage: MapleStage): MapleDatabaseMode {
 	}
 }
 
+/** Which worker is binding `MAPLE_DB`. prd gives each its own Hyperdrive config — see docs/infra.md. */
+export type MapleDbConsumer = "api" | "alerting"
+
 /**
- * Dashboard-managed Hyperdrive configs, bound by ID (v1's `HyperdriveRef`).
- * The origin/credentials are managed in the Cloudflare dashboard — deploys
- * never see or rewrite the database connection. Stages returning undefined get
- * an alchemy-managed Hyperdrive pushed from MAPLE_PG_URL, or no database at
- * all — `resolveDatabaseMode` is the authority on which. Config IDs are not
- * secrets.
+ * Dashboard-managed Hyperdrive configs, bound by ID; deploys never see the
+ * database credentials. Stages returning undefined get an alchemy-managed
+ * Hyperdrive from MAPLE_PG_URL or no database — `resolveDatabaseMode` decides.
+ * Config IDs are not secrets.
  */
-export function resolveHyperdriveRefId(stage: MapleStage): string | undefined {
+export function resolveHyperdriveRefId(stage: MapleStage, consumer: MapleDbConsumer): string | undefined {
 	switch (stage.kind) {
 		case "prd":
-			// `maple-prd` — origin: PlanetScale `main` branch.
-			return "ad4c487838594b89810b23e5fb14e129"
+			// Both target the PlanetScale `main` branch; their `origin_connection_limit`s
+			// SUM against its `max_connections`.
+			return consumer === "alerting"
+				? "f473167201af4d2cae494f9989f1d742" // `maple-alerting-prd`
+				: "ad4c487838594b89810b23e5fb14e129" // `maple-prd`
 		case "stg":
 			// TEMPORARY: staging shares prod's `maple-prd` config (owner decision,
 			// 2026-07-14) — stg workers therefore read/write the PRODUCTION
 			// database and the stg alerting crons overlap prod's. Replace with a
 			// dedicated `maple-stg` config (PlanetScale `stg` branch) ASAP.
+			// Deliberately NOT split per consumer here: stg is already pointed at the
+			// wrong database, and splitting it would add a second wrong pool.
 			return "ad4c487838594b89810b23e5fb14e129"
 		case "pr":
-		case "dev":
-			return undefined
-	}
-}
-
-export function resolveHyperdriveName(stage: MapleStage): string {
-	switch (stage.kind) {
-		case "prd":
-			// Pre-configured in the Cloudflare dashboard (origin/credentials managed
-			// there); the prod deploy references it by this name. See alchemy.run.ts.
-			return "maple-prd"
-		case "stg":
-			return "maple-db-stg"
-		case "pr":
-			return `maple-db-pr-${stage.prNumber}`
-		case "dev":
-			return `maple-db-dev-${stage.name}`
-	}
-}
-
-/**
- * PlanetScale Postgres branch backing a stage. One database (`maple-api`)
- * with a fully-isolated branch per stage. Dev stages have no managed branch —
- * local dev runs against the docker-compose Postgres — and PR previews no
- * longer provision one either (see `resolveDatabaseMode`), so the `pr` case
- * here only documents the mapping the reverse path would restore.
- */
-export function resolvePlanetScaleBranch(stage: MapleStage): string | undefined {
-	switch (stage.kind) {
-		case "prd":
-			return "main"
-		case "stg":
-			return "stg"
-		case "pr":
-			return `pr-${stage.prNumber}`
 		case "dev":
 			return undefined
 	}

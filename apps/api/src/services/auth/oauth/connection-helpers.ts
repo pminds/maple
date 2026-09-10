@@ -1,11 +1,9 @@
-// ---------------------------------------------------------------------------
 // Shared OAuth-connection machinery for provider integrations (Cloudflare,
 // Hazel, ...). Both providers persist into the same `oauth_connections` /
 // `oauth_auth_states` tables, so the state-row lifecycle, encrypted token
 // persistence, token-endpoint HTTP calls, and refresh semantics live here —
 // parameterized by provider id and display label. Provider-specific flow
 // (PKCE, OIDC discovery, account resolution) stays in each service.
-// ---------------------------------------------------------------------------
 
 import { randomUUID } from "node:crypto"
 import {
@@ -18,7 +16,7 @@ import {
 } from "@maple/domain/http"
 import { oauthAuthStates, oauthConnections, type OAuthAuthStateRow, type OAuthConnectionRow } from "@maple/db"
 import { and, eq, isNull, lt } from "drizzle-orm"
-import { Clock, Effect, Redacted, Schema, Semaphore } from "effect"
+import { Clock, Effect, Option, Redacted, Schedule, Schema, Semaphore } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
 import {
 	decryptAes256Gcm,
@@ -26,12 +24,31 @@ import {
 	parseBase64Aes256GcmKey,
 	type EncryptedValue,
 } from "@/platform/Crypto"
-import type { DatabaseClient, DatabaseShape } from "@/platform/DatabaseLive"
-import type { EnvShape } from "@/platform/Env"
+import type { DatabaseApi } from "@/platform/DatabaseLive"
+import { makeDbExecute, makePersistenceErrorMapper } from "@/platform/db-execute"
+import type { EnvConfig } from "@/platform/Env"
 import { msToDate } from "@/platform/time"
 
 export const OAUTH_STATE_TTL_MS = 10 * 60_000 // 10 minutes
 export const OAUTH_REFRESH_LEEWAY_MS = 60_000 // refresh when the access token is within 1 minute of expiry
+
+/**
+ * How long `getValidConnectionToken` may serve a connection row from the
+ * in-isolate memo instead of re-reading Postgres.
+ *
+ * Why this exists: an uncached read on a hot path is a network call exposed to
+ * the dial itself — measured at p50 11ms but with ~4% of dials stalling out.
+ * Poller and scrape paths call this once per tick per org, which made it one of
+ * the largest sources of dial volume on the api worker. Requests now share one
+ * connection per invocation (`pg-connection-scope.ts`), which amortizes the
+ * dial but not the round trip.
+ *
+ * 60s is deliberately far tighter than the token's own lifetime: the memo is
+ * about collapsing a burst of same-tick reads, not about holding credentials.
+ * It is also bounded twice over — an entry is only served while `rowIsValid`
+ * still holds for it, so a token nearing expiry re-reads regardless of TTL.
+ */
+const CONNECTION_MEMO_TTL_MS = 60_000
 
 /** Standard OAuth2 token payload (OIDC providers add `id_token`). */
 export const OAuthTokenResponseSchema = Schema.Struct({
@@ -46,11 +63,25 @@ export type OAuthTokenResponse = typeof OAuthTokenResponseSchema.Type
 
 const decodeTokenResponse = Schema.decodeUnknownEffect(OAuthTokenResponseSchema)
 
+/**
+ * RFC 6749 §5.2 error body. Token endpoints answer 400/401 for many reasons —
+ * `invalid_client` (rotated/misconfigured client secret), `invalid_request`,
+ * `invalid_scope` — and only `invalid_grant` means the grant itself is dead.
+ * Classifying any other 400/401 as revoked would let one bad Maple client
+ * secret stamp every tenant connection revoked at once.
+ */
+const decodeOAuthErrorCode = Schema.decodeUnknownOption(
+	Schema.fromJsonString(Schema.Struct({ error: Schema.String })),
+)
+
+const oauthErrorCodeOf = (text: string): Option.Option<string> =>
+	Option.map(decodeOAuthErrorCode(text), (body) => body.error)
+
 export const toUpstreamError = (message: string, status?: number, cause?: unknown) =>
 	new IntegrationsUpstreamError({
 		message,
-		...(status === undefined ? {} : { status }),
-		...(cause === undefined ? {} : { cause }),
+		...(!(status === undefined) ? { status } : undefined),
+		...(!(cause === undefined) ? { cause } : undefined),
 	})
 
 /** The token-endpoint slice of a provider's resolved OAuth config. */
@@ -66,8 +97,8 @@ export interface MakeOAuthConnectionHelpersOptions {
 	readonly provider: string
 	/** Display name used in error messages ("Cloudflare", "Hazel"). */
 	readonly providerLabel: string
-	readonly database: DatabaseShape
-	readonly env: EnvShape
+	readonly database: DatabaseApi
+	readonly env: EnvConfig
 }
 
 /**
@@ -92,14 +123,12 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 				}),
 		)
 
-		const toPersistenceError = (cause: unknown) =>
-			new IntegrationsPersistenceError({
-				message:
-					cause instanceof Error ? cause.message : `${providerLabel} integration database error`,
-			})
+		const toPersistenceError = makePersistenceErrorMapper(
+			IntegrationsPersistenceError,
+			`${providerLabel} integration database error`,
+		)
 
-		const dbExecute = <T>(fn: (db: DatabaseClient) => Promise<T>) =>
-			database.execute(fn).pipe(Effect.mapError(toPersistenceError))
+		const dbExecute = makeDbExecute(database, `${providerLabel} integration`, toPersistenceError)
 
 		const encryptValue = (plaintext: string) =>
 			encryptAes256Gcm(
@@ -154,6 +183,28 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 			return row satisfies OAuthAuthStateRow
 		})
 
+		/**
+		 * Per-isolate connection-row memo backing `getValidConnectionToken` only.
+		 *
+		 * Scoped to that one caller on purpose. `loadConnection` /
+		 * `requireConnection` must stay uncached: the refresh path re-reads the row
+		 * specifically to detect that a *different* isolate rotated the refresh
+		 * token (see `refreshWithSingleFlight`), and a memo there would hand that
+		 * re-read its own stale row and turn a recoverable race into a spurious
+		 * "revoked".
+		 */
+		const connectionMemo = new Map<string, { row: OAuthConnectionRow; expiresAt: number }>()
+
+		/**
+		 * Drop the memoized row for an org. Must be called from every path that
+		 * writes or removes the connection — a stale entry here serves a token for
+		 * a grant that was just revoked or reconnected.
+		 */
+		const invalidateConnectionMemo = (orgId: OrgId) =>
+			Effect.sync(() => {
+				connectionMemo.delete(orgId)
+			})
+
 		const loadConnection = (orgId: OrgId) =>
 			dbExecute((db) =>
 				db
@@ -206,7 +257,7 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 						// pollers resume automatically.
 						set: { ...values, revokedAt: null, updatedAt: new Date(currentTime) },
 					}),
-			)
+			).pipe(Effect.ensuring(invalidateConnectionMemo(orgId)))
 
 		/**
 		 * Stamp the connection as revoked (idempotent — only the first stamp writes).
@@ -218,6 +269,9 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 			orgId: OrgId,
 		) {
 			const currentTime = yield* Clock.currentTimeMillis
+			// Before the write, not after: the memo must not outlive the decision to
+			// revoke even if the stamp itself fails (it is best-effort/ignored below).
+			yield* invalidateConnectionMemo(orgId)
 			yield* dbExecute((db) =>
 				db
 					.update(oauthConnections)
@@ -239,7 +293,10 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 					.delete(oauthConnections)
 					.where(and(eq(oauthConnections.orgId, orgId), eq(oauthConnections.provider, provider)))
 					.returning({ id: oauthConnections.id }),
-			).pipe(Effect.map((result) => ({ disconnected: result.length > 0 })))
+			).pipe(
+				Effect.map((result) => ({ disconnected: result.length > 0 })),
+				Effect.ensuring(invalidateConnectionMemo(orgId)),
+			)
 
 		/** POST an `application/x-www-form-urlencoded` body and return the raw status + text. */
 		const postForm = Effect.fn("OAuthConnectionHelpers.postForm")(
@@ -288,7 +345,9 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 					code,
 					redirect_uri: redirectUri,
 					client_id: config.clientId,
-					...(config.clientSecret ? { client_secret: Redacted.value(config.clientSecret) } : {}),
+					...(config.clientSecret
+						? { client_secret: Redacted.value(config.clientSecret) }
+						: undefined),
 					...extraParams,
 				})
 				if (status < 200 || status >= 300) {
@@ -301,9 +360,11 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 		)
 
 		/**
-		 * Refresh-grant call with the shared classification rule: a 400/401 means
-		 * the grant itself is gone (revoked / rotated away), not a transient
-		 * upstream failure.
+		 * Refresh-grant call with the shared classification rule: only a 400/401
+		 * whose RFC 6749 error body says `invalid_grant` means the grant itself is
+		 * gone (revoked / rotated away). Every other failure — `invalid_client`
+		 * from a rotated Maple secret, a bodyless 400, 429s, 5xx — is a
+		 * non-mutating upstream failure and must not stamp the connection revoked.
 		 */
 		const refreshAccessToken = Effect.fn("OAuthConnectionHelpers.refreshAccessToken")(function* (
 			config: OAuthTokenEndpointConfig,
@@ -313,13 +374,27 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 				grant_type: "refresh_token",
 				refresh_token: refreshToken,
 				client_id: config.clientId,
-				...(config.clientSecret ? { client_secret: Redacted.value(config.clientSecret) } : {}),
+				...(config.clientSecret ? { client_secret: Redacted.value(config.clientSecret) } : undefined),
 			})
 			if (status === 400 || status === 401) {
+				const errorCode = oauthErrorCodeOf(text)
+				// Only a decoded `invalid_grant` means revoked: a None (bodyless or
+				// undecodable 400/401) stays a transient upstream failure below.
+				if (Option.contains(errorCode, "invalid_grant")) {
+					return yield* Effect.fail(
+						new IntegrationsRevokedError({
+							message: `${providerLabel} connection no longer authorized — reconnect required`,
+						}),
+					)
+				}
 				return yield* Effect.fail(
-					new IntegrationsRevokedError({
-						message: `${providerLabel} connection no longer authorized — reconnect required`,
-					}),
+					toUpstreamError(
+						`Token refresh failed with ${status}${Option.match(errorCode, {
+							onNone: () => "",
+							onSome: (code) => ` (${code})`,
+						})}`,
+						status,
+					),
 				)
 			}
 			if (status < 200 || status >= 300) {
@@ -353,6 +428,11 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 						updatedAt: new Date(currentTime),
 					})
 					.where(eq(oauthConnections.id, row.id)),
+			).pipe(
+				// The provider already rotated the refresh token, so this write holds the
+				// only usable copy — losing it to a transient Postgres blip turns into a
+				// permanent disconnect on the next refresh. Retry hard before giving up.
+				Effect.retry({ times: 3, schedule: Schedule.exponential("100 millis") }),
 			)
 			return tokenResponse.access_token
 		})
@@ -428,10 +508,24 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 		 */
 		const getValidConnectionToken = Effect.fn("OAuthConnectionHelpers.getValidConnectionToken")(
 			function* (config: OAuthTokenEndpointConfig, orgId: OrgId) {
+				const nowMs = yield* Clock.currentTimeMillis
+				const memoized = connectionMemo.get(orgId)
+				if (memoized !== undefined && memoized.expiresAt > nowMs && rowIsValid(memoized.row, nowMs)) {
+					yield* Effect.annotateCurrentSpan("oauth.connection.memoHit", true)
+					return yield* accessTokenFromRow(memoized.row)
+				}
+				yield* Effect.annotateCurrentSpan("oauth.connection.memoHit", false)
+
 				const row = yield* requireConnection(orgId)
-				if (rowIsValid(row, yield* Clock.currentTimeMillis)) {
+				if (rowIsValid(row, nowMs)) {
+					connectionMemo.set(orgId, { row, expiresAt: nowMs + CONNECTION_MEMO_TTL_MS })
 					return yield* accessTokenFromRow(row)
 				}
+				// Deliberately not memoized. `refreshWithSingleFlight` resolves to the
+				// row as it was read *before* the refresh, so its ciphertext is the
+				// superseded token — caching it would serve a stale credential for the
+				// whole TTL. Refreshes are rare; the next call re-reads and memoizes
+				// the persisted row.
 				return yield* refreshWithSingleFlight(config, orgId)
 			},
 		)

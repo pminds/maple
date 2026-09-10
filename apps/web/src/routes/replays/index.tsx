@@ -1,3 +1,4 @@
+import { warmAtoms } from "@effect-router/core"
 import { useMemo } from "react"
 import { createFileRoute, useNavigate } from "@tanstack/react-router"
 import { Schema } from "effect"
@@ -8,10 +9,11 @@ import { ActiveUserFilter } from "@/components/replays/active-user-filter"
 import { ReplaysFilterSidebar } from "@/components/replays/replays-filter-sidebar"
 import { ReplaysToolbar } from "@/components/replays/replays-toolbar"
 import { BooleanFromStringParam, NumberFromStringParam } from "@/lib/search-params"
-import { useEffectiveTimeRange } from "@/hooks/use-effective-time-range"
-import { useInfiniteReplays } from "@/hooks/use-infinite-replays"
-import { Result, useAtomValue } from "@/lib/effect-atom"
-import { replaysFacetsResultAtom } from "@/lib/services/atoms/warehouse-query-atoms"
+import { replaysFilterInputs } from "@/components/replays/replays-filter-inputs"
+import { REPLAYS_PAGE_SIZE, useInfiniteReplays } from "@/hooks/use-infinite-replays"
+import { Result } from "@/lib/effect-atom"
+import { useRefreshableAtomValue } from "@/hooks/use-refreshable-atom-value"
+import { listReplaysResultAtom, replaysFacetsResultAtom } from "@/lib/services/atoms/warehouse-query-atoms"
 import { TimeRangeSearchFields, applyTimeRangeSearch } from "@/components/time-range-picker/search"
 import { TimeRangeHeaderControls } from "@/components/time-range-picker/time-range-header-controls"
 import { PageRefreshProvider } from "@/components/time-range-picker/page-refresh-context"
@@ -19,6 +21,9 @@ import type { TimeRange } from "@/components/time-range-picker/types"
 import { QueryErrorState } from "@/components/common/query-error-state"
 import { Skeleton } from "@maple/ui/components/ui/skeleton"
 import { ToolbarStat } from "@maple/ui/components/toolbar"
+import { Button } from "@maple/ui/components/ui/button"
+import { Link } from "@tanstack/react-router"
+import { ChartBarHorizontalIcon } from "@/components/icons"
 
 const replaysSearchSchema = Schema.Struct({
 	service: Schema.optional(Schema.String),
@@ -26,6 +31,11 @@ const replaysSearchSchema = Schema.Struct({
 	country: Schema.optional(Schema.String),
 	deviceType: Schema.optional(Schema.String),
 	userId: Schema.optional(Schema.String),
+	/** Substring match on the identified user's name or email — the human-typed
+	 *  counterpart to the exact `userId`. */
+	user: Schema.optional(Schema.String),
+	/** Identified group (company / team) name, from the sidebar facet. */
+	group: Schema.optional(Schema.String),
 	/** Scope to one browser — spans signed-out marketing and signed-in app sessions. */
 	visitorId: Schema.optional(Schema.String),
 	hasErrors: Schema.optional(Schema.Union([Schema.Boolean, BooleanFromStringParam])),
@@ -43,43 +53,38 @@ const replaysSearchSchema = Schema.Struct({
 export const Route = createFileRoute("/replays/")({
 	component: ReplaysPage,
 	validateSearch: Schema.toStandardSchemaV1(replaysSearchSchema),
+	loaderDeps: ({ search }) => search,
+	// Both queries are on the critical path and neither is cached server-side, so
+	// starting them here rather than on mount is worth real time: the router runs
+	// `defaultPreload: "intent"`, which fires this on hover — ahead of the route
+	// chunk evaluating and React committing. Mount is fire-and-forget; the
+	// component reads the same entries and renders its skeleton meanwhile.
+	loader: ({ context, deps }) => {
+		const filterInputs = replaysFilterInputs(deps)
+		warmAtoms(context.effectRegistry, [
+			listReplaysResultAtom({ data: { ...filterInputs, limit: REPLAYS_PAGE_SIZE } }),
+			replaysFacetsResultAtom({ data: filterInputs }),
+		])
+	},
 })
 
 function ReplaysPage() {
 	const search = Route.useSearch()
 	const navigate = useNavigate({ from: Route.fullPath })
-	const { startTime, endTime } = useEffectiveTimeRange(
-		search.startTime,
-		search.endTime,
-		search.timePreset ?? "24h",
-	)
 
 	const filterInputs = useMemo(
-		() => ({
-			startTime,
-			endTime,
-			serviceName: search.service,
-			browser: search.browser,
-			country: search.country,
-			deviceType: search.deviceType,
-			userId: search.userId,
-			visitorId: search.visitorId,
-			hasErrors: search.hasErrors,
-			search: search.q,
-			// URL params are whole seconds; the warehouse filters in ms.
-			durationMinMs: search.durationMin != null ? search.durationMin * 1000 : undefined,
-			durationMaxMs: search.durationMax != null ? search.durationMax * 1000 : undefined,
-			activeTimeMinMs: search.activeMin != null ? search.activeMin * 1000 : undefined,
-			activeTimeMaxMs: search.activeMax != null ? search.activeMax * 1000 : undefined,
-		}),
+		() => replaysFilterInputs(search),
 		[
-			startTime,
-			endTime,
+			search.startTime,
+			search.endTime,
+			search.timePreset,
 			search.service,
 			search.browser,
 			search.country,
 			search.deviceType,
 			search.userId,
+			search.user,
+			search.group,
 			search.visitorId,
 			search.hasErrors,
 			search.q,
@@ -89,10 +94,14 @@ function ReplaysPage() {
 			search.activeMax,
 		],
 	)
+	const { startTime, endTime } = filterInputs
 
 	const { firstPageResult, allData, hasNextPage, isCapped, isFetchingNextPage, fetchNextPage } =
 		useInfiniteReplays(filterInputs)
-	const facetsResult = useAtomValue(replaysFacetsResultAtom({ data: filterInputs }))
+	// Retained for the same reason as the list: without it, ticking one sidebar
+	// checkbox drops the sidebar that contains it into its own skeleton, and the
+	// option you just clicked disappears out from under the cursor.
+	const facetsResult = useRefreshableAtomValue(replaysFacetsResultAtom({ data: filterInputs }))
 
 	const handleTimeChange = (range: TimeRange, options?: { replace?: boolean }) => {
 		navigate({
@@ -114,18 +123,56 @@ function ReplaysPage() {
 	}
 
 	const sessions = allData
-	const errorSessions = Result.isSuccess(facetsResult) ? facetsResult.value.errorCount : 0
-	const durationP95 = Result.isSuccess(facetsResult) ? facetsResult.value.durationP95 : undefined
+	// Every header number comes off the facets query, which counts the whole
+	// window under the current filters. They used to be mixed: "sessions" and
+	// "live" counted the rows scrolled into memory while the error chip counted
+	// the window, so "50 sessions" sat beside "2,018 with errors" as though the
+	// two were the same kind of thing.
+	const facets = Result.isSuccess(facetsResult) ? facetsResult.value : undefined
+	const errorSessions = facets?.errorCount ?? 0
+	const totalSessions = facets?.totalSessions
+	const liveSessions = facets?.liveSessions
+	const durationP95 = facets?.durationP95
 	// "Engaged" chip mirrors the sidebar preset exactly (activeMin=30, no max), so
 	// toggling either surface keeps the other in sync.
 	const engagedOnly = search.activeMin === 30 && search.activeMax == null
 
 	const headerActions = (
-		<>
-			<div className="mr-2 hidden items-center gap-4 sm:flex">
-				<ToolbarStat value={sessions.length} label="sessions" />
-				<ToolbarStat value={sessions.filter((s) => s.status === "active").length} label="live" dot />
-			</div>
+		<div className="flex flex-wrap items-center gap-2">
+			{/* Held back until the counts exist rather than shown as zeros: a header
+			    that reads "0 sessions" for a beat above a list that is about to fill
+			    is worse than one that arrives a beat late. */}
+			{totalSessions !== undefined && (
+				<div className="hidden items-center gap-4 sm:flex">
+					<ToolbarStat value={totalSessions} label="sessions" />
+					{liveSessions !== undefined && liveSessions > 0 && (
+						<ToolbarStat value={liveSessions} label="live" dot />
+					)}
+				</div>
+			)}
+			{/* Replays and Web Analytics read the same session data from opposite ends —
+			    one session at a time versus the aggregate — so each is the obvious next
+			    question from the other. The time range travels with the link; arriving
+			    at a different window than the one you were just looking at is what makes
+			    a cross-link feel like it lost your place. */}
+			<Button
+				variant="outline"
+				size="sm"
+				aria-label="View web analytics"
+				render={
+					<Link
+						to="/analytics"
+						search={{
+							startTime: search.startTime,
+							endTime: search.endTime,
+							timePreset: search.timePreset,
+						}}
+					/>
+				}
+			>
+				<ChartBarHorizontalIcon size={14} />
+				<span className="hidden sm:inline">Analytics</span>
+			</Button>
 			<TimeRangeHeaderControls
 				startTime={search.startTime ?? startTime}
 				endTime={search.endTime ?? endTime}
@@ -133,7 +180,7 @@ function ReplaysPage() {
 				defaultPreset="24h"
 				onTimeChange={handleTimeChange}
 			/>
-		</>
+		</div>
 	)
 
 	const toolbar = (

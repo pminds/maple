@@ -1,18 +1,34 @@
 import { formatRelativeTimeOrDate, toEpochMs } from "@maple/ui/lib/time-format"
-import { useCallback, useState } from "react"
+import { useCallback } from "react"
 import { useNavigate } from "@tanstack/react-router"
 import { useVirtualizer } from "@tanstack/react-virtual"
 import { cn } from "@maple/ui/lib/utils"
 import { EyeIcon } from "@/components/icons"
+import { useLiveClock } from "@/hooks/use-live-clock"
+import { usePageScrollMargin } from "@/hooks/use-page-scroll-margin"
 import { browserIconFor, deviceIconFor } from "./session-icons"
-import { formatSessionDuration, gradientFor, hostFromUrl } from "./replay-format"
+import {
+	formatSessionDuration,
+	gradientFor,
+	hostFromUrl,
+	isSessionLive,
+	sessionDurationMs,
+} from "./replay-format"
 
 export interface SessionRow {
 	readonly sessionId: string
 	readonly startTime: string
 	readonly durationMs: number | null
 	readonly status: string
+	/** Heartbeat timestamp. Paired with `status` to decide live-ness — see
+	 *  `isSessionLive`; `status` on its own never stops saying `"active"`. */
+	readonly lastActivityAt: string | null
 	readonly userId: string | null
+	/** identify() identity. `""` on sessions that were never identified. */
+	readonly userName: string
+	readonly userEmail: string
+	readonly groupId: string
+	readonly groupName: string
 	readonly urlInitial: string
 	readonly browserName: string
 	readonly osName: string
@@ -33,12 +49,36 @@ function absoluteTs(startTime: string): string {
 	return Number.isNaN(parsed) ? startTime : new Date(parsed).toLocaleString()
 }
 
-function identity(session: SessionRow): { label: string; initial: string; gradient: string } {
-	const label = session.userId || "Anonymous"
+interface RowIdentity {
+	readonly label: string
+	readonly initial: string
+	readonly gradient: string
+	/** The second line under the label. */
+	readonly secondary: string
+	/** True when `secondary` is the identity line rather than the session/host
+	 *  fallback — the two are typeset differently (prose vs mono). */
+	readonly identified: boolean
+	/** Session id · host, kept as a hover target when identity took the line. */
+	readonly origin: string
+}
+
+// A person is easier to recognize by name than by an opaque id, so the label
+// walks down to the most human value available. Sessions recorded before
+// identify() (or by users who never call it) carry `""` in every identity column
+// and fall all the way through to the original userId/Anonymous rendering.
+function identity(session: SessionRow): RowIdentity {
+	const label = session.userName || session.userEmail || session.userId || "Anonymous"
+	const origin = `${session.sessionId.slice(0, 8)} · ${hostFromUrl(session.urlInitial)}`
+	// Don't repeat the label on the line below it — when the email *is* the label,
+	// the group alone carries the second line.
+	const details = [session.userEmail === label ? "" : session.userEmail, session.groupName].filter(Boolean)
 	return {
 		label,
 		initial: (label[0] ?? "?").toUpperCase(),
 		gradient: gradientFor(session.sessionId),
+		secondary: details.length > 0 ? details.join(" · ") : origin,
+		identified: details.length > 0,
+		origin,
 	}
 }
 
@@ -55,6 +95,23 @@ interface SessionsListProps {
 	/** p95 session duration (ms) from the facets query — sessions above it get a
 	 *  "long" chip beside their duration. No chip when unavailable. */
 	durationP95?: number
+	/** "Now" for the live-ness test, injectable so tests don't chase the clock.
+	 *  Left unset it comes from {@link useLiveClock}, which ticks so a pill stops
+	 *  claiming LIVE once its window closes even on a list nobody is touching.
+	 *  Either way it is sampled once per render, never per row: two rows in one
+	 *  frame must not disagree about what time it is. */
+	nowMs?: number
+}
+
+function observeReachEnd(element: HTMLDivElement, onReachEnd: () => void): () => void {
+	const observer = new IntersectionObserver(
+		(entries) => {
+			if (entries[0]?.isIntersecting) onReachEnd()
+		},
+		{ rootMargin: "400px 0px" },
+	)
+	observer.observe(element)
+	return () => observer.disconnect()
 }
 
 function SessionsSentinel({
@@ -64,16 +121,9 @@ function SessionsSentinel({
 	const elementRef = useCallback(
 		(element: HTMLDivElement | null) => {
 			if (!element) return
-			const observer = new IntersectionObserver(
-				(entries) => {
-					if (entries[0]?.isIntersecting && !loadingMore) onReachEnd?.()
-				},
-				{ rootMargin: "400px 0px" },
-			)
-			// React Doctor does not yet recognize React 19 callback-ref cleanup.
-			// oxlint-disable-next-line react-doctor/effect-needs-cleanup
-			observer.observe(element)
-			return () => observer.disconnect()
+			return observeReachEnd(element, () => {
+				if (!loadingMore) onReachEnd?.()
+			})
 		},
 		[loadingMore, onReachEnd],
 	)
@@ -88,16 +138,22 @@ export function SessionsList({
 	loadingMore = false,
 	isCapped = false,
 	durationP95,
+	nowMs,
 }: SessionsListProps) {
 	const navigate = useNavigate()
-	const [listElement, setListElement] = useState<HTMLDivElement | null>(null)
-	const scrollElement = listElement?.closest<HTMLDivElement>('[data-slot="page-scroll-area"]') ?? null
+	// Only sessions still reading `"active"` can cross the live boundary while
+	// the list sits open; a page of ended ones needs no timer at all.
+	const tickedNowMs = useLiveClock({
+		enabled: nowMs === undefined && sessions.some((session) => session.status === "active"),
+	})
+	const effectiveNowMs = nowMs ?? tickedNowMs
+	const { ref: listRef, getScrollElement, scrollMargin } = usePageScrollMargin()
 	const virtualizer = useVirtualizer({
 		count: sessions.length,
-		getScrollElement: () => scrollElement,
+		getScrollElement,
 		estimateSize: () => 65,
 		overscan: 8,
-		scrollMargin: listElement?.offsetTop ?? 0,
+		scrollMargin,
 	})
 	const virtualItems = virtualizer.getVirtualItems()
 
@@ -125,15 +181,12 @@ export function SessionsList({
 
 	return (
 		<div className="@container">
-			<div
-				ref={setListElement}
-				className="relative w-full"
-				style={{ height: virtualizer.getTotalSize() }}
-			>
+			<div ref={listRef} className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
 				{virtualItems.map((virtualRow) => {
 					const session = sessions[virtualRow.index]!
 					const id = identity(session)
-					const isActive = session.status === "active"
+					const isActive = isSessionLive(session, effectiveNowMs)
+					const durationMs = sessionDurationMs(session)
 					const isUnrecorded = session.recorded === "false"
 					const hasErrors = session.errorCount > 0
 					const BrowserIcon = browserIconFor(session.browserName)
@@ -200,8 +253,14 @@ export function SessionsList({
 											{formatRelativeTimeOrDate(session.startTime)}
 										</span>
 									</div>
-									<div className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
-										{session.sessionId.slice(0, 8)} · {hostFromUrl(session.urlInitial)}
+									<div
+										className={cn(
+											"mt-0.5 truncate text-xs text-muted-foreground",
+											!id.identified && "font-mono",
+										)}
+										title={id.identified ? id.origin : undefined}
+									>
+										{id.secondary}
 									</div>
 									{(session.traceCount > 0 || hasErrors || isUnrecorded) && (
 										<div className="mt-1.5 flex items-center gap-1.5 @2xl:hidden">
@@ -234,12 +293,12 @@ export function SessionsList({
 								{/* Activity lane: duration (flagged when unusually long) + pages/clicks */}
 								<div className="hidden w-[13.5rem] shrink-0 items-baseline gap-2 overflow-hidden whitespace-nowrap @3xl:flex">
 									<span className="font-mono text-[13px] font-semibold tabular-nums">
-										{formatSessionDuration(session.durationMs)}
+										{formatSessionDuration(durationMs)}
 									</span>
 									{durationP95 != null &&
 										durationP95 > 0 &&
-										session.durationMs != null &&
-										session.durationMs > durationP95 && (
+										durationMs != null &&
+										durationMs > durationP95 && (
 											<span
 												className="shrink-0 self-center rounded-full bg-accent px-1.5 py-px text-[10px] font-medium text-accent-foreground"
 												title={`Longer than 95% of sessions in this view (p95: ${formatSessionDuration(durationP95)})`}

@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest"
-import type { SpanId } from "@maple/domain"
+import { SpanId } from "@maple/domain"
 import type { SpanNode } from "@maple/query-engine/observability"
+import { Schema } from "effect"
 import { selectOverviewSpans } from "./span-tree"
+
+const decodeSpanId = Schema.decodeSync(SpanId)
 
 function span(
 	id: string,
 	opts: Partial<Omit<SpanNode, "spanId" | "children">> & { children?: SpanNode[] } = {},
 ): SpanNode {
 	return {
-		spanId: id as unknown as SpanId,
+		spanId: decodeSpanId(id),
 		parentSpanId: opts.parentSpanId ?? "",
 		spanName: opts.spanName ?? id,
 		serviceName: opts.serviceName ?? "svc",
@@ -26,7 +29,7 @@ function span(
 function ids(roots: ReadonlyArray<SpanNode>): Set<string> {
 	const out = new Set<string>()
 	const walk = (n: SpanNode) => {
-		out.add(n.spanId as string)
+		out.add(n.spanId)
 		n.children.forEach(walk)
 	}
 	roots.forEach(walk)
@@ -109,10 +112,27 @@ describe("selectOverviewSpans", () => {
 		const kept = ids(result.roots)
 		const checkConnected = (n: SpanNode) => {
 			for (const child of n.children) {
-				expect(kept.has(child.spanId as string)).toBe(true)
+				expect(kept.has(child.spanId)).toBe(true)
 				checkConnected(child)
 			}
 		}
 		result.roots.forEach(checkConnected)
+	})
+})
+
+describe("selectOverviewSpans errorsOnly", () => {
+	it("keeps only errors, their ancestors and the roots, even when the trace fits the budget", () => {
+		const roots = bigTree()
+		const result = selectOverviewSpans(roots, 100, { errorsOnly: true })
+		const kept = ids(result.roots)
+		expect(kept.has("root")).toBe(true)
+		expect(kept.has("a")).toBe(true)
+		expect(kept.has("a2")).toBe(true)
+		expect(kept.has("a1")).toBe(false)
+		expect(kept.has("b")).toBe(false)
+		expect(kept.has("c")).toBe(false)
+		expect(result.renderedCount).toBe(3)
+		expect(result.truncated).toBe(true)
+		expect(result.omittedByParent.get("root")?.count).toBe(12)
 	})
 })

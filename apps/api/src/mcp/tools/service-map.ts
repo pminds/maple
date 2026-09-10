@@ -1,26 +1,26 @@
-import { optionalStringParam, McpQueryError, type McpToolRegistrar } from "./types"
-import { resolveTenant } from "@/mcp/lib/query-warehouse"
+import { optionalStringParam, optionalTimeParam, McpQueryError, type McpToolRegistrar } from "./types"
+import { CurrentMcpTenant } from "@/mcp/lib/query-warehouse"
 import { resolveTimeRange } from "@/mcp/lib/time"
 import { formatNumber, formatDurationFromMs, formatPercent, formatTable } from "@/mcp/lib/format"
 import { formatNextSteps } from "@/mcp/lib/next-steps"
 import { Array as Arr, Effect, HashSet, Order, Schema } from "effect"
 import { createDualContent } from "@/mcp/lib/structured-output"
 import { serviceMap } from "@maple/query-engine/observability"
-import { makeWarehouseExecutorFromTenant } from "@/services/warehouse/WarehouseQueryService"
+import { provideWarehouseExecutorFromTenant } from "@/services/warehouse/WarehouseQueryService"
 
 export function registerServiceMapTool(server: McpToolRegistrar) {
 	server.tool(
 		"service_map",
 		"Show service-to-service dependencies with call counts, error rates, and latency per edge. Use to understand system architecture and identify problematic inter-service calls.",
 		Schema.Struct({
-			start_time: optionalStringParam("Start of time range (YYYY-MM-DD HH:mm:ss)"),
-			end_time: optionalStringParam("End of time range (YYYY-MM-DD HH:mm:ss)"),
+			start_time: optionalTimeParam("Start of time range (YYYY-MM-DD HH:mm:ss)"),
+			end_time: optionalTimeParam("End of time range (YYYY-MM-DD HH:mm:ss)"),
 			service_name: optionalStringParam("Filter to edges involving this service (as source or target)"),
 			environment: optionalStringParam("Filter by deployment environment"),
 		}),
 		Effect.fn("McpTool.serviceMap")(function* ({ start_time, end_time, service_name, environment }) {
 			const { st, et } = resolveTimeRange(start_time, end_time)
-			const tenant = yield* resolveTenant
+			const tenant = yield* CurrentMcpTenant
 			yield* Effect.annotateCurrentSpan({
 				orgId: tenant.orgId,
 				service: service_name ?? "all",
@@ -32,7 +32,7 @@ export function registerServiceMapTool(server: McpToolRegistrar) {
 				service: service_name ?? undefined,
 				environment: environment ?? undefined,
 			}).pipe(
-				Effect.provide(makeWarehouseExecutorFromTenant(tenant)),
+				provideWarehouseExecutorFromTenant(tenant),
 				Effect.mapError(
 					(e) =>
 						new McpQueryError({ message: e.message, pipeName: "service_dependencies", cause: e }),
@@ -75,7 +75,7 @@ export function registerServiceMapTool(server: McpToolRegistrar) {
 				"Errors",
 				"Error Rate",
 				"Avg Duration",
-				"P95 Duration",
+				"Max Duration",
 			]
 			const rows = Arr.map(edges, (e) => {
 				const errorRate = e.callCount > 0 ? e.errorCount / e.callCount : 0
@@ -85,7 +85,7 @@ export function registerServiceMapTool(server: McpToolRegistrar) {
 					formatNumber(e.errorCount),
 					formatPercent(errorRate),
 					formatDurationFromMs(e.avgDurationMs),
-					formatDurationFromMs(e.p95DurationMs),
+					formatDurationFromMs(e.maxDurationMs),
 				]
 			})
 
@@ -124,7 +124,7 @@ export function registerServiceMapTool(server: McpToolRegistrar) {
 							callCount: e.callCount,
 							errorCount: e.errorCount,
 							avgDurationMs: e.avgDurationMs,
-							p95DurationMs: e.p95DurationMs,
+							maxDurationMs: e.maxDurationMs,
 						})),
 						serviceCount,
 					},

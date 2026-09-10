@@ -21,7 +21,7 @@ export type UIMessagePart =
 	  }
 	/**
 	 * An approval-gated mutation the agent proposed and did NOT run. The turn stops here;
-	 * `POST /api/chat/apply` is what actually mutates, on the user's click.
+	 * `POST /internal/chat/apply` is what actually mutates, on the user's click.
 	 *
 	 * A distinct state rather than a marker parsed back out of `output`: the server emits a
 	 * `tool-call` with `proposed: true` and *no* result, so there is no output to parse. While the
@@ -51,6 +51,24 @@ export type UIMessagePart =
 			state: "output-error"
 			input: unknown
 			errorText: string
+	  }
+	/**
+	 * A sub-agent run: its own transcript, nested under the `task` call that started it.
+	 *
+	 * A part of its own rather than a `dynamic-tool` with a payload, because it renders as a
+	 * collapsible transcript rather than a tool row, and because `transcript-rows` must not fold it
+	 * into a "Used N tools" group — a sub-agent is content, not plumbing.
+	 *
+	 * `messages` is `UIMessage[]` and not recursive by accident: sub-agents cannot spawn sub-agents,
+	 * so a nested message never carries another `task` part.
+	 */
+	| {
+			type: "task"
+			toolCallId: string
+			agent: string
+			description: string
+			status: "running" | "completed" | "error" | "aborted"
+			messages: UIMessage[]
 	  }
 
 export interface UIMessage {

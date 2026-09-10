@@ -9,7 +9,7 @@ import { isTrustedCallbackOrigin, resolveRequestOrigin } from "./integrations.ht
 const fakeRequest = (
 	headers: Record<string, string | undefined>,
 	url = "/v2/integrations/slack/install",
-): HttpServerRequest.HttpServerRequest => ({ headers, url }) as unknown as HttpServerRequest.HttpServerRequest
+): HttpServerRequest.HttpServerRequest => ({ headers, url }) as HttpServerRequest.HttpServerRequest
 
 /**
  * The resolver is UNTRUSTED by design: `x-forwarded-host` is client-supplied on
@@ -103,7 +103,7 @@ describe("isTrustedCallbackOrigin", () => {
 			["https://api.localhost", "https://web.localhost"],
 			// Worktree dev hosts nest another label under *.localhost.
 			["https://wt.api.localhost", "https://wt.web.localhost"],
-			// `bun dev:app` serves web and api on different loopback ports.
+			// Raw-port dev servers put web and api on different loopback ports.
 			["http://127.0.0.1:3472", "http://127.0.0.1:3471"],
 		] as const) {
 			assert.isTrue(isTrustedCallbackOrigin(origin, appBaseUrl), `${origin} vs ${appBaseUrl}`)

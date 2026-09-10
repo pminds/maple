@@ -1,8 +1,10 @@
+// SAFETY-FILE: JSON in this test is emitted by the fixture or unit under test before its fields are asserted.
+// BOUNDARY: Test doubles mirror intentionally untyped external callbacks.
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { createRequire } from "node:module"
 import { join } from "node:path"
-import { resolveSlackBotToken } from "eve/channels/slack"
+import { resolveSlackBotToken, type SlackBotTokenContext } from "eve/channels/slack"
 
 /**
  * Canary for `patches/eve@0.25.3.patch` — the multi-workspace patch that
@@ -44,17 +46,9 @@ describe("eve multi-workspace patch", () => {
 	})
 
 	test("resolveSlackBotToken passes the request context to the credential", async () => {
-		// The patch rewrites eve's built JS, not its .d.ts, so the published type
-		// still advertises the unpatched arity — hence the cast. That mismatch is
-		// exactly why this has to be asserted at runtime.
-		const patched = resolveSlackBotToken as unknown as (
-			credential: (context: unknown) => Promise<string>,
-			context: unknown,
-		) => Promise<string>
-
-		const seen: unknown[] = []
-		const token = await patched(
-			async (context: unknown) => {
+		const seen: Array<SlackBotTokenContext | undefined> = []
+		const token = await resolveSlackBotToken(
+			async (context) => {
 				seen.push(context)
 				return "xoxb-per-team"
 			},
@@ -111,5 +105,46 @@ describe("eve __maple_ui strip patch", () => {
 		expect(strip!(plain)).toBe(plain)
 		expect(strip!("plain string result")).toBe("plain string result")
 		expect(strip!(null)).toBe(null)
+	})
+})
+
+describe("eve otel supplemental-attributes patch", () => {
+	/**
+	 * Canary for the third hunk of `patches/eve@0.25.3.patch`: eve hard-codes
+	 * `new OpenTelemetry({runtimeContext:!0})`, which leaves the integration's
+	 * `providerMetadata` and `usage` supplemental span attributes off. The patch
+	 * turns both on — `ai.response.providerMetadata` is where OpenRouter's cost
+	 * accounting reaches the span (lifted into `gen_ai.usage.cost` by
+	 * `lib/genai-cost.ts`), and the usage supplemental carries
+	 * `ai.usage.outputTokenDetails.reasoningTokens`, which Maple's read side
+	 * decodes as reasoning output tokens.
+	 *
+	 * Fails silently when it stops applying: spans simply arrive without cost
+	 * or reasoning tokens. So the test registers the real integration and reads
+	 * the flags it resolved.
+	 */
+	const require_ = createRequire(import.meta.url)
+	const eveRoot = new URL(".", `file://${require_.resolve("eve/package.json")}`).href
+
+	test("registered integration has providerMetadata + usage supplementals on", async () => {
+		const module_ = (await import(`${eveRoot}dist/src/harness/otel-integration.js`)) as {
+			ensureOtelIntegration: () => void
+		}
+		module_.ensureOtelIntegration()
+
+		const integrations = (
+			globalThis as {
+				AI_SDK_TELEMETRY_INTEGRATIONS?: Array<{
+					supplementalAttributes?: Record<string, boolean>
+				}>
+			}
+		).AI_SDK_TELEMETRY_INTEGRATIONS
+		const otel = integrations?.find((entry) => entry.supplementalAttributes !== undefined)
+		expect(otel, "eve did not register its OpenTelemetry integration").toBeDefined()
+		expect(otel!.supplementalAttributes).toMatchObject({
+			runtimeContext: true,
+			providerMetadata: true,
+			usage: true,
+		})
 	})
 })

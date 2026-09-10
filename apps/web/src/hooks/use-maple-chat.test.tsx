@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+// TEST-SEAM: This focused test replaces process-global modules that have no instance-level injection seam.
 
 /**
  * `useMapleChat`'s stream reader, driven by a fake SSE body.
@@ -53,11 +54,18 @@ function Harness() {
 	return (
 		<div>
 			<span data-testid="status">{chat.status}</span>
+			<span data-testid="error">{chat.error?.message ?? ""}</span>
 			<span data-testid="ready">{String(chat.historyReady)}</span>
 			<span data-testid="text">
 				{chat.messages
 					.flatMap((message) => message.parts)
-					.map((part) => (part.type === "text" ? part.text : `[${part.state}]`))
+					.map((part) =>
+						part.type === "text"
+							? part.text
+							: part.type === "task"
+								? `[task:${part.agent}:${part.status}]`
+								: `[${part.state}]`,
+					)
 					.join("|")}
 			</span>
 			<button type="button" onClick={() => chat.sendMessage("hello")}>
@@ -83,6 +91,40 @@ afterEach(() => {
 })
 
 describe("useMapleChat stream reader", () => {
+	it("surfaces a terminal turn error and clears it when the user continues", async () => {
+		tracedFetch
+			.mockResolvedValueOnce(jsonResponse(emptyHistory))
+			.mockResolvedValueOnce(jsonResponse({ cursor: 0, messageId: "m1" }))
+			.mockResolvedValueOnce(
+				sseResponse([
+					frame({ seq: 1, type: "turn-start", messageId: "m1" }),
+					frame({
+						seq: 2,
+						type: "turn-end",
+						messageId: "m1",
+						reason: "error",
+						error: "Maple couldn't complete this response.",
+					}),
+				]),
+			)
+			// Keep the follow-up request in flight; `sendMessage` clears the old failure immediately.
+			.mockImplementationOnce(() => new Promise<Response>(() => {}))
+
+		render(<Harness />)
+		await waitFor(() => expect(screen.getByTestId("ready").textContent).toBe("true"))
+		await act(async () => {
+			screen.getByText("send").click()
+		})
+
+		await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("error"))
+		expect(screen.getByTestId("error").textContent).toBe("Maple couldn't complete this response.")
+
+		await act(async () => {
+			screen.getByText("send").click()
+		})
+		expect(screen.getByTestId("error").textContent).toBe("")
+	})
+
 	it("reconnects from its cursor when the stream closes without a turn-end", async () => {
 		// The server closes after its 25s tail window elapses. Treating that as the end of the turn
 		// left `status` at "streaming" forever, with the composer disabled and the turn still
@@ -189,11 +231,7 @@ describe("useMapleChat stream reader", () => {
 		await new Promise((resolve) => setTimeout(resolve, 150))
 
 		assert.equal(screen.getByTestId("status").textContent, "ready")
-		assert.equal(
-			eventsRequests().length,
-			afterStop,
-			"a stopped stream must not open another connection",
-		)
+		assert.equal(eventsRequests().length, afterStop, "a stopped stream must not open another connection")
 	})
 
 	it("surfaces a 409 as a turn-in-flight message, not a raw status", async () => {
@@ -242,5 +280,85 @@ describe("useMapleChat stream reader", () => {
 		// Was `[input-available]` — a spinner that never resolved, because the client waited for an
 		// output the server never sends for a gated call.
 		assert.include(screen.getByTestId("text").textContent ?? "", "[proposed]")
+	})
+
+	it("retracts the text of a retried step instead of showing it twice", async () => {
+		tracedFetch
+			.mockResolvedValueOnce(jsonResponse(emptyHistory))
+			.mockResolvedValueOnce(jsonResponse({ cursor: 0, messageId: "m1" }))
+			.mockResolvedValueOnce(
+				sseResponse([
+					frame({ seq: 1, type: "turn-start", messageId: "m1" }),
+					frame({ seq: 2, type: "text-delta", messageId: "m1", text: "Hello wo" }),
+					frame({
+						seq: 3,
+						type: "turn-retry",
+						messageId: "m1",
+						attempt: 2,
+						retractChars: 8,
+						reason: "Transport",
+						delayMs: 1000,
+					}),
+					frame({ seq: 4, type: "text-delta", messageId: "m1", text: "Hello world." }),
+					frame({ seq: 5, type: "turn-end", messageId: "m1", reason: "stop" }),
+				]),
+			)
+
+		render(<Harness />)
+		await waitFor(() => expect(screen.getByTestId("ready").textContent).toBe("true"))
+		await act(async () => {
+			screen.getByText("send").click()
+		})
+
+		await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("ready"))
+		// The leading "hello" is the optimistic user message. Without the retraction the assistant's
+		// half reads "Hello woHello world.".
+		assert.equal(screen.getByTestId("text").textContent, "hello|Hello world.")
+	})
+})
+
+describe("useMapleChat sub-agent transcripts", () => {
+	const ref = { id: "t1", agent: "explore", parentMessageId: "m1" }
+
+	it("nests a sub-agent's events under its task card, not the top-level thread", async () => {
+		tracedFetch
+			.mockResolvedValueOnce(jsonResponse(emptyHistory))
+			.mockResolvedValueOnce(jsonResponse({ cursor: 0, messageId: "m1" }))
+			.mockResolvedValueOnce(
+				sseResponse([
+					frame({ seq: 1, type: "turn-start", messageId: "m1" }),
+					frame({
+						seq: 2,
+						type: "tool-call",
+						messageId: "m1",
+						callId: "t1",
+						name: "task",
+						input: { subagent_type: "explore", description: "trace checkout" },
+					}),
+					frame({ seq: 3, type: "turn-start", messageId: "c1", task: ref }),
+					frame({ seq: 4, type: "text-delta", messageId: "c1", text: "child text", task: ref }),
+					frame({ seq: 5, type: "turn-end", messageId: "c1", reason: "stop", task: ref }),
+					frame({
+						seq: 6,
+						type: "tool-result",
+						messageId: "m1",
+						callId: "t1",
+						output: "<task_result/>",
+					}),
+					frame({ seq: 7, type: "text-delta", messageId: "m1", text: "parent answer" }),
+					frame({ seq: 8, type: "turn-end", messageId: "m1", reason: "stop" }),
+				]),
+			)
+
+		render(<Harness />)
+		await waitFor(() => expect(screen.getByTestId("ready").textContent).toBe("true"))
+		await act(async () => {
+			screen.getByText("send").click()
+		})
+
+		await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("ready"))
+		// "child text" must NOT appear at the top level — it lives inside the task part. The harness
+		// only renders top-level parts, so its absence here is the assertion.
+		assert.equal(screen.getByTestId("text").textContent, "hello|[task:explore:completed]|parent answer")
 	})
 })

@@ -1,4 +1,3 @@
-// ---------------------------------------------------------------------------
 // Anomaly detection math — pure functions, no I/O.
 //
 // Baseline model: seasonal-naive. For the current hour-of-day `h`, the
@@ -10,7 +9,6 @@
 // Error/latency breaches require statistical, ratio, absolute-delta, and
 // volume guards. Throughput is deliberately stricter: only a near-total loss
 // of a historically continuous traffic stream is service-health evidence.
-// ---------------------------------------------------------------------------
 
 import type { AnomalyIncidentSeverity, AnomalySensitivity, AnomalySignalType } from "@maple/domain/http"
 
@@ -25,6 +23,13 @@ export interface AnomalyEvaluation {
 	readonly baselineMedian: number
 	readonly baselineSigma: number
 	readonly threshold: number
+	/**
+	 * Always an integer. Volume counts are sample-weighted (`sum(SampleRate)`), so
+	 * they arrive fractional from the warehouse — and `anomaly_detector_states`
+	 * / `anomaly_incidents` store them in `integer` columns, which rejects
+	 * `6102857.511138143` outright. Rounded at every construction site below so
+	 * the invariant holds for every consumer, not just the ones that remember.
+	 */
 	readonly sampleCount: number
 	readonly severity: AnomalyIncidentSeverity
 }
@@ -40,7 +45,7 @@ export const SENSITIVITY: Record<AnomalySensitivity, SensitivityConfig> = {
 	low: { k: 6, ratio: 3.0 },
 	normal: { k: 4, ratio: 2.0 },
 	high: { k: 3, ratio: 1.5 },
-}
+} satisfies Record<AnomalySensitivity, SensitivityConfig>
 
 /** Minimum sealed baseline samples before a series is evaluated at all. */
 const MIN_BASELINE_SAMPLES = 6
@@ -72,9 +77,7 @@ export function robustSigma(
 	return Math.max(MAD_TO_SIGMA * mad(values, m), epsilonAbs, epsilonRel * m)
 }
 
-// ---------------------------------------------------------------------------
 // Input shapes (rows already split into current vs baseline by the caller)
-// ---------------------------------------------------------------------------
 
 export interface GoldenSignalSeries {
 	readonly serviceName: string
@@ -91,6 +94,25 @@ export interface LogVolumeSeries {
 	readonly current: { errorLogCount: number }
 	readonly baseline: ReadonlyArray<{ errorLogCount: number }>
 }
+
+/**
+ * Bound per-org work to the busiest log series — the same rule the golden
+ * path applies inline. The input arrives in ClickHouse GROUP BY order, which
+ * is arbitrary: slicing it unsorted would drop busy (or already-anomalous)
+ * series nondeterministically, and a dropped open series never refreshes
+ * `lastTriggeredAt`, so the no-data sweep would falsely resolve it.
+ */
+export const capBusiestLogSeries = (
+	series: ReadonlyArray<LogVolumeSeries>,
+	max: number,
+): ReadonlyArray<LogVolumeSeries> =>
+	[...series]
+		.sort(
+			(a, b) =>
+				Math.max(b.current.errorLogCount, b.baseline.length) -
+				Math.max(a.current.errorLogCount, a.baseline.length),
+		)
+		.slice(0, max)
 
 export interface ErrorSpikeObservation {
 	readonly fingerprintHash: string
@@ -131,13 +153,11 @@ const skipped = (
 	baselineMedian: 0,
 	baselineSigma: 0,
 	threshold: 0,
-	sampleCount,
+	sampleCount: Math.round(sampleCount),
 	severity: "warning",
 })
 
-// ---------------------------------------------------------------------------
 // Golden signals
-// ---------------------------------------------------------------------------
 
 /** Minimum weighted request count in the current window before evaluating. */
 const GOLDEN_MIN_VOLUME = 50
@@ -187,14 +207,13 @@ export function evaluateGoldenSignals(
 		baselineMedian: m,
 		baselineSigma: sigma,
 		threshold,
-		sampleCount,
+		sampleCount: Math.round(sampleCount),
 		severity,
 	})
 
 	const insufficientBaseline = baseline.length < MIN_BASELINE_SAMPLES
 	const currentCount = current.requestCount
 
-	// --- Error rate -----------------------------------------------------------
 	{
 		const signal: AnomalySignalType = "error_rate"
 		if (insufficientBaseline || currentCount < GOLDEN_MIN_VOLUME) {
@@ -226,7 +245,6 @@ export function evaluateGoldenSignals(
 		}
 	}
 
-	// --- p95 latency -----------------------------------------------------------
 	{
 		const signal: AnomalySignalType = "latency_p95"
 		if (insufficientBaseline || currentCount < GOLDEN_MIN_VOLUME) {
@@ -249,7 +267,6 @@ export function evaluateGoldenSignals(
 		}
 	}
 
-	// --- Throughput (drops only) -----------------------------------------------
 	{
 		const signal: AnomalySignalType = "throughput"
 		const ratePerMin = config.elapsedMinutes > 0 ? currentCount / config.elapsedMinutes : currentCount
@@ -276,9 +293,7 @@ export function evaluateGoldenSignals(
 	return evaluations
 }
 
-// ---------------------------------------------------------------------------
 // Log volume (error-class severities)
-// ---------------------------------------------------------------------------
 
 const LOG_MIN_VOLUME = 30
 
@@ -315,14 +330,12 @@ export function evaluateLogVolume(series: LogVolumeSeries, config: DetectionConf
 		baselineMedian: m,
 		baselineSigma: sigma,
 		threshold,
-		sampleCount: current.errorLogCount,
+		sampleCount: Math.round(current.errorLogCount),
 		severity: "warning",
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Error fingerprint spikes (Poisson-flavored — counts are small)
-// ---------------------------------------------------------------------------
 
 /** Half-hour windows in 7 days. */
 const HALF_HOURS_PER_WEEK = 336
@@ -372,7 +385,7 @@ export function evaluateErrorSpike(
 		baselineMedian: lambda,
 		baselineSigma: Math.sqrt(Math.max(lambda, 1)),
 		threshold,
-		sampleCount: count,
+		sampleCount: Math.round(count),
 		severity: count >= threshold * 3 ? "critical" : "warning",
 	}
 }
@@ -408,7 +421,7 @@ export function healthyErrorSpikeRecovery(
 		baselineMedian,
 		baselineSigma: Math.sqrt(Math.max(baselineMedian, 1)),
 		threshold,
-		sampleCount: observation.count,
+		sampleCount: Math.round(observation.count),
 		severity: "warning",
 	}
 }

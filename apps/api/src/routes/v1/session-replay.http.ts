@@ -1,14 +1,11 @@
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import {
 	CurrentTenant,
-	GetReplayEventsResponse,
 	GetReplayResponse,
 	ListReplaysResponse,
-	ReplaysFacetsResponse,
 	MapleApi,
 	ReplaysForTraceResponse,
 	SessionTranscriptResponse,
-	SessionTraceSummariesResponse,
 	SessionId,
 	TraceId,
 	UserId,
@@ -37,10 +34,15 @@ export const HttpSessionReplaysLive = HttpApiBuilder.group(MapleApi, "sessionRep
 							country: payload.country,
 							deviceType: payload.deviceType,
 							userId: payload.userId,
+							userSearch: payload.userSearch,
+							groupName: payload.groupName,
 							visitorId: payload.visitorId,
 							hasErrors: payload.hasErrors,
 							search: payload.search,
-							cursor: payload.cursor,
+							cursor:
+								payload.cursor === undefined
+									? undefined
+									: { startTime: payload.cursor, sessionId: payload.cursorSessionId },
 							durationMinMs: payload.durationMinMs,
 							durationMaxMs: payload.durationMaxMs,
 							activeTimeMinMs: payload.activeTimeMinMs,
@@ -64,52 +66,6 @@ export const HttpSessionReplaysLive = HttpApiBuilder.group(MapleApi, "sessionRep
 							// Schema.Number validates the response (see the facets handler).
 							traceCount: Number(row.traceCount),
 						})),
-					})
-				}),
-			)
-			.handle("facets", ({ payload }) =>
-				Effect.gen(function* () {
-					const tenant = yield* CurrentTenant.Context
-					yield* Effect.annotateCurrentSpan({ orgId: tenant.orgId })
-					const compiled = CH.compileUnion(
-						CH.sessionReplaysFacetsQuery({
-							serviceName: payload.serviceName,
-							browser: payload.browser,
-							country: payload.country,
-							deviceType: payload.deviceType,
-							userId: payload.userId,
-							hasErrors: payload.hasErrors,
-							search: payload.search,
-						}),
-						{ orgId: tenant.orgId, startTime: payload.startTime, endTime: payload.endTime },
-					)
-					const rows = yield* warehouse.compiledQuery(tenant, compiled, {
-						profile: "list",
-						context: "replaysFacets",
-					})
-					// ClickHouse serializes integer aggregates (`uniq(...)`) as JSON strings,
-					// while the Tinybird path returns numbers; this query declares no row
-					// schema, so coerce at the edge before the Schema.Number response validates.
-					const pick = (facetType: string) =>
-						rows
-							.filter((row) => row.facetType === facetType)
-							.map((row) => ({ name: row.name, count: Number(row.count) }))
-					// The percentile branches ride the same {name, count} shape as the
-					// facets, with the quantile in `count` — read them back by label.
-					const stat = (name: string) =>
-						Number(
-							rows.find((row) => row.facetType === "durationStat" && row.name === name)
-								?.count ?? 0,
-						)
-					return new ReplaysFacetsResponse({
-						services: pick("service"),
-						browsers: pick("browser"),
-						countries: pick("country"),
-						devices: pick("device"),
-						errorCount: Number(rows.find((row) => row.facetType === "error")?.count ?? 0),
-						durationBuckets: pick("durationBucket"),
-						durationP50: stat("p50"),
-						durationP95: stat("p95"),
 					})
 				}),
 			)
@@ -142,6 +98,10 @@ export const HttpSessionReplaysLive = HttpApiBuilder.group(MapleApi, "sessionRep
 						}),
 						{ orgId: tenant.orgId, sessionId: payload.sessionId },
 					)
+					// Resolve the org's route before fanning out, so the config read lands
+					// on an empty connection pool instead of queueing behind a sibling's
+					// warehouse fetch. No-op once the in-isolate memo is warm.
+					yield* warehouse.warmRoute(tenant)
 					const [maybeData, maybeActivity] = yield* Effect.all(
 						[
 							warehouse.compiledQueryFirst(tenant, compiled, {
@@ -178,32 +138,6 @@ export const HttpSessionReplaysLive = HttpApiBuilder.group(MapleApi, "sessionRep
 					})
 				}),
 			)
-			.handle("getReplayEvents", ({ payload }) =>
-				Effect.gen(function* () {
-					const tenant = yield* CurrentTenant.Context
-					yield* Effect.annotateCurrentSpan({
-						orgId: tenant.orgId,
-						"maple.session.id": payload.sessionId,
-					})
-					const compiled = CH.compile(
-						CH.sessionReplayEventsQuery({
-							startTime: payload.windowStart,
-							endTime: payload.windowEnd,
-						}),
-						{
-							orgId: tenant.orgId,
-							sessionId: payload.sessionId,
-						},
-					)
-					const chunks = yield* warehouse.compiledQuery(tenant, compiled, {
-						profile: "list",
-						context: "getReplayEvents",
-					})
-					// rrweb payloads come straight from ClickHouse (no R2 / presigning);
-					// each chunk's `events` is the rrweb array JSON the player parses.
-					return new GetReplayEventsResponse({ chunks })
-				}),
-			)
 			.handle("replaysForTrace", ({ payload }) =>
 				Effect.gen(function* () {
 					const tenant = yield* CurrentTenant.Context
@@ -224,41 +158,6 @@ export const HttpSessionReplaysLive = HttpApiBuilder.group(MapleApi, "sessionRep
 						data: rows.map((row) => ({
 							...row,
 							sessionId: decodeSessionId(row.sessionId),
-						})),
-					})
-				}),
-			)
-			.handle("traceSummaries", ({ payload }) =>
-				Effect.gen(function* () {
-					const tenant = yield* CurrentTenant.Context
-					yield* Effect.annotateCurrentSpan({
-						orgId: tenant.orgId,
-						"maple.trace.count": payload.traceIds.length,
-					})
-					// `TraceId IN ()` is invalid SQL; a session with no correlated traces
-					// short-circuits to an empty result without touching the warehouse.
-					if (payload.traceIds.length === 0) {
-						return new SessionTraceSummariesResponse({ data: [] })
-					}
-					const compiled = CH.compile(
-						CH.sessionTraceSummariesQuery({
-							traceIds: payload.traceIds,
-							startTime: payload.windowStart,
-							endTime: payload.windowEnd,
-						}),
-						{ orgId: tenant.orgId },
-					)
-					const rows = yield* warehouse.compiledQuery(tenant, compiled, {
-						profile: "list",
-						context: "sessionTraceSummaries",
-					})
-					return new SessionTraceSummariesResponse({
-						data: rows.map((row) => ({
-							...row,
-							traceId: decodeTraceId(row.traceId),
-							// `count()` is UInt64 — same ClickHouse JSON-string coercion as
-							// listReplays' traceCount; coerce before Schema.Number validates.
-							spanCount: Number(row.spanCount),
 						})),
 					})
 				}),

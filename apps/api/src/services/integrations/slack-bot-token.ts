@@ -1,9 +1,9 @@
 import { slackWorkspaces } from "@maple/db"
-import { AlertDeliveryError } from "@maple/domain/http"
+import { AlertDeliveryAuthError, AlertDeliveryError, OrgId } from "@maple/domain/http"
 import { and, eq, isNull } from "drizzle-orm"
-import { Context, Data, Effect, Layer, Option, Redacted } from "effect"
+import { Context, Effect, Layer, Option, Redacted, Schema } from "effect"
 import { decryptAes256Gcm, parseBase64Aes256GcmKey } from "@/platform/Crypto"
-import { Database, type DatabaseShape } from "@/platform/DatabaseLive"
+import { Database, type DatabaseApi } from "@/platform/DatabaseLive"
 import { Env } from "@/platform/Env"
 
 /*
@@ -28,7 +28,7 @@ export const slackSecretAad = (orgId: string, teamId: string, column: SlackSecre
 	Buffer.from(`slack_workspaces:v1:${orgId}:${teamId}:${column}`, "utf8")
 
 /** The single active (non-revoked) installation for an org, if any. */
-export const loadActiveWorkspaceByOrg = Effect.fnUntraced(function* (database: DatabaseShape, orgId: string) {
+export const loadActiveWorkspaceByOrg = Effect.fnUntraced(function* (database: DatabaseApi, orgId: OrgId) {
 	const rows = yield* database.execute((db) =>
 		db
 			.select()
@@ -39,20 +39,39 @@ export const loadActiveWorkspaceByOrg = Effect.fnUntraced(function* (database: D
 	return Option.fromNullishOr(rows[0])
 })
 
-const notConnected = (message: string) => new AlertDeliveryError({ message, destinationType: "slack-bot" })
+/**
+ * No active Slack install means no token will ever be resolved until someone
+ * reconnects the workspace, so this must be the non-retryable class — the
+ * delivery queue reads `retryable` off the failure to decide whether to
+ * re-enqueue, and retrying this five times accomplishes nothing.
+ */
+const notConnected = (message: string) =>
+	new AlertDeliveryAuthError({ message, destinationType: "slack-bot" })
 
 /**
  * Resolve the decrypted Slack bot token for an org's active installation.
- * Fails with an {@link AlertDeliveryError} when there is no active install.
+ * Fails with an {@link AlertDeliveryAuthError} when there is no active install.
  */
 export const resolveSlackBotTokenForDispatch = Effect.fn("SlackBotTokenResolver.resolve")(function* (
-	database: DatabaseShape,
+	database: DatabaseApi,
 	encryptionKey: Buffer,
 	orgId: string,
 ) {
-	yield* Effect.annotateCurrentSpan({ orgId })
-	const rowOption = yield* loadActiveWorkspaceByOrg(database, orgId).pipe(
-		Effect.mapError((error) => notConnected(`Failed to load Slack installation: ${error.message}`)),
+	const decodedOrgId = yield* Schema.decodeEffect(OrgId)(orgId).pipe(Effect.orDie)
+	yield* Effect.annotateCurrentSpan({ orgId: decodedOrgId })
+	// A failed LOOKUP is not a failed authentication: the workspace may be
+	// connected and healthy behind a transient Postgres blip. Keep it retryable
+	// so the queue re-enqueues instead of dropping the alert (and so it does not
+	// count toward auto-disabling the destination).
+	const rowOption = yield* loadActiveWorkspaceByOrg(database, decodedOrgId).pipe(
+		Effect.mapError(
+			(error) =>
+				new AlertDeliveryError({
+					message: "Failed to load the Slack installation",
+					destinationType: "slack-bot",
+					cause: error,
+				}),
+		),
 	)
 	if (Option.isNone(rowOption)) {
 		return yield* Effect.fail(
@@ -73,15 +92,16 @@ export const resolveSlackBotTokenForDispatch = Effect.fn("SlackBotTokenResolver.
 	)
 })
 
-class SlackBotTokenConfigError extends Data.TaggedError("@maple/api/services/SlackBotTokenConfigError")<{
-	readonly message: string
-}> {}
+class SlackBotTokenConfigError extends Schema.TaggedError<SlackBotTokenConfigError>()(
+	"@maple/api/services/SlackBotTokenConfigError",
+	{ message: Schema.String },
+) {}
 
-export interface SlackBotTokenResolverShape {
-	readonly resolve: (orgId: string) => Effect.Effect<string, AlertDeliveryError>
+export interface SlackBotTokenResolverApi {
+	readonly resolve: (orgId: OrgId) => Effect.Effect<string, AlertDeliveryAuthError | AlertDeliveryError>
 }
 
-const make: Effect.Effect<SlackBotTokenResolverShape, SlackBotTokenConfigError, Database | Env> = Effect.gen(
+const make: Effect.Effect<SlackBotTokenResolverApi, SlackBotTokenConfigError, Database | Env> = Effect.gen(
 	function* () {
 		const database = yield* Database
 		const env = yield* Env
@@ -98,9 +118,9 @@ const make: Effect.Effect<SlackBotTokenResolverShape, SlackBotTokenConfigError, 
 	},
 )
 
-export class SlackBotTokenResolver extends Context.Service<
-	SlackBotTokenResolver,
-	SlackBotTokenResolverShape
->()("@maple/api/services/SlackBotTokenResolver", { make }) {
+export class SlackBotTokenResolver extends Context.Service<SlackBotTokenResolver, SlackBotTokenResolverApi>()(
+	"@maple/api/services/SlackBotTokenResolver",
+	{ make },
+) {
 	static readonly layer = Layer.effect(this, this.make)
 }

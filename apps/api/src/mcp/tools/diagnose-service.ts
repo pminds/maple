@@ -1,5 +1,5 @@
-import { optionalStringParam, requiredStringParam, type McpToolRegistrar } from "./types"
-import { resolveTenant } from "@/mcp/lib/query-warehouse"
+import { optionalStringParam, optionalTimeParam, requiredStringParam, type McpToolRegistrar } from "./types"
+import { CurrentMcpTenant } from "@/mcp/lib/query-warehouse"
 import { resolveTimeRange } from "@/mcp/lib/time"
 import { formatDurationFromMs, formatPercent, formatNumber, truncate } from "@/mcp/lib/format"
 import { formatNextSteps } from "@/mcp/lib/next-steps"
@@ -7,7 +7,7 @@ import { toMcpQueryError } from "@/mcp/lib/map-warehouse-error"
 import { Array as Arr, Effect, Schema } from "effect"
 import { createDualContent } from "@/mcp/lib/structured-output"
 import { diagnoseService } from "@maple/query-engine/observability"
-import { makeWarehouseExecutorFromTenant } from "@/services/warehouse/WarehouseQueryService"
+import { provideWarehouseExecutorFromTenant } from "@/services/warehouse/WarehouseQueryService"
 
 export function registerDiagnoseServiceTool(server: McpToolRegistrar) {
 	server.tool(
@@ -15,20 +15,20 @@ export function registerDiagnoseServiceTool(server: McpToolRegistrar) {
 		"Deep investigation of one service: health metrics, Apdex, top errors, recent traces and logs. Use after list_services identifies a problem service.",
 		Schema.Struct({
 			service_name: requiredStringParam("The service name to diagnose"),
-			start_time: optionalStringParam("Start of time range (YYYY-MM-DD HH:mm:ss)"),
-			end_time: optionalStringParam("End of time range (YYYY-MM-DD HH:mm:ss)"),
+			start_time: optionalTimeParam("Start of time range (YYYY-MM-DD HH:mm:ss)"),
+			end_time: optionalTimeParam("End of time range (YYYY-MM-DD HH:mm:ss)"),
 			environment: optionalStringParam("Filter by deployment environment (e.g. production, staging)"),
 		}),
 		Effect.fn("McpTool.diagnoseService")(function* ({ service_name, start_time, end_time, environment }) {
 			const { st, et } = resolveTimeRange(start_time, end_time)
-			const tenant = yield* resolveTenant
+			const tenant = yield* CurrentMcpTenant
 
 			const result = yield* diagnoseService({
 				serviceName: service_name,
 				timeRange: { startTime: st, endTime: et },
 				environment: environment ?? undefined,
 			}).pipe(
-				Effect.provide(makeWarehouseExecutorFromTenant(tenant)),
+				provideWarehouseExecutorFromTenant(tenant),
 				Effect.mapError(toMcpQueryError("service_overview")),
 			)
 

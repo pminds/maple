@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest"
-import type { SpanId } from "@maple/domain"
+import { SpanId } from "@maple/domain"
 import type { SpanNode } from "@maple/query-engine/observability"
+import { Schema } from "effect"
 import { renderTraceOverview, type TraceOverviewLog } from "./render-trace"
+
+const decodeSpanId = Schema.decodeSync(SpanId)
 
 function span(
 	id: string,
 	opts: Partial<Omit<SpanNode, "spanId" | "children">> & { children?: SpanNode[] } = {},
 ): SpanNode {
 	return {
-		spanId: id as unknown as SpanId,
+		spanId: decodeSpanId(id),
 		parentSpanId: opts.parentSpanId ?? "",
 		spanName: opts.spanName ?? id,
 		serviceName: opts.serviceName ?? "svc",
@@ -93,5 +96,27 @@ describe("renderTraceOverview", () => {
 		expect(text).toContain("Related Logs (2):")
 		expect(text).toContain("● ") // ERROR marker
 		expect(text).toContain("span:deadbeef") // short span ref for the error log
+	})
+})
+
+describe("renderTraceOverview errorsOnly", () => {
+	it("says which policy pruned the tree", () => {
+		const spans = [
+			span("root", {
+				children: [span("ok"), span("bad", { statusCode: "Error", statusMessage: "boom" })],
+			}),
+		]
+		const { lines, overview } = renderTraceOverview({
+			...base,
+			spanCount: 3,
+			spans,
+			budget: 100,
+			options: { errorsOnly: true },
+		})
+		const text = lines.join("\n")
+		expect(overview.renderedCount).toBe(2)
+		expect(text).toContain("error spans and their ancestors only")
+		expect(text).toContain("bad")
+		expect(text).not.toContain("ok —")
 	})
 })

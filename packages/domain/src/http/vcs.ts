@@ -1,16 +1,13 @@
 import { Schema, SchemaGetter } from "effect"
 import { OrgId, UserId } from "../primitives"
+import { PullRequestLinkState } from "./fix-verification"
 
-// ---------------------------------------------------------------------------
 // Vendor-agnostic VCS integration types.
 //
 // Everything here is provider-neutral: rows carry a `provider` discriminator
 // and GitHub-specific concepts (App auth, REST/webhook payload shapes) live in
 // the GitHub layer behind the `VcsProviderClient` port. Adding another provider
 // means extending `VcsProviderId` + the enum normalizations — no new tables.
-// ---------------------------------------------------------------------------
-
-// ---- Branded IDs ----------------------------------------------------------
 
 export const VcsInstallationId = Schema.String.check(Schema.isUUID()).pipe(
 	Schema.brand("@maple/VcsInstallationId"),
@@ -39,7 +36,7 @@ export type VcsBranchId = Schema.Schema.Type<typeof VcsBranchId>
 /**
  * A full 40-char git commit SHA. Case-insensitive on input and normalized to
  * lowercase during decode, so the same commit is identified regardless of the
- * case a provider — or an OTel `deployment.commit_sha` attribute — emits it in.
+ * case a provider — or an OTel `vcs.ref.head.revision` attribute — emits it in.
  * Strict — unlike the permissive telemetry `CommitSha` brand (which must not
  * throw on arbitrary OTel data) — so the SHA-shape regex lives in exactly this
  * one declarative type, validated at the webhook/REST boundary and on persistence.
@@ -59,8 +56,6 @@ export const GitCommitSha = Schema.String.pipe(
 	Schema.annotate({ identifier: "@maple/GitCommitSha", title: "Git Commit SHA" }),
 )
 export type GitCommitSha = Schema.Schema.Type<typeof GitCommitSha>
-
-// ---- Provider + normalized enums ------------------------------------------
 
 /** The set of supported VCS providers. Extend this array to add a provider. */
 export const VcsProviderId = Schema.Literals(["github"]).annotate({
@@ -106,8 +101,6 @@ export const VcsRepoStatus = Schema.Literals(["active", "removed"]).annotate({
 	title: "VCS Repository Status",
 })
 export type VcsRepoStatus = Schema.Schema.Type<typeof VcsRepoStatus>
-
-// ---- Row → domain models (validated reads) --------------------------------
 
 export class VcsInstallation extends Schema.Class<VcsInstallation>("VcsInstallation")({
 	id: VcsInstallationId,
@@ -202,7 +195,31 @@ export class VcsBranch extends Schema.Class<VcsBranch>("VcsBranch")({
 	updatedAt: Schema.Number,
 }) {}
 
-// ---- Boundary input DTOs (provider → repo / queue) ------------------------
+/**
+ * One pull request as a provider reports it, normalized.
+ *
+ * Read-only and never persisted: this is what the attach-a-PR picker lists and
+ * what hydrates a link at attach time. `state` collapses the provider's own
+ * split representation — GitHub answers `state: "open" | "closed"` alongside a
+ * separate `merged_at` — into the same three-way {@link PullRequestLinkState}
+ * the stored link and the webhook mapper already use, so a merged PR is never
+ * mistaken for a plain closed one.
+ */
+export const PullRequestSummary = Schema.Struct({
+	number: Schema.Number,
+	title: Schema.String,
+	url: Schema.String,
+	authorLogin: Schema.NullOr(Schema.String),
+	state: PullRequestLinkState,
+	/** The branch the PR merges *from* — what a person recognizes it by. */
+	headRef: Schema.String,
+	baseRef: Schema.String,
+	isDraft: Schema.Boolean,
+	updatedAtMs: Schema.Number,
+	mergedAtMs: Schema.NullOr(Schema.Number),
+	mergeCommitSha: Schema.NullOr(Schema.String),
+})
+export type PullRequestSummary = Schema.Schema.Type<typeof PullRequestSummary>
 
 /** Normalized repository, returned by a provider and persisted by the repo. */
 export const RepoUpsertInput = Schema.Struct({
@@ -280,8 +297,6 @@ export const VcsRepositoryRef = Schema.Struct({
 	name: Schema.String,
 })
 export type VcsRepositoryRef = Schema.Schema.Type<typeof VcsRepositoryRef>
-
-// ---- Queue jobs (vendor-agnostic; orgId resolved by the orchestrator) ------
 
 export const VcsInstallationSyncReason = Schema.Literals([
 	"created",
@@ -383,36 +398,67 @@ export const BranchEventJob = Schema.Struct({
 })
 export type BranchEventJob = Schema.Schema.Type<typeof BranchEventJob>
 
+// A pull request webhook. Unlike every other job here this one touches no VCS
+// table: it is forwarded to the errors side, which owns the issue⇄PR link and
+// the post-merge verification window. The job carries only VCS facts (the
+// provider's own ids, the PR's text) so this layer stays ignorant of issues —
+// `VcsSyncService` resolves the org and hands it over.
+//
+// `title` and `body` are carried because the auto-link scan reads them: a PR
+// that names a Maple issue in its description links itself. `body` is nullable
+// (GitHub sends null for an empty description) and unbounded here; the scan
+// itself is a bounded regex.
+export const PullRequestEventJob = Schema.Struct({
+	kind: Schema.Literal("pull-request-event"),
+	provider: VcsProviderId,
+	externalInstallationId: Schema.String,
+	externalRepoId: Schema.String,
+	repoFullName: Schema.String,
+	number: Schema.Number,
+	// GitHub's `action`, narrowed to the ones that change a link's meaning.
+	// `closed` covers both "merged" and "closed without merging"; `merged`
+	// below is what distinguishes them.
+	action: Schema.Literals(["opened", "edited", "reopened", "closed", "synchronize"]),
+	url: Schema.String,
+	title: Schema.NullOr(Schema.String),
+	body: Schema.NullOr(Schema.String),
+	authorLogin: Schema.NullOr(Schema.String),
+	merged: Schema.Boolean,
+	mergeCommitSha: Schema.NullOr(Schema.String),
+	mergedAtMs: Schema.NullOr(Schema.Number),
+	deliveryId: Schema.optionalKey(Schema.String),
+})
+export type PullRequestEventJob = Schema.Schema.Type<typeof PullRequestEventJob>
+
 export const VcsSyncJob = Schema.Union([
 	InstallationSyncJob,
 	SyncCommitsJob,
 	PushJob,
 	SyncBranchesJob,
 	BranchEventJob,
+	PullRequestEventJob,
 ])
 export type VcsSyncJob = Schema.Schema.Type<typeof VcsSyncJob>
 
-// ---- Tagged errors --------------------------------------------------------
-
-export class VcsRepoPersistenceError extends Schema.TaggedErrorClass<VcsRepoPersistenceError>()(
+export class VcsRepoPersistenceError extends Schema.TaggedError<VcsRepoPersistenceError>()(
 	"@maple/http/errors/VcsRepoPersistenceError",
 	{ message: Schema.String },
 	{ httpApiStatus: 503 },
 ) {}
 
-export class VcsRepoDecodeError extends Schema.TaggedErrorClass<VcsRepoDecodeError>()(
+export class VcsRepoDecodeError extends Schema.TaggedError<VcsRepoDecodeError>()(
 	"@maple/http/errors/VcsRepoDecodeError",
 	{ message: Schema.String, table: Schema.String, column: Schema.optionalKey(Schema.String) },
 	{ httpApiStatus: 500 },
 ) {}
 
-export class VcsQueueError extends Schema.TaggedErrorClass<VcsQueueError>()(
+export class VcsQueueError extends Schema.TaggedError<VcsQueueError>()(
 	"@maple/http/errors/VcsQueueError",
 	{ message: Schema.String },
 	{ httpApiStatus: 503 },
 ) {}
 
-export class VcsProviderError extends Schema.TaggedErrorClass<VcsProviderError>()(
+export class VcsProviderError extends Schema.TaggedError<VcsProviderError>()(
 	"@maple/http/errors/VcsProviderError",
 	{
 		message: Schema.String,
@@ -429,7 +475,7 @@ export class VcsProviderError extends Schema.TaggedErrorClass<VcsProviderError>(
  * as a disconnect — raw HTTP status never drives that decision. Providers must
  * only raise this when the signal is unambiguous.
  */
-export class VcsInstallationGoneError extends Schema.TaggedErrorClass<VcsInstallationGoneError>()(
+export class VcsInstallationGoneError extends Schema.TaggedError<VcsInstallationGoneError>()(
 	"@maple/http/errors/VcsInstallationGoneError",
 	{ message: Schema.String },
 	{ httpApiStatus: 410 },
@@ -439,10 +485,28 @@ export class VcsInstallationGoneError extends Schema.TaggedErrorClass<VcsInstall
  * The provider is certain a specific repository is permanently inaccessible
  * (deleted / renamed / access lost). Scoped to the repo — never the installation.
  */
-export class VcsRepoUnavailableError extends Schema.TaggedErrorClass<VcsRepoUnavailableError>()(
+export class VcsRepoUnavailableError extends Schema.TaggedError<VcsRepoUnavailableError>()(
 	"@maple/http/errors/VcsRepoUnavailableError",
 	{ message: Schema.String },
 	{ httpApiStatus: 404 },
+) {}
+
+/**
+ * The provider is permanently refusing access to a specific repository for a
+ * reason retrying cannot clear: GitHub answers `451 Unavailable For Legal
+ * Reasons` (DMCA takedown, `{"block":{"reason":"dmca"}}`) or a `403` carrying
+ * the same block body. Distinct from `VcsRepoUnavailableError` (deleted /
+ * renamed / access lost) so the two are separable in telemetry — a blocked repo
+ * needs an operator, a gone repo needs nothing.
+ *
+ * TERMINAL: the sync consumer must drain the job, never redeliver it. A DMCA
+ * block on one repo retried ~12x per scheduled run, every 12h, for a year before
+ * this existed.
+ */
+export class VcsRepositoryBlockedError extends Schema.TaggedError<VcsRepositoryBlockedError>()(
+	"@maple/http/errors/VcsRepositoryBlockedError",
+	{ message: Schema.String, status: Schema.optionalKey(Schema.Number) },
+	{ httpApiStatus: 451 },
 ) {}
 
 /**
@@ -451,25 +515,25 @@ export class VcsRepoUnavailableError extends Schema.TaggedErrorClass<VcsRepoUnav
  * consumer redelivers the failed job with this delay; backfill catches it earlier
  * and requeues from a cursor (see `VcsCommitFetch.next`).
  */
-export class VcsRateLimitedError extends Schema.TaggedErrorClass<VcsRateLimitedError>()(
+export class VcsRateLimitedError extends Schema.TaggedError<VcsRateLimitedError>()(
 	"@maple/http/errors/VcsRateLimitedError",
 	{ message: Schema.String, retryAfterSeconds: Schema.Number },
 	{ httpApiStatus: 429 },
 ) {}
 
-export class VcsWebhookSignatureError extends Schema.TaggedErrorClass<VcsWebhookSignatureError>()(
+export class VcsWebhookSignatureError extends Schema.TaggedError<VcsWebhookSignatureError>()(
 	"@maple/http/errors/VcsWebhookSignatureError",
 	{ message: Schema.String },
 	{ httpApiStatus: 401 },
 ) {}
 
-export class VcsWebhookParseError extends Schema.TaggedErrorClass<VcsWebhookParseError>()(
+export class VcsWebhookParseError extends Schema.TaggedError<VcsWebhookParseError>()(
 	"@maple/http/errors/VcsWebhookParseError",
 	{ message: Schema.String },
 	{ httpApiStatus: 400 },
 ) {}
 
-export class UnknownVcsProviderError extends Schema.TaggedErrorClass<UnknownVcsProviderError>()(
+export class UnknownVcsProviderError extends Schema.TaggedError<UnknownVcsProviderError>()(
 	"@maple/http/errors/UnknownVcsProviderError",
 	{ provider: Schema.String, message: Schema.String },
 	{ httpApiStatus: 404 },
@@ -477,13 +541,13 @@ export class UnknownVcsProviderError extends Schema.TaggedErrorClass<UnknownVcsP
 
 /**
  * The requested commit reference is not a resolvable git SHA — it failed the
- * strict 40-hex `GitCommitSha` shape. Telemetry `deployment.commit_sha` is
+ * strict 40-hex `GitCommitSha` shape. Telemetry `vcs.ref.head.revision` is
  * unguarded OTel data, so a value can be a short SHA, a tag, or arbitrary text;
  * the hover-card endpoint surfaces that as this distinct, non-retryable error
  * (422) rather than a generic 400, so the dashboard can render a muted
  * "non-standard commit reference" state instead of a failure.
  */
-export class VcsCommitShaInvalidError extends Schema.TaggedErrorClass<VcsCommitShaInvalidError>()(
+export class VcsCommitShaInvalidError extends Schema.TaggedError<VcsCommitShaInvalidError>()(
 	"@maple/http/errors/VcsCommitShaInvalidError",
 	{ message: Schema.String, sha: Schema.String },
 	{ httpApiStatus: 422 },
@@ -493,13 +557,13 @@ export class VcsCommitShaInvalidError extends Schema.TaggedErrorClass<VcsCommitS
  * The SHA is a valid 40-hex commit, but no connected repository in the org
  * contains it (neither stored nor resolvable on the fly from any provider).
  */
-export class VcsCommitNotFoundError extends Schema.TaggedErrorClass<VcsCommitNotFoundError>()(
+export class VcsCommitNotFoundError extends Schema.TaggedError<VcsCommitNotFoundError>()(
 	"@maple/http/errors/VcsCommitNotFoundError",
 	{ message: Schema.String, sha: Schema.String },
 	{ httpApiStatus: 404 },
 ) {}
 
-export class OAuthStatePersistenceError extends Schema.TaggedErrorClass<OAuthStatePersistenceError>()(
+export class OAuthStatePersistenceError extends Schema.TaggedError<OAuthStatePersistenceError>()(
 	"@maple/http/errors/OAuthStatePersistenceError",
 	{ message: Schema.String },
 	{ httpApiStatus: 503 },

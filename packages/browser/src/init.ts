@@ -12,6 +12,8 @@ import {
 	onConsentChange,
 	publishSessionSink,
 	rotateSession,
+	isLikelyBot,
+	sdkHint,
 	setActiveTraceIdProvider,
 	setVisitorTracking,
 	startEventSink,
@@ -24,7 +26,12 @@ import {
 import type { ReplaySessionHandle } from "@maple/browser-session/replay"
 import { trace } from "@opentelemetry/api"
 import { type MapleBrowserConfig, type ResolvedConfig, resolveConfig } from "./config"
+import { setupErrorCapture } from "./errors"
 import { setupTracing } from "./tracing"
+import { SDK_NAME, SDK_VERSION } from "./version"
+
+/** `x-maple-sdk` value for every request this build makes to ingest. */
+const SDK_HINT = sdkHint(SDK_NAME, SDK_VERSION)
 
 export interface MapleBrowserHandle {
 	/** Empty until consent is granted when `requireConsent` is enabled. */
@@ -64,11 +71,17 @@ export function init(rawConfig: MapleBrowserConfig): MapleBrowserHandle {
 	if (!hasConsent()) clearPendingEvents()
 	setActiveTraceIdProvider(() => trace.getActiveSpan()?.spanContext().traceId)
 
-	const recordReplay = config.replayEnabled && Math.random() < config.replaySampleRate
+	// Crawlers are excluded before the sample roll, not by it: they still get a
+	// metadata-only session (Web Analytics counts them, and the server-side
+	// classifier is what labels them a bot there), but no rrweb chunk and no
+	// uploads. See `isLikelyBot`.
+	const recordReplay =
+		config.replayEnabled && !isLikelyBot(navigator.userAgent) && Math.random() < config.replaySampleRate
 	let runtime: BrowserRuntime | undefined
 	let stopped = false
 	let rotateOnNextStart = false
 	let shutdownTracing: (() => Promise<void>) | undefined
+	let stopErrorCapture: (() => void) | undefined
 	// Bumped by every start and stop, so a replay chunk that lands after a
 	// consent revoke (or a rotation) never attaches a recorder to a dead runtime.
 	let generation = 0
@@ -83,15 +96,24 @@ export function init(rawConfig: MapleBrowserConfig): MapleBrowserHandle {
 			{
 				endpoint: config.endpoint,
 				ingestKey: config.ingestKey,
+				sdk: SDK_HINT,
 				maskAllInputs: config.maskAllInputs,
 				maskAllText: config.maskAllText,
+				getIdentity: () => activeConfig?.identity,
 			},
 			session.id,
 		)
 		if (config.tracingEnabled && !shutdownTracing) shutdownTracing = setupTracing(config)
+		// After `setupTracing`: the handlers span through the global provider it
+		// registers, so registering them first would drop the errors of the very
+		// first moments into a no-op tracer.
+		if (config.tracingEnabled && config.tracingCaptureErrors && !stopErrorCapture) {
+			stopErrorCapture = setupErrorCapture()
+		}
 		const shared = {
 			endpoint: config.endpoint,
 			ingestKey: config.ingestKey,
+			sdk: SDK_HINT,
 			serviceName: config.serviceName,
 			environment: config.environment,
 			serviceVersion: config.serviceVersion,
@@ -184,6 +206,8 @@ export function init(rawConfig: MapleBrowserConfig): MapleBrowserHandle {
 			stopped = true
 			stopConsentListener()
 			await stopRuntime(true)
+			stopErrorCapture?.()
+			stopErrorCapture = undefined
 			await shutdownTracing?.()
 			shutdownTracing = undefined
 			setActiveTraceIdProvider(() => undefined)

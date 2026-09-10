@@ -3,11 +3,16 @@ import { ConfigProvider, Context, Effect, Layer, ManagedRuntime, Schema } from "
 import { HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import {
+	IntegrationsConfigurationError,
 	IntegrationsNotConnectedError,
 	IntegrationsPersistenceError,
 	IntegrationsUpstreamError,
 	IntegrationsValidationError,
 	OrgId,
+	ScrapeTargetEncryptionError,
+	ScrapeTargetId,
+	ScrapeTargetNotFoundError,
+	ScrapeTargetStoredConfigInvalidError,
 	UserId,
 } from "@maple/domain/http"
 import { MapleApiV2 } from "@maple/domain/http/v2"
@@ -16,13 +21,26 @@ import { cleanupTestDbs, createTestDb, type TestDb } from "@/platform/test-pglit
 import { ApiKeysService } from "@/services/org/ApiKeysService"
 import { AuthService } from "@/services/auth/AuthService"
 import { DashboardPersistenceService } from "@/services/dashboards/DashboardPersistenceService"
+import { SharedDashboardService } from "@/services/dashboards/SharedDashboardService"
 import { ApiAuthorizationV2Layer } from "@/services/auth/ApiAuthorizationV2Layer"
+import { AuditLogService } from "@/services/audit/AuditLogService"
 import {
 	SLACK_CALLBACK_PATH,
 	SlackIntegrationService,
-	type SlackIntegrationServiceShape,
+	type SlackIntegrationServiceApi,
 } from "@/services/integrations/SlackIntegrationService"
-import { V2SchemaErrorsLive } from "./error-envelope"
+import { EdgeCacheService, MemoryCacheBackendLive } from "@maple/cache"
+import {
+	PLANETSCALE_CALLBACK_PATH,
+	PlanetScaleOAuthService,
+	type PlanetScaleOAuthServiceApi,
+} from "@/services/auth/PlanetScaleOAuthService"
+import {
+	PlanetScaleConnectionService,
+	type PlanetScaleConnectionServiceApi,
+} from "@/services/integrations/PlanetScaleConnectionService"
+import { PlanetScaleService, type PlanetScaleServiceApi } from "@/services/integrations/PlanetScaleService"
+import { V2TransportErrorBoundaryLive } from "./error-envelope"
 import {
 	AlertsServiceStubLayer,
 	AllV2GroupLayersLive,
@@ -68,11 +86,13 @@ const testConfig = () =>
 
 const die = () => Effect.die(new Error("This SlackIntegrationService method is not stubbed in this test"))
 
+const psDie = () => Effect.die(new Error("This PlanetScale service method is not stubbed in this test"))
+
 /**
  * A real `SlackIntegrationService` with only the methods a test exercises —
  * anything else dies loudly rather than silently succeeding.
  */
-const slackServiceLayer = (overrides: Partial<SlackIntegrationServiceShape>) =>
+const slackServiceLayer = (overrides: Partial<SlackIntegrationServiceApi>) =>
 	Layer.succeed(
 		SlackIntegrationService,
 		SlackIntegrationService.of({
@@ -88,23 +108,70 @@ const slackServiceLayer = (overrides: Partial<SlackIntegrationServiceShape>) =>
 		}),
 	)
 
-const makeHarness = (slack: Partial<SlackIntegrationServiceShape> = {}) => {
+interface PlanetScaleFakes {
+	readonly connection?: Partial<PlanetScaleConnectionServiceApi>
+	readonly oauth?: Partial<PlanetScaleOAuthServiceApi>
+	readonly inventory?: Partial<PlanetScaleServiceApi>
+}
+
+/**
+ * The three PlanetScale services the v2 group depends on, stubbed the same way
+ * as Slack's — unstubbed methods die loudly. The edge cache is real (in-memory):
+ * `query_insights` and `events` round-trip their responses through it, so a
+ * no-op cache would skip the encode the wire shape depends on.
+ */
+const planetscaleServiceLayer = (fakes: PlanetScaleFakes) =>
+	Layer.mergeAll(
+		Layer.succeed(PlanetScaleConnectionService, {
+			getStatus: psDie,
+			finalizeOrgSelection: psDie,
+			setMetricsToken: psDie,
+			disconnect: psDie,
+			loadConnection: psDie,
+			webhookConfig: psDie,
+			...fakes.connection,
+		}),
+		Layer.succeed(PlanetScaleOAuthService, {
+			startConnect: psDie,
+			completeConnect: psDie,
+			getValidAccessToken: psDie,
+			listOrganizations: psDie,
+			hasConnection: psDie,
+			connectedByUserId: psDie,
+			grantStatus: psDie,
+			disconnect: psDie,
+			...fakes.oauth,
+		}),
+		Layer.succeed(PlanetScaleService, {
+			pollAllOrgs: psDie,
+			listDatabases: psDie,
+			listEvents: psDie,
+			queryInsights: psDie,
+			...fakes.inventory,
+		}),
+		EdgeCacheService.layer.pipe(Layer.provide(MemoryCacheBackendLive)),
+	)
+
+const makeHarness = (slack: Partial<SlackIntegrationServiceApi> = {}, planetscale: PlanetScaleFakes = {}) => {
 	const testDb = createTestDb(createdDbs)
 	const envLive = Env.layer.pipe(Layer.provide(testConfig()))
 	const servicesLive = Layer.mergeAll(
 		ApiKeysService.layer,
 		AuthService.layer,
 		DashboardPersistenceService.layer,
+		SharedDashboardService.layer,
 	).pipe(Layer.provideMerge(Layer.mergeAll(envLive, testDb.layer)))
 
 	const routes = HttpApiBuilder.layer(MapleApiV2).pipe(
 		Layer.provide(AllV2GroupLayersLive),
-		Layer.provide(V2SchemaErrorsLive),
+		Layer.provide(V2TransportErrorBoundaryLive),
 		Layer.provide(slackServiceLayer(slack)),
+		Layer.provide(planetscaleServiceLayer(planetscale)),
 		Layer.provide(AlertsServiceStubLayer),
 		Layer.provide(ConfigResourceServiceStubsLayer),
 		Layer.provide(TelemetryServiceStubsLayer),
 		Layer.provideMerge(ApiAuthorizationV2Layer),
+		Layer.provideMerge(AuditLogService.layerMemory),
 		Layer.provideMerge(ApiV2RateLimiterAllowAllLayer),
 		Layer.provideMerge(servicesLive),
 	)
@@ -140,7 +207,7 @@ const makeHarness = (slack: Partial<SlackIntegrationServiceShape> = {}) => {
 		method: string,
 		path: string,
 		token: string,
-		options: { forwardedHost?: string } = {},
+		options: { forwardedHost?: string; body?: unknown } = {},
 	) => {
 		const response = await handler(
 			new Request(`http://${API_HOST}${path}`, {
@@ -151,7 +218,9 @@ const makeHarness = (slack: Partial<SlackIntegrationServiceShape> = {}) => {
 					// so the resolved origin does not depend on the web adapter's
 					// host-header handling.
 					"x-forwarded-host": options.forwardedHost ?? API_HOST,
+					...(!(options.body === undefined) ? { "content-type": "application/json" } : undefined),
 				},
+				...(!(options.body === undefined) ? { body: JSON.stringify(options.body) } : undefined),
 			}),
 			Context.empty() as never,
 		)
@@ -251,7 +320,11 @@ describe("v2 slack integration over HTTP", () => {
 
 		const { status, body } = await harness.request("GET", "/v2/integrations/slack", key.secret)
 		expect(status).toBe(503)
-		expect(body.error).toMatchObject({ type: "api_error", code: "service_unavailable" })
+		expect(body.error).toMatchObject({
+			_tag: "@maple/http/errors/IntegrationsPersistenceError",
+			type: "api_error",
+			code: "integration_persistence_unavailable",
+		})
 		await harness.dispose()
 	})
 
@@ -296,9 +369,13 @@ describe("v2 slack integration over HTTP", () => {
 		)
 		expect(status).toBe(403)
 		expect(body.error).toEqual({
+			_tag: "@maple/http/v2/InsufficientPermissionsError",
 			type: "permission_error",
 			code: "insufficient_permissions",
+			title: "Permission required",
 			message: "Only org admins can install the Slack app",
+			retryable: false,
+			recovery: "request_access",
 		})
 		expect(called).toBe(false)
 		await harness.dispose()
@@ -321,16 +398,16 @@ describe("v2 slack integration over HTTP", () => {
 			forwardedHost: "public.example.com",
 		})
 		expect(status).toBe(503)
-		expect(body.error).toMatchObject({ type: "api_error", code: "service_unavailable" })
+		expect(body.error).toMatchObject({ type: "api_error", code: "callback_host_unavailable" })
 		expect(called).toBe(false)
 		await harness.dispose()
 	})
 
-	it("maps install validation and persistence failures to 503", async () => {
+	it("distinguishes server configuration from persistence failures", async () => {
 		const unconfigured = makeHarness({
 			startInstall: () =>
 				Effect.fail(
-					new IntegrationsValidationError({ message: "Slack integration is not configured" }),
+					new IntegrationsConfigurationError({ message: "Slack integration is not configured" }),
 				),
 		})
 		const unconfiguredKey = await unconfigured.bootstrapAdminKey()
@@ -340,7 +417,10 @@ describe("v2 slack integration over HTTP", () => {
 			unconfiguredKey.secret,
 		)
 		expect(validation.status).toBe(503)
-		expect(validation.body.error.code).toBe("service_unavailable")
+		expect(validation.body.error).toMatchObject({
+			_tag: "@maple/http/errors/IntegrationsConfigurationError",
+			code: "integration_not_configured",
+		})
 		await unconfigured.dispose()
 
 		const broken = makeHarness({
@@ -385,9 +465,13 @@ describe("v2 slack integration over HTTP", () => {
 		const { status, body } = await harness.request("DELETE", "/v2/integrations/slack", member.secret)
 		expect(status).toBe(403)
 		expect(body.error).toEqual({
+			_tag: "@maple/http/v2/InsufficientPermissionsError",
 			type: "permission_error",
 			code: "insufficient_permissions",
+			title: "Permission required",
 			message: "Only org admins can uninstall the Slack app",
+			retryable: false,
+			recovery: "request_access",
 		})
 		expect(called).toBe(false)
 		await harness.dispose()
@@ -402,7 +486,7 @@ describe("v2 slack integration over HTTP", () => {
 
 		const { status, body } = await harness.request("DELETE", "/v2/integrations/slack", key.secret)
 		expect(status).toBe(503)
-		expect(body.error.code).toBe("service_unavailable")
+		expect(body.error.code).toBe("integration_persistence_unavailable")
 		await harness.dispose()
 	})
 
@@ -474,9 +558,13 @@ describe("v2 slack integration over HTTP", () => {
 		)
 		expect(status).toBe(403)
 		expect(body.error).toEqual({
+			_tag: "@maple/http/v2/InsufficientPermissionsError",
 			type: "permission_error",
 			code: "insufficient_permissions",
+			title: "Permission required",
 			message: "Only org admins can list Slack channels",
+			retryable: false,
+			recovery: "request_access",
 		})
 		expect(called).toBe(false)
 		await harness.dispose()
@@ -505,7 +593,7 @@ describe("v2 slack integration over HTTP", () => {
 		await harness.dispose()
 	})
 
-	it("maps each channels service error tag to its status: 404, 502, 503", async () => {
+	it("maps each channels service tag without flattening its meaning", async () => {
 		const notConnected = makeHarness({
 			listChannels: () =>
 				Effect.fail(
@@ -520,10 +608,11 @@ describe("v2 slack integration over HTTP", () => {
 			"/v2/integrations/slack/channels",
 			notConnectedKey.secret,
 		)
-		expect(missing.status).toBe(404)
+		expect(missing.status).toBe(409)
 		expect(missing.body.error).toMatchObject({
-			type: "not_found_error",
-			code: "resource_missing",
+			_tag: "@maple/http/errors/IntegrationsNotConnectedError",
+			type: "conflict_error",
+			code: "integration_not_connected",
 			message: "Slack is not connected for this organization",
 		})
 		await notConnected.dispose()
@@ -539,7 +628,11 @@ describe("v2 slack integration over HTTP", () => {
 		const upstreamKey = await upstream.bootstrapAdminKey()
 		const rejected = await upstream.request("GET", "/v2/integrations/slack/channels", upstreamKey.secret)
 		expect(rejected.status).toBe(502)
-		expect(rejected.body.error).toMatchObject({ type: "api_error", code: "slack_upstream_error" })
+		expect(rejected.body.error).toMatchObject({
+			_tag: "@maple/http/errors/IntegrationsUpstreamError",
+			type: "api_error",
+			code: "integration_upstream_error",
+		})
 		await upstream.dispose()
 
 		const persistence = makeHarness({
@@ -553,8 +646,32 @@ describe("v2 slack integration over HTTP", () => {
 			persistenceKey.secret,
 		)
 		expect(unavailable.status).toBe(503)
-		expect(unavailable.body.error.code).toBe("service_unavailable")
+		expect(unavailable.body.error.code).toBe("integration_persistence_unavailable")
 		await persistence.dispose()
+	})
+
+	it("never puts a persistence failure's message in the public body", async () => {
+		// postgres.js puts the whole failing SQL in the error message, so echoing
+		// it — which is what the v1 body does — publishes the schema. Confirmed on
+		// the PlanetScale endpoints against a database missing a table.
+		const harness = makeHarness({
+			getStatus: () =>
+				Effect.fail(
+					new IntegrationsPersistenceError({
+						message:
+							'Failed query: select "id", "org_id" from "slack_installations" [caused by: relation "slack_installations" does not exist]',
+					}),
+				),
+		})
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request("GET", "/v2/integrations/slack", key.secret)
+		expect(status).toBe(503)
+		expect(body.error.code).toBe("integration_persistence_unavailable")
+		const serialized = JSON.stringify(body)
+		expect(serialized).not.toContain("select")
+		expect(serialized).not.toContain("slack_installations")
+		await harness.dispose()
 	})
 
 	it("enforces the integrations read/write scope family", async () => {
@@ -584,6 +701,461 @@ describe("v2 slack integration over HTTP", () => {
 			type: "permission_error",
 			code: "insufficient_scope",
 		})
+		await harness.dispose()
+	})
+})
+
+/**
+ * The `planetscaleIntegration` group. Promoted from v1 for scripted setups, so
+ * the cases that matter most are the ones a v1 caller could not exercise: scope
+ * enforcement, the admin gate as a v2 envelope, and the wire shape a script
+ * parses.
+ */
+describe("v2 planetscale integration over HTTP", () => {
+	const connectedStatus = {
+		connected: true,
+		pendingOrgSelection: false,
+		organization: "acme",
+		connectedByUserId: null,
+		detectedPermissions: { readMetricsEndpoints: true },
+		metricsAuth: "service_token" as const,
+		scrapeTarget: {
+			id: Schema.decodeUnknownSync(ScrapeTargetId)("11111111-1111-4111-8111-111111111111"),
+			enabled: true,
+			scrapeIntervalSeconds: 60,
+			includeBranches: ["main"],
+			excludeBranches: ["pr-*"],
+			lastScrapeAt: Date.parse("2026-08-05T12:00:00.000Z"),
+			lastScrapeError: null,
+		},
+		lastInventoryAt: Date.parse("2026-08-05T11:00:00.000Z"),
+		lastInventoryError: null,
+		revokedAt: null,
+		expiresAt: null,
+	}
+
+	it("returns the status in v2 wire shape, with an ISO scrape time and a scrp_ ID", async () => {
+		const harness = makeHarness({}, { connection: { getStatus: () => Effect.succeed(connectedStatus) } })
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request("GET", "/v2/integrations/planetscale", key.secret)
+		expect(status).toBe(200)
+		expect(body).toMatchObject({
+			object: "planetscale_integration",
+			connected: true,
+			pending_org_selection: false,
+			organization: "acme",
+			metrics_auth: "service_token",
+			last_inventory_at: "2026-08-05T11:00:00.000Z",
+			scrape_target: {
+				object: "planetscale_integration.scrape_target",
+				scrape_interval_seconds: 60,
+				include_branches: ["main"],
+				exclude_branches: ["pr-*"],
+				last_scrape_at: "2026-08-05T12:00:00.000Z",
+			},
+		})
+		// Public ID, not the raw UUID, and no camelCase leakage from the service.
+		expect(body.scrape_target.id).toMatch(/^scrp_/)
+		expect("metricsAuth" in body).toBe(false)
+		await harness.dispose()
+	})
+
+	it("preserves a malformed managed-target tag on status", async () => {
+		const harness = makeHarness(
+			{},
+			{
+				connection: {
+					getStatus: () =>
+						Effect.fail(
+							new ScrapeTargetStoredConfigInvalidError({
+								rawTargetId: "broken-target",
+								component: "discovery_config",
+								message: "stored discovery config is malformed",
+								cause: new Error("organization is missing"),
+							}),
+						),
+				},
+			},
+		)
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request("GET", "/v2/integrations/planetscale", key.secret)
+		expect(status).toBe(502)
+		expect(body.error).toMatchObject({
+			_tag: "@maple/http/errors/ScrapeTargetStoredConfigInvalidError",
+			code: "scrape_target_stored_config_invalid",
+			retryable: false,
+			recovery: "reconnect",
+		})
+		expect(JSON.stringify(body)).not.toContain("organization is missing")
+		await harness.dispose()
+	})
+
+	it("attaches a metrics token for an admin and answers with the refreshed status", async () => {
+		let received: { tokenId: string; tokenSecret: string } | null = null
+		const harness = makeHarness(
+			{},
+			{
+				connection: {
+					setMetricsToken: (_orgId, request) => {
+						received = { tokenId: request.tokenId, tokenSecret: request.tokenSecret }
+						return Effect.succeed(connectedStatus)
+					},
+				},
+			},
+		)
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			key.secret,
+			{ body: { token_id: "tok_1", token_secret: "pscale_tkn_secret" } },
+		)
+		expect(status).toBe(200)
+		expect(body.metrics_auth).toBe("service_token")
+		// snake_case on the wire, camelCase into the service.
+		expect(received).toEqual({ tokenId: "tok_1", tokenSecret: "pscale_tkn_secret" })
+		await harness.dispose()
+	})
+
+	it("rejects a token PlanetScale refuses with 400 and never reports success", async () => {
+		const harness = makeHarness(
+			{},
+			{
+				connection: {
+					setMetricsToken: () =>
+						Effect.fail(
+							new IntegrationsValidationError({
+								message: "PlanetScale rejected the service token for the metrics endpoint.",
+							}),
+						),
+				},
+			},
+		)
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			key.secret,
+			{ body: { token_id: "tok_bad", token_secret: "nope" } },
+		)
+		expect(status).toBe(400)
+		expect(body.error).toMatchObject({
+			type: "invalid_request_error",
+			code: "integration_request_invalid",
+		})
+		await harness.dispose()
+	})
+
+	it("preserves a managed scrape-target encryption failure", async () => {
+		const harness = makeHarness(
+			{},
+			{
+				connection: {
+					setMetricsToken: () =>
+						Effect.fail(
+							new ScrapeTargetEncryptionError({
+								message: "failed to encrypt token with key material",
+							}),
+						),
+				},
+			},
+		)
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			key.secret,
+			{ body: { token_id: "tok_1", token_secret: "pscale_tkn_secret" } },
+		)
+
+		expect(status).toBe(500)
+		expect(body.error).toMatchObject({
+			_tag: "@maple/http/errors/ScrapeTargetEncryptionError",
+			code: "scrape_target_encryption_failed",
+		})
+		expect(JSON.stringify(body)).not.toContain("key material")
+		await harness.dispose()
+	})
+
+	it("preserves a missing managed scrape target as an exact 404", async () => {
+		const harness = makeHarness(
+			{},
+			{
+				connection: {
+					setMetricsToken: () =>
+						Effect.fail(
+							new ScrapeTargetNotFoundError({
+								targetId: connectedStatus.scrapeTarget.id,
+								message: "The managed PlanetScale scrape target no longer exists",
+							}),
+						),
+				},
+			},
+		)
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			key.secret,
+			{ body: { token_id: "tok_1", token_secret: "pscale_tkn_secret" } },
+		)
+
+		expect(status).toBe(404)
+		expect(body.error).toMatchObject({
+			_tag: "@maple/http/errors/ScrapeTargetNotFoundError",
+			code: "scrape_target_not_found",
+			param: "id",
+		})
+		await harness.dispose()
+	})
+
+	it("rejects an empty token id at the schema boundary, before the service is reached", async () => {
+		const harness = makeHarness({}, {})
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			key.secret,
+			{ body: { token_id: "", token_secret: "pscale_tkn_secret" } },
+		)
+		expect(status).toBe(400)
+		expect(body.error.type).toBe("invalid_request_error")
+		// The service is `psDie` here: reaching it would crash rather than 400.
+		await harness.dispose()
+	})
+
+	it("refuses a metrics token from a non-admin member with 403 and never calls the service", async () => {
+		const harness = makeHarness({}, {})
+		const member = await harness.bootstrapMemberKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			member.secret,
+			{ body: { token_id: "tok_1", token_secret: "pscale_tkn_secret" } },
+		)
+		expect(status).toBe(403)
+		expect(body.error).toMatchObject({
+			type: "permission_error",
+			code: "insufficient_permissions",
+		})
+		await harness.dispose()
+	})
+
+	it("serves the status to a non-admin member — the integration card renders for everyone", async () => {
+		const harness = makeHarness({}, { connection: { getStatus: () => Effect.succeed(connectedStatus) } })
+		const member = await harness.bootstrapMemberKey()
+
+		const { status } = await harness.request("GET", "/v2/integrations/planetscale", member.secret)
+		expect(status).toBe(200)
+		await harness.dispose()
+	})
+
+	it("maps a missing connection to 409 and an upstream failure to 502", async () => {
+		const notConnected = makeHarness(
+			{},
+			{
+				connection: {
+					setMetricsToken: () =>
+						Effect.fail(
+							new IntegrationsNotConnectedError({
+								message: "Connect PlanetScale before adding a metrics service token",
+							}),
+						),
+				},
+			},
+		)
+		const notConnectedKey = await notConnected.bootstrapAdminKey()
+		const missing = await notConnected.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			notConnectedKey.secret,
+			{ body: { token_id: "tok_1", token_secret: "pscale_tkn_secret" } },
+		)
+		expect(missing.status).toBe(409)
+		expect(missing.body.error).toMatchObject({
+			_tag: "@maple/http/errors/IntegrationsNotConnectedError",
+			code: "integration_not_connected",
+		})
+		await notConnected.dispose()
+
+		const upstream = makeHarness(
+			{},
+			{
+				oauth: {
+					listOrganizations: () =>
+						Effect.fail(new IntegrationsUpstreamError({ message: "PlanetScale is unavailable" })),
+				},
+			},
+		)
+		const upstreamKey = await upstream.bootstrapAdminKey()
+		const failed = await upstream.request(
+			"GET",
+			"/v2/integrations/planetscale/organizations",
+			upstreamKey.secret,
+		)
+		expect(failed.status).toBe(502)
+		expect(failed.body.error.code).toBe("integration_upstream_error")
+		await upstream.dispose()
+	})
+
+	it("fails a connect closed with 503 when the request origin is not trusted", async () => {
+		const harness = makeHarness({}, {})
+		const key = await harness.bootstrapAdminKey()
+
+		const { status } = await harness.request("POST", "/v2/integrations/planetscale/connect", key.secret, {
+			forwardedHost: "evil.example.com",
+			body: {},
+		})
+		// `psDie` would crash if the handler got past the origin gate.
+		expect(status).toBe(503)
+		await harness.dispose()
+	})
+
+	it("mints an authorize URL pointing at the v1 callback path, which did not move", async () => {
+		let callbackUrl: string | null = null
+		const harness = makeHarness(
+			{},
+			{
+				oauth: {
+					startConnect: (_orgId, _userId, options) => {
+						callbackUrl = options.callbackUrl
+						return Effect.succeed({
+							redirectUrl: "https://app.planetscale.com/oauth/authorize?state=abc",
+							state: "abc",
+						})
+					},
+				},
+			},
+		)
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/connect",
+			key.secret,
+			{ body: { return_to: "/integrations" } },
+		)
+		expect(status).toBe(200)
+		expect(body).toEqual({
+			object: "planetscale_integration.connect",
+			redirect_url: "https://app.planetscale.com/oauth/authorize?state=abc",
+			state: "abc",
+		})
+		expect(callbackUrl).toBe(`https://${API_HOST}${PLANETSCALE_CALLBACK_PATH}`)
+		await harness.dispose()
+	})
+
+	it("treats query_insights and events as reads: an integrations:read key is enough", async () => {
+		const harness = makeHarness(
+			{},
+			{
+				inventory: {
+					queryInsights: () =>
+						Effect.succeed({
+							branch: "main",
+							rows: [],
+							unavailableReason: null,
+						}),
+					listEvents: () => Effect.succeed({ events: [], nextCursor: null }),
+				},
+			},
+		)
+		const readOnly = await harness.bootstrapAdminKey(["integrations:read"])
+		const window = {
+			start_time: "2026-08-05T11:00:00.000Z",
+			end_time: "2026-08-05T12:00:00.000Z",
+		}
+
+		const insights = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/query_insights",
+			readOnly.secret,
+			{ body: { database: "acme-prod", ...window } },
+		)
+		expect(insights.status).toBe(200)
+		expect(insights.body).toEqual({
+			object: "planetscale_integration.query_insight_list",
+			branch: "main",
+			data: [],
+			unavailable_reason: null,
+		})
+
+		const events = await harness.request("POST", "/v2/integrations/planetscale/events", readOnly.secret, {
+			body: window,
+		})
+		expect(events.status).toBe(200)
+		expect(events.body).toEqual({
+			object: "planetscale_integration.event_list",
+			data: [],
+			next_cursor: null,
+		})
+
+		// The same key must not be able to write.
+		const write = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/metrics_token",
+			readOnly.secret,
+			{ body: { token_id: "tok_1", token_secret: "pscale_tkn_secret" } },
+		)
+		expect(write.status).toBe(403)
+		expect(write.body.error.code).toBe("insufficient_scope")
+		await harness.dispose()
+	})
+
+	it("never puts a persistence failure's message in the public body", async () => {
+		// postgres.js puts the whole failing SQL in the error message, so echoing
+		// it — which is what the v1 body does — publishes the schema. Found by
+		// calling the endpoint against a database missing the events table.
+		const harness = makeHarness(
+			{},
+			{
+				inventory: {
+					listEvents: () =>
+						Effect.fail(
+							new IntegrationsPersistenceError({
+								message:
+									'Failed query: select "id", "org_id" from "planetscale_events" [caused by: relation "planetscale_events" does not exist]',
+							}),
+						),
+				},
+			},
+		)
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/events",
+			key.secret,
+			{ body: { start_time: "2026-08-05T11:00:00.000Z", end_time: "2026-08-05T12:00:00.000Z" } },
+		)
+		expect(status).toBe(503)
+		expect(body.error.code).toBe("integration_persistence_unavailable")
+		const serialized = JSON.stringify(body)
+		expect(serialized).not.toContain("select")
+		expect(serialized).not.toContain("planetscale_events")
+		await harness.dispose()
+	})
+
+	it("rejects an inverted window with 400 and names the offending field", async () => {
+		const harness = makeHarness({}, {})
+		const key = await harness.bootstrapAdminKey()
+
+		const { status, body } = await harness.request(
+			"POST",
+			"/v2/integrations/planetscale/events",
+			key.secret,
+			{ body: { start_time: "2026-08-05T12:00:00.000Z", end_time: "2026-08-05T11:00:00.000Z" } },
+		)
+		expect(status).toBe(400)
+		expect(body.error).toMatchObject({ code: "invalid_time_range", param: "end_time" })
 		await harness.dispose()
 	})
 })

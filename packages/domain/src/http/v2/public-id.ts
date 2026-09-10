@@ -1,4 +1,4 @@
-import { Effect, Option, Schema, SchemaGetter, SchemaIssue } from "effect"
+import { Effect, Option, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
 
 /**
  * Stripe-style prefixed public object IDs for the v2 API.
@@ -22,11 +22,13 @@ export const PublicIdPrefixes = {
 	apiKey: "key",
 	dashboard: "dash",
 	dashboardVersion: "dbv",
+	dashboardShare: "dshr",
 	dashboardTemplate: "dtpl",
 	alertRule: "alrt",
 	alertDestination: "dest",
 	alertIncident: "inc",
 	actor: "actor",
+	auditLogEntry: "alog",
 	errorIssue: "iss",
 	errorIncident: "einc",
 	investigation: "inv",
@@ -36,6 +38,7 @@ export const PublicIdPrefixes = {
 	ingestKey: "ingk",
 	attributeMapping: "amap",
 	sessionReplay: "srep",
+	mobileDevice: "mdev",
 	/** Synthetic identity for logs, which have no native OTel record id. */
 	log: "log",
 	/** Reserved for the future events/webhooks system. */
@@ -55,9 +58,9 @@ const base58Encode = (bytes: Uint8Array): string => {
 
 	const digits: number[] = []
 	for (let i = zeros; i < bytes.length; i++) {
-		let carry = bytes[i]!
+		let carry = bytes[i] ?? 0
 		for (let j = 0; j < digits.length; j++) {
-			carry += digits[j]! << 8
+			carry += (digits[j] ?? 0) << 8
 			digits[j] = carry % 58
 			carry = (carry / 58) | 0
 		}
@@ -68,7 +71,9 @@ const base58Encode = (bytes: Uint8Array): string => {
 	}
 
 	let out = "1".repeat(zeros)
-	for (let i = digits.length - 1; i >= 0; i--) out += ALPHABET[digits[i]!]
+	// `charAt` rather than `[]`: every digit is already `% 58`, and it keeps the
+	// expression a `string` instead of a `string | undefined` to unwrap.
+	for (let i = digits.length - 1; i >= 0; i--) out += ALPHABET.charAt(digits[i] ?? 0)
 	return out
 }
 
@@ -80,11 +85,11 @@ const base58Decode = (input: string): Uint8Array | null => {
 
 	const bytes: number[] = []
 	for (let i = zeros; i < input.length; i++) {
-		const value = ALPHABET_MAP.get(input[i]!)
+		const value = ALPHABET_MAP.get(input.charAt(i))
 		if (value === undefined) return null
 		let carry = value
 		for (let j = 0; j < bytes.length; j++) {
-			carry += bytes[j]! * 58
+			carry += (bytes[j] ?? 0) * 58
 			bytes[j] = carry & 0xff
 			carry >>= 8
 		}
@@ -95,7 +100,7 @@ const base58Decode = (input: string): Uint8Array | null => {
 	}
 
 	const out = new Uint8Array(zeros + bytes.length)
-	for (let i = 0; i < bytes.length; i++) out[zeros + i] = bytes[bytes.length - 1 - i]!
+	for (let i = 0; i < bytes.length; i++) out[zeros + i] = bytes[bytes.length - 1 - i] ?? 0
 	return out
 }
 
@@ -136,18 +141,21 @@ export const decodePublicId = (prefix: PublicIdPrefix, publicId: string): string
 	const bytes = base58Decode(body)
 	if (bytes === null || bytes.length < 2) return null
 
-	const mode = bytes[0]!
+	const mode = bytes[0]
 	const idBytes = bytes.subarray(1)
 	if (mode === MODE_UUID) {
 		if (idBytes.length !== 16) return null
 		return bytesToUuid(idBytes)
 	}
 	if (mode === MODE_UTF8) {
-		try {
-			return new TextDecoder("utf-8", { fatal: true }).decode(idBytes)
-		} catch {
-			return null
-		}
+		// `fatal` makes the decoder throw on an invalid sequence rather than
+		// silently emitting U+FFFD, which would turn a corrupt ID into a
+		// plausible-looking one.
+		return Option.getOrNull(
+			Effect.runSync(
+				Effect.option(Effect.try(() => new TextDecoder("utf-8", { fatal: true }).decode(idBytes))),
+			),
+		)
 	}
 	return null
 }
@@ -177,9 +185,12 @@ export const PublicId = <S extends Schema.Codec<any, string>>(prefix: PublicIdPr
 						const internalId = decodePublicId(prefix, publicId)
 						return internalId === null
 							? Effect.fail(
-									new SchemaIssue.InvalidValue(Option.some(publicId), {
-										message: `Invalid ID: expected an ID with prefix "${prefix}_"`,
-									}),
+									new SchemaIssue.InvalidValue(
+										{
+											message: `Invalid ID: expected an ID with prefix "${prefix}_"`,
+										},
+										publicId,
+									),
 								)
 							: Effect.succeed(internalId)
 					}),
@@ -190,5 +201,10 @@ export const PublicId = <S extends Schema.Codec<any, string>>(prefix: PublicIdPr
 				Schema.decodeTo(internal),
 			)
 			.annotate({ title: `Public ID (${prefix}_…)` })
+			.pipe(
+				Schema.annotateEncoded({
+					identifier: SchemaAST.resolveIdentifier(internal.ast),
+				}),
+			)
 	)
 }

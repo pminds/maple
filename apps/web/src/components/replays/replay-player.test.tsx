@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+// TEST-SEAM: This focused test replaces process-global modules that have no instance-level injection seam.
 
 import { Registry, RegistryContext } from "@/lib/effect-atom"
 import { cleanup, render } from "@testing-library/react"
@@ -19,8 +20,7 @@ vi.mock("@/hooks/use-replay-keyboard-shortcuts", () => ({
 	useReplayKeyboardShortcuts: () => {},
 }))
 
-/** Render the surface + detached transport through the provider's preview path,
- *  which bypasses the warehouse fetch entirely. */
+/** Render with injected events so the test never reaches the warehouse. */
 function renderSurface(props: { recorded?: boolean; sessionActive?: boolean }) {
 	const registry = Registry.make()
 	const Wrapper = ({ children }: { children: ReactNode }) => (
@@ -30,7 +30,7 @@ function renderSurface(props: { recorded?: boolean; sessionActive?: boolean }) {
 		<Wrapper>
 			<ReplayPlayerProvider
 				sessionId="sess-1"
-				previewEvents={[]}
+				eventsOverride={[]}
 				recorded={props.recorded}
 				sessionActive={props.sessionActive ?? false}
 			>

@@ -1,8 +1,6 @@
-import { useState } from "react"
+import { useMemo } from "react"
 
-import { Badge } from "@maple/ui/components/ui/badge"
 import { Button } from "@maple/ui/components/ui/button"
-import { Checkbox } from "@maple/ui/components/ui/checkbox"
 import { Input } from "@maple/ui/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@maple/ui/components/ui/select"
 import {
@@ -12,7 +10,13 @@ import {
 	ComboboxItem,
 	ComboboxList,
 } from "@maple/ui/components/ui/combobox"
-import { cn } from "@maple/ui/lib/utils"
+import {
+	AddOnToggleBar,
+	QUERY_BUILDER_PANEL_SOURCES,
+	QueryPanelShell,
+	isQueryBuilderDataSource,
+	type QueryPanelSource,
+} from "@/components/dashboard-builder/config/query-panel-shell"
 import { GroupByMultiSelect } from "@/components/query-builder/group-by-multi-select"
 import { WhereClauseEditor } from "@/components/query-builder/where-clause-editor"
 import { useMetricScopedAutocomplete } from "@/hooks/use-metric-scoped-autocomplete"
@@ -21,16 +25,13 @@ import {
 	AGGREGATIONS_BY_SOURCE,
 	QUERY_BUILDER_METRIC_TYPES,
 	getMetricsAggregations,
-	queryBadgeColor,
 	type QueryBuilderAddOnKey,
 	type QueryBuilderDataSource,
 	type QueryBuilderMetricType,
 	type QueryBuilderQueryDraft,
-} from "@/lib/query-builder/model"
+} from "@maple/query-engine/query-builder"
 
-// ---------------------------------------------------------------------------
 // Types
-// ---------------------------------------------------------------------------
 
 interface MetricSelectionOption {
 	value: string
@@ -61,13 +62,23 @@ interface QueryPanelProps {
 	onClone: () => void
 	onRemove: () => void
 	onDataSourceChange: (ds: QueryBuilderDataSource) => void
+	/**
+	 * Sources beyond traces/logs/metrics the select offers, and what choosing
+	 * one does. Only the funnel widget passes these — picking "Product events"
+	 * swaps this panel for the funnel's.
+	 */
+	extraSourceOptions?: ReadonlyArray<Exclude<QueryPanelSource, QueryBuilderDataSource>>
+	onExtraSourceChange?: (source: Exclude<QueryPanelSource, QueryBuilderDataSource>) => void
 	showHeaderActions?: boolean
 	showVisibilityToggle?: boolean
+	/**
+	 * The bucket "Auto" currently resolves to for the preview ("2m"), shown in
+	 * the interval placeholder so the auto width is visible before you override it.
+	 */
+	autoIntervalLabel?: string
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 function parseMetricSelection(raw: string): {
 	metricName: string
@@ -87,9 +98,7 @@ const ADD_ON_KEYS: { key: QueryBuilderAddOnKey; label: string }[] = [
 	{ key: "legend", label: "Legend" },
 ]
 
-// ---------------------------------------------------------------------------
 // QueryPanel
-// ---------------------------------------------------------------------------
 
 export function QueryPanel({
 	query,
@@ -104,11 +113,13 @@ export function QueryPanel({
 	onClone,
 	onRemove,
 	onDataSourceChange,
+	extraSourceOptions = [],
+	onExtraSourceChange,
 	showHeaderActions = true,
 	showVisibilityToggle = true,
+	autoIntervalLabel,
 }: QueryPanelProps) {
-	const [collapsed, setCollapsed] = useState(false)
-	const badgeColor = queryBadgeColor(index)
+	const intervalPlaceholder = autoIntervalLabel ? `Auto (${autoIntervalLabel})` : "Auto"
 	const aggregateOptions =
 		query.dataSource === "metrics"
 			? getMetricsAggregations(query.metricType || "gauge", query.isMonotonic)
@@ -122,57 +133,30 @@ export function QueryPanel({
 			: undefined
 
 	return (
-		<div className="border rounded-md">
-			{/* Header */}
-			<div className="flex items-center gap-2 px-3 py-2 bg-muted/30">
-				<button
-					type="button"
-					onClick={() => setCollapsed((c) => !c)}
-					className="text-muted-foreground hover:text-foreground transition-colors text-xs shrink-0"
-					aria-label={collapsed ? "Expand query" : "Collapse query"}
-				>
-					{collapsed ? "\u25B6" : "\u25BC"}
-				</button>
-
-				{showVisibilityToggle && (
-					<Checkbox
-						id={`query-visible-${query.id}`}
-						checked={!query.hidden}
-						onCheckedChange={(checked) =>
-							onUpdate((current) => ({
-								...current,
-								hidden: checked !== true,
-							}))
+		<QueryPanelShell
+			name={query.name}
+			index={index}
+			source={query.dataSource}
+			sourceOptions={[...QUERY_BUILDER_PANEL_SOURCES, ...extraSourceOptions]}
+			onSourceChange={(source) => {
+				if (isQueryBuilderDataSource(source)) onDataSourceChange(source)
+				else onExtraSourceChange?.(source)
+			}}
+			visibility={
+				showVisibilityToggle
+					? {
+							id: `query-visible-${query.id}`,
+							checked: !query.hidden,
+							onChange: (checked) =>
+								onUpdate((current) => ({
+									...current,
+									hidden: !checked,
+								})),
 						}
-						className="shrink-0"
-					/>
-				)}
-
-				<Badge
-					variant="outline"
-					className={cn("font-mono text-[11px] text-white border-0 shrink-0", badgeColor)}
-				>
-					{query.name}
-				</Badge>
-
-				<Select
-					items={{ traces: "Traces", logs: "Logs", metrics: "Metrics" }}
-					value={query.dataSource}
-					onValueChange={(value) => onDataSourceChange(value as QueryBuilderDataSource)}
-				>
-					<SelectTrigger className="h-7 w-24 text-xs border-none bg-transparent shadow-none px-1">
-						<SelectValue />
-					</SelectTrigger>
-					<SelectContent>
-						<SelectItem value="traces">Traces</SelectItem>
-						<SelectItem value="logs">Logs</SelectItem>
-						<SelectItem value="metrics">Metrics</SelectItem>
-					</SelectContent>
-				</Select>
-
-				<div className="flex-1" />
-
-				{showHeaderActions && (
+					: undefined
+			}
+			headerActions={
+				showHeaderActions ? (
 					<>
 						<Button variant="ghost" size="xs" onClick={onClone}>
 							Clone
@@ -181,76 +165,55 @@ export function QueryPanel({
 							Remove
 						</Button>
 					</>
-				)}
-			</div>
-
-			{/* Body */}
-			{!collapsed && (
-				<div className="p-3 space-y-3">
-					{isMetrics ? (
-						<MetricsBody
-							query={query}
-							aggregateOptions={aggregateOptions}
-							metricValue={metricValue}
-							metricSelectionOptions={metricSelectionOptions}
-							onMetricSearch={onMetricSearch}
-							autocompleteValues={autocompleteValues}
-							onUpdate={onUpdate}
-							onMetricSelectionChange={onMetricSelectionChange}
-							onAggregationChange={onAggregationChange}
-						/>
-					) : (
-						<TracesLogsBody
-							query={query}
-							aggregateOptions={aggregateOptions}
-							autocompleteValues={autocompleteValues}
-							onUpdate={onUpdate}
-							onAggregationChange={onAggregationChange}
-						/>
-					)}
-
-					{/* Add-on toggle bar */}
-					<div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-dashed">
-						{ADD_ON_KEYS.map(({ key, label }) => (
-							<button
-								key={key}
-								type="button"
-								onClick={() =>
-									onUpdate((current) => ({
-										...current,
-										addOns: {
-											...current.addOns,
-											[key]: !current.addOns[key],
-										},
-									}))
-								}
-								className={cn(
-									"px-2 py-0.5 text-[11px] rounded-sm border transition-colors",
-									query.addOns[key]
-										? "bg-primary/10 border-primary/30 text-primary"
-										: "bg-muted/40 border-transparent text-muted-foreground hover:text-foreground",
-								)}
-							>
-								{label}
-							</button>
-						))}
-					</div>
-
-					{/* Expanded add-on sections */}
-					<AddOnSections
-						query={query}
-						autocompleteValues={autocompleteValues}
-						onUpdate={onUpdate}
-					/>
-				</div>
+				) : undefined
+			}
+		>
+			{isMetrics ? (
+				<MetricsBody
+					query={query}
+					aggregateOptions={aggregateOptions}
+					metricValue={metricValue}
+					metricSelectionOptions={metricSelectionOptions}
+					onMetricSearch={onMetricSearch}
+					autocompleteValues={autocompleteValues}
+					onUpdate={onUpdate}
+					onMetricSelectionChange={onMetricSelectionChange}
+					onAggregationChange={onAggregationChange}
+					intervalPlaceholder={intervalPlaceholder}
+				/>
+			) : (
+				<TracesLogsBody
+					query={query}
+					aggregateOptions={aggregateOptions}
+					autocompleteValues={autocompleteValues}
+					onUpdate={onUpdate}
+					onAggregationChange={onAggregationChange}
+					intervalPlaceholder={intervalPlaceholder}
+				/>
 			)}
-		</div>
+
+			{/* Add-on toggle bar */}
+			<AddOnToggleBar
+				items={ADD_ON_KEYS}
+				active={query.addOns}
+				onToggle={(key) =>
+					onUpdate((current) => ({
+						...current,
+						addOns: {
+							...current.addOns,
+							[key]: !current.addOns[key],
+						},
+					}))
+				}
+			/>
+
+			{/* Expanded add-on sections */}
+			<AddOnSections query={query} autocompleteValues={autocompleteValues} onUpdate={onUpdate} />
+		</QueryPanelShell>
 	)
 }
 
-// ---------------------------------------------------------------------------
 // TracesLogsBody
-// ---------------------------------------------------------------------------
 
 function TracesLogsBody({
 	query,
@@ -258,12 +221,14 @@ function TracesLogsBody({
 	autocompleteValues,
 	onUpdate,
 	onAggregationChange,
+	intervalPlaceholder,
 }: {
 	query: QueryBuilderQueryDraft
 	aggregateOptions: Array<{ label: string; value: string }>
 	autocompleteValues: AutocompleteValues
 	onUpdate: (updater: (q: QueryBuilderQueryDraft) => QueryBuilderQueryDraft) => void
 	onAggregationChange: (aggregation: string) => void
+	intervalPlaceholder: string
 }) {
 	return (
 		<>
@@ -346,8 +311,9 @@ function TracesLogsBody({
 							stepInterval: event.target.value,
 						}))
 					}
-					placeholder="Auto"
-					className="h-8 w-20 text-xs"
+					placeholder={intervalPlaceholder}
+					// Wide enough for "Auto (15m)" — the resolved width must be readable, not clipped.
+					className="h-8 w-24 text-xs"
 				/>
 
 				<span className="text-xs text-muted-foreground">seconds</span>
@@ -356,9 +322,7 @@ function TracesLogsBody({
 	)
 }
 
-// ---------------------------------------------------------------------------
 // MetricsBody
-// ---------------------------------------------------------------------------
 
 function MetricsBody({
 	query,
@@ -370,6 +334,7 @@ function MetricsBody({
 	onUpdate,
 	onMetricSelectionChange,
 	onAggregationChange,
+	intervalPlaceholder,
 }: {
 	query: QueryBuilderQueryDraft
 	aggregateOptions: Array<{ label: string; value: string }>
@@ -384,6 +349,7 @@ function MetricsBody({
 		isMonotonic: boolean
 	}) => void
 	onAggregationChange: (aggregation: string) => void
+	intervalPlaceholder: string
 }) {
 	// Scope attribute suggestions (WHERE clause + group-by) to the selected
 	// metric — the shared context values span every metric in the org.
@@ -393,6 +359,25 @@ function MetricsBody({
 		metricName: metricsQuery?.metricName || undefined,
 		metricType: metricsQuery?.metricType || undefined,
 	})
+
+	// The options list is one fetched page (and narrows further as you search),
+	// so a metric that arrived by prefill — a dashboard widget, or an "Alert on
+	// this" suggestion — often isn't in it, leaving the combobox with no item to
+	// render the selection from. Synthesize one so the current metric always
+	// shows and stays reselectable.
+	const metricOptions = useMemo(() => {
+		if (!metricValue || metricSelectionOptions.some((o) => o.value === metricValue)) {
+			return metricSelectionOptions
+		}
+		return [
+			{
+				value: metricValue,
+				label: `${metricsQuery?.metricName} (${metricsQuery?.metricType})`,
+				isMonotonic: metricsQuery?.isMonotonic ?? metricsQuery?.metricType === "sum",
+			},
+			...metricSelectionOptions,
+		]
+	}, [metricValue, metricSelectionOptions, metricsQuery])
 
 	return (
 		<>
@@ -404,7 +389,7 @@ function MetricsBody({
 					onValueChange={(value) => {
 						const parsed = value ? parseMetricSelection(value) : null
 						if (!parsed) return
-						const selectedOption = metricSelectionOptions.find((o) => o.value === value)
+						const selectedOption = metricOptions.find((o) => o.value === value)
 						const isMonotonic = selectedOption?.isMonotonic ?? parsed.metricType === "sum"
 						onMetricSelectionChange({
 							metricName: parsed.metricName,
@@ -419,13 +404,13 @@ function MetricsBody({
 						onChange={(e) => onMetricSearch?.(e.target.value)}
 					/>
 					<ComboboxContent>
-						{metricSelectionOptions.length === 0 ? (
+						{metricOptions.length === 0 ? (
 							<div className="py-4 text-center text-xs text-muted-foreground">
 								No metrics found.
 							</div>
 						) : (
 							<ComboboxList>
-								{metricSelectionOptions.map((metric) => (
+								{metricOptions.map((metric) => (
 									<ComboboxItem key={metric.value} value={metric.value}>
 										{metric.label}
 									</ComboboxItem>
@@ -486,8 +471,9 @@ function MetricsBody({
 							stepInterval: event.target.value,
 						}))
 					}
-					placeholder="Auto"
-					className="h-8 w-20 text-xs"
+					placeholder={intervalPlaceholder}
+					// Wide enough for "Auto (15m)" — the resolved width must be readable, not clipped.
+					className="h-8 w-24 text-xs"
 				/>
 
 				<span className="text-xs text-muted-foreground">seconds</span>
@@ -553,9 +539,7 @@ function MetricsBody({
 	)
 }
 
-// ---------------------------------------------------------------------------
 // AddOnSections
-// ---------------------------------------------------------------------------
 
 function AddOnSections({
 	query,

@@ -2,7 +2,7 @@ import { afterEach, assert, describe, it } from "@effect/vitest"
 import { orgOnboardingState } from "@maple/db"
 import { eq, sql } from "drizzle-orm"
 import { Effect, Exit, Tracer } from "effect"
-import { Database } from "./DatabaseLive"
+import { Database, executeWithSpan } from "./DatabaseLive"
 import { PGLITE_DB_NAMESPACE } from "./DatabasePgliteLive"
 import { cleanupTestDbs, createTestDb, type TestDb } from "./test-pglite"
 
@@ -179,5 +179,67 @@ describe("Database execute span instrumentation", () => {
 				assert.strictEqual(span.attributes.get("db.statement_count"), 1)
 			}
 		}).pipe(Effect.provide(createTestDb(trackedDbs).layer)),
+	)
+})
+
+/**
+ * `db.duration_ms` alone cannot distinguish a stalled connection handshake from
+ * a slow query — the ambiguity that made the production p95 investigation
+ * guesswork. These cover the split that resolves it.
+ */
+describe("Database execute failure classification", () => {
+	// There is no connect/query split any more. postgres.js connects on the first
+	// statement, so the split could only ever be synthesized by a `select 1` probe
+	// that cost a round trip on every request. What it was used to infer — is this
+	// a connection problem or a query problem — `error.type` states outright.
+	it.effect("classifies a connection failure by class rather than by duration", () =>
+		Effect.gen(function* () {
+			const { spans, tracer } = makeRecordingTracer()
+
+			const exit = yield* executeWithSpan(() =>
+				Promise.reject(
+					Object.assign(new Error("write CONNECT_TIMEOUT"), { code: "CONNECT_TIMEOUT" }),
+				),
+			).pipe(Effect.withTracer(tracer), Effect.exit)
+
+			assert.isTrue(Exit.isFailure(exit))
+			const [span] = dbSpans(spans)
+			assert.isDefined(span)
+			assert.strictEqual(span.attributes.get("error.type"), "CONNECT_TIMEOUT")
+			assert.strictEqual(span.attributes.get("db.connect.failed"), true)
+			assert.isNumber(span.attributes.get("db.duration_ms"))
+		}),
+	)
+
+	it.effect("classifies a statement failure separately, with its SQLSTATE", () =>
+		Effect.gen(function* () {
+			const { spans, tracer } = makeRecordingTracer()
+
+			const exit = yield* executeWithSpan(() =>
+				Promise.reject(Object.assign(new Error("duplicate key"), { code: "23505" })),
+			).pipe(Effect.withTracer(tracer), Effect.exit)
+
+			assert.isTrue(Exit.isFailure(exit))
+			const [span] = dbSpans(spans)
+			assert.isDefined(span)
+			assert.strictEqual(span.attributes.get("error.type"), "23505")
+			assert.strictEqual(span.attributes.get("db.response.status_code"), "23505")
+			assert.strictEqual(span.attributes.get("db.connect.failed"), false)
+		}),
+	)
+
+	it.effect("merges attributes recorded by the body", () =>
+		Effect.gen(function* () {
+			const { spans, tracer } = makeRecordingTracer()
+
+			yield* executeWithSpan((hooks) => {
+				hooks.record({ "db.connect.reused": true })
+				return Promise.resolve("ok")
+			}).pipe(Effect.withTracer(tracer))
+
+			const [span] = dbSpans(spans)
+			assert.isDefined(span)
+			assert.strictEqual(span.attributes.get("db.connect.reused"), true)
+		}),
 	)
 })

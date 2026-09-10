@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import {
 	IsoDateTimeString,
+	OrgId,
 	RecommendationIssue,
 	RecommendationIssueId,
 	RecommendationIssueKind,
@@ -13,14 +14,15 @@ import { detectAttributeRecommendations, planReconcileIssues } from "@maple/doma
 import { orgIngestAttributeMappings, orgRecommendationIssues } from "@maple/db"
 import { CH, formatWarehouseDateTime } from "@maple/query-engine"
 import { and, eq } from "drizzle-orm"
-import { Array as Arr, Clock, Context, Effect, Layer, Option, Schema } from "effect"
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect"
 import type { TenantContext } from "@/services/auth/AuthService"
 import { Database, type DatabaseError } from "@/platform/DatabaseLive"
+import { msToDate } from "@/platform/time"
 import { WarehouseQueryService } from "@/services/warehouse/WarehouseQueryService"
 
 type IssueRow = typeof orgRecommendationIssues.$inferSelect
 
-export interface RecommendationIssueServiceShape {
+export interface RecommendationIssueServiceApi {
 	/** Reconciles live telemetry → persisted issues, then returns the full numbered list. */
 	readonly listReconciled: (
 		tenant: TenantContext,
@@ -56,17 +58,17 @@ const rowToIssue = (row: IssueRow): RecommendationIssue =>
 		recommendationKey: row.recommendationKey,
 		kind: decodeKindSync(row.kind),
 		sourceKey: row.sourceKey,
-		...(row.canonicalKey != null ? { canonicalKey: row.canonicalKey } : {}),
+		...(row.canonicalKey != null ? { canonicalKey: row.canonicalKey } : undefined),
 		status: decodeStatusSync(row.status),
 		usageCount: row.usageCount,
 		openedAt: decodeIsoSync(row.openedAt.toISOString()),
 		updatedAt: decodeIsoSync(row.updatedAt.toISOString()),
-		...(row.resolvedAt != null ? { resolvedAt: decodeIsoSync(row.resolvedAt.toISOString()) } : {}),
+		...(row.resolvedAt != null ? { resolvedAt: decodeIsoSync(row.resolvedAt.toISOString()) } : undefined),
 	})
 
 export class RecommendationIssueService extends Context.Service<
 	RecommendationIssueService,
-	RecommendationIssueServiceShape
+	RecommendationIssueServiceApi
 >()("@maple/api/services/RecommendationIssueService", {
 	make: Effect.gen(function* () {
 		const database = yield* Database
@@ -85,7 +87,7 @@ export class RecommendationIssueService extends Context.Service<
 				Effect.mapError(toPersistenceError),
 			)
 
-		const selectAll = (orgId: string) =>
+		const selectAll = (orgId: OrgId) =>
 			runDb(
 				"list",
 				database.execute((db) =>
@@ -97,7 +99,7 @@ export class RecommendationIssueService extends Context.Service<
 				),
 			)
 
-		const listResponse = (orgId: string) =>
+		const listResponse = (orgId: OrgId) =>
 			selectAll(orgId).pipe(
 				Effect.map((rows) => new RecommendationIssuesListResponse({ issues: rows.map(rowToIssue) })),
 			)
@@ -137,6 +139,7 @@ export class RecommendationIssueService extends Context.Service<
 			tenant: TenantContext,
 		) {
 			const orgId = tenant.orgId
+			yield* Effect.annotateCurrentSpan("orgId", orgId)
 
 			// Reconcile needs live span keys. If the warehouse is unavailable, degrade gracefully:
 			// return the stored issues unchanged rather than failing the whole settings page.
@@ -193,23 +196,18 @@ export class RecommendationIssueService extends Context.Service<
 					updatedAt: new Date(now),
 					resolvedAt: null,
 				}))
-				// Cloudflare D1 caps bound parameters at 100 per statement. Each row binds 12
-				// columns, so insert in chunks of 8 (8 × 12 = 96 < 100).
-				yield* Effect.forEach(
-					Arr.chunksOf(rows, 8),
-					(chunk) =>
-						runDb(
-							"insert",
-							database.execute((db) => db.insert(orgRecommendationIssues).values(chunk)),
-						),
-					{ discard: true },
+				yield* runDb(
+					"insert",
+					database.execute((db) => db.insert(orgRecommendationIssues).values(rows)),
 				)
 			}
 
 			yield* Effect.forEach(
 				plan.updates,
 				(update) => {
-					const fields: Record<string, unknown> = { updatedAt: new Date(now) }
+					const fields: Partial<typeof orgRecommendationIssues.$inferInsert> = {
+						updatedAt: msToDate(now),
+					}
 					if (update.usageCount !== undefined) fields.usageCount = update.usageCount
 					if (update.nextStatus !== undefined) {
 						fields.status = update.nextStatus
@@ -239,9 +237,10 @@ export class RecommendationIssueService extends Context.Service<
 		const setStatus = Effect.fn("RecommendationIssueService.setStatus")(function* (
 			tenant: TenantContext,
 			id: RecommendationIssueId,
-			fields: Record<string, unknown>,
+			fields: Partial<typeof orgRecommendationIssues.$inferInsert>,
 		) {
 			const orgId = tenant.orgId
+			yield* Effect.annotateCurrentSpan({ orgId, "maple.recommendation_issue.id": id })
 			const existing = yield* runDb(
 				"selectById",
 				database.execute((db) =>
@@ -285,7 +284,7 @@ export class RecommendationIssueService extends Context.Service<
 		const reopen = (tenant: TenantContext, id: RecommendationIssueId) =>
 			setStatus(tenant, id, { status: "open", resolvedAt: null })
 
-		return { listReconciled, dismiss, reopen } satisfies RecommendationIssueServiceShape
+		return { listReconciled, dismiss, reopen } satisfies RecommendationIssueServiceApi
 	}),
 }) {
 	static readonly layer = Layer.effect(this, this.make)

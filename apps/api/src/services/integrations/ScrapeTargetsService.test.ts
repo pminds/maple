@@ -61,24 +61,8 @@ const asOrgId = Schema.decodeUnknownSync(OrgId)
 const asScrapeIntervalSeconds = Schema.decodeUnknownSync(ScrapeIntervalSeconds)
 
 describe("ScrapeTargetsService", () => {
-	it.effect("scrapeForCollector applies stored bearer credentials", () => {
+	it.effect("authHeaders decrypts a stored bearer credential into an Authorization header", () => {
 		const testDb = createTestDb(trackedDbs)
-		const calls: Array<{ url: string; authorization: string | null }> = []
-
-		globalThis.fetch = (async (input, init) => {
-			const requestUrl =
-				typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
-			const headers = new Headers(init?.headers)
-			calls.push({
-				url: requestUrl,
-				authorization: headers.get("authorization"),
-			})
-			return new Response("up 1\n", {
-				status: 200,
-				headers: { "content-type": "text/plain; version=0.0.4" },
-			})
-		}) as typeof fetch
-
 		return Effect.gen(function* () {
 			const service = yield* ScrapeTargetsService
 			const target = yield* service.create(
@@ -91,14 +75,12 @@ describe("ScrapeTargetsService", () => {
 					authCredentials: JSON.stringify({ token: "stored-token" }),
 				}),
 			)
+			const row = (yield* service.listAllEnabled()).find((candidate) => candidate.id === target.id)
+			assert.isDefined(row)
+			if (!row) return
 
-			const response = yield* service.scrapeForCollector(target.id)
-
-			assert.strictEqual(response.status, 200)
-			assert.strictEqual(response.body, "up 1\n")
-			assert.strictEqual(response.contentType, "text/plain; version=0.0.4")
-			assert.isTrue(calls.some((call) => call.url === "https://metrics.example.com/metrics"))
-			assert.isTrue(calls.every((call) => call.authorization === "Bearer stored-token"))
+			const headers = yield* service.authHeaders(row)
+			assert.deepStrictEqual(headers, { Authorization: "Bearer stored-token" })
 		}).pipe(Effect.provide(makeLayer(testDb)))
 	})
 
@@ -389,6 +371,34 @@ describe("ScrapeTargetsService", () => {
 		}).pipe(Effect.provide(makeLayer(testDb)))
 	})
 
+	it.effect("manual probes persist safe upstream messages without stack traces", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			const service = yield* ScrapeTargetsService
+			const orgId = asOrgId("org_1")
+			const target = yield* service.create(
+				orgId,
+				new CreateScrapeTargetRequest({
+					name: "Node Exporter",
+					url: "https://metrics.example.com/metrics",
+					scrapeIntervalSeconds: asScrapeIntervalSeconds(15),
+				}),
+			)
+
+			globalThis.fetch = (async () => {
+				throw new Error("socket exploded")
+			}) as typeof fetch
+
+			const probed = yield* service.probe(orgId, target.id)
+			assert.isFalse(probed.success)
+			assert.strictEqual(probed.lastScrapeError, "socket exploded")
+			assert.notInclude(probed.lastScrapeError ?? "", "ScrapeTargetsService.ts")
+
+			const checks = yield* service.listChecks(orgId, target.id, {})
+			assert.lengthOf(checks, 0)
+		}).pipe(Effect.provide(makeLayer(testDb)))
+	})
+
 	it.effect("recording results no longer prunes — retention is the cron's job", () => {
 		const testDb = createTestDb(trackedDbs)
 		return Effect.gen(function* () {
@@ -457,70 +467,6 @@ describe("ScrapeTargetsService", () => {
 			// Every result still gets its own check row.
 			const checks = yield* service.listChecks(orgId, target.id, {})
 			assert.lengthOf(checks, 3)
-		}).pipe(Effect.provide(makeLayer(testDb)))
-	})
-
-	it.effect("serves repeat proxied scrapes from the memo instead of re-reading Postgres", () => {
-		const testDb = createTestDb(trackedDbs)
-		const scrapedUrls: string[] = []
-		globalThis.fetch = (async (input) => {
-			scrapedUrls.push(
-				typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
-			)
-			return new Response("up 1\n", { status: 200 })
-		}) as typeof fetch
-		return Effect.gen(function* () {
-			const service = yield* ScrapeTargetsService
-			const orgId = asOrgId("org_1")
-			const target = yield* service.create(
-				orgId,
-				new CreateScrapeTargetRequest({
-					name: "Node Exporter",
-					url: "https://metrics.example.com/metrics",
-					scrapeIntervalSeconds: asScrapeIntervalSeconds(15),
-				}),
-			)
-
-			yield* service.scrapeForCollector(target.id)
-			scrapedUrls.length = 0
-
-			// Mutate the row BEHIND the service so nothing invalidates the memo. If the
-			// second scrape still uses the original URL, it was served from the memo —
-			// i.e. it did not go back to Postgres.
-			yield* Effect.promise(() =>
-				executeSql(testDb, "update scrape_targets set url = $1 where id = $2", [
-					"https://changed.example.com/metrics",
-					target.id,
-				]),
-			)
-
-			yield* service.scrapeForCollector(target.id)
-			assert.deepStrictEqual(scrapedUrls, ["https://metrics.example.com/metrics"])
-		}).pipe(Effect.provide(makeLayer(testDb)))
-	})
-
-	it.effect("re-reads a target from Postgres after an update invalidates the memo", () => {
-		const testDb = createTestDb(trackedDbs)
-		globalThis.fetch = (async () => new Response("up 1\n", { status: 200 })) as typeof fetch
-		return Effect.gen(function* () {
-			const service = yield* ScrapeTargetsService
-			const orgId = asOrgId("org_1")
-			const target = yield* service.create(
-				orgId,
-				new CreateScrapeTargetRequest({
-					name: "Node Exporter",
-					url: "https://metrics.example.com/metrics",
-					scrapeIntervalSeconds: asScrapeIntervalSeconds(15),
-				}),
-			)
-
-			// Warm the memo.
-			yield* service.scrapeForCollector(target.id)
-
-			// Disabling must take effect immediately, not after the memo TTL.
-			yield* service.update(orgId, target.id, new UpdateScrapeTargetRequest({ enabled: false }))
-			const exit = yield* Effect.exit(service.scrapeForCollector(target.id))
-			assert.isTrue(exit._tag === "Failure")
 		}).pipe(Effect.provide(makeLayer(testDb)))
 	})
 
@@ -621,6 +567,112 @@ describe("ScrapeTargetsService", () => {
 			})
 			assert.strictEqual(switched.authType, "planetscale_oauth")
 			assert.isFalse(switched.hasCredentials)
+		}).pipe(Effect.provide(makeLayer(testDb)))
+	})
+
+	it.effect("refuses to carry stored credentials to a new origin", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			const service = yield* ScrapeTargetsService
+			const orgId = asOrgId("org_1")
+			const target = yield* service.create(
+				orgId,
+				new CreateScrapeTargetRequest({
+					name: "Node Exporter",
+					url: "https://metrics.example.com/metrics",
+					authType: "bearer",
+					authCredentials: JSON.stringify({ token: "stored-token" }),
+				}),
+			)
+			assert.isTrue(target.hasCredentials)
+
+			// Repointing at an attacker-controlled host without re-supplying the
+			// credential is exactly the exfiltration path: it must not persist.
+			const error = yield* service
+				.update(
+					orgId,
+					target.id,
+					new UpdateScrapeTargetRequest({ url: "https://attacker.example.com/metrics" }),
+				)
+				.pipe(Effect.flip)
+			assert.strictEqual(error._tag, "@maple/http/errors/ScrapeTargetValidationError")
+			assert.include(error.message, "re-supplying authCredentials")
+
+			const unchanged = yield* service.get(orgId, target.id)
+			assert.strictEqual(unchanged.url, "https://metrics.example.com/metrics")
+			assert.isTrue(unchanged.hasCredentials)
+
+			// A port change is an origin change too.
+			const portError = yield* service
+				.update(
+					orgId,
+					target.id,
+					new UpdateScrapeTargetRequest({ url: "https://metrics.example.com:8443/metrics" }),
+				)
+				.pipe(Effect.flip)
+			assert.strictEqual(portError._tag, "@maple/http/errors/ScrapeTargetValidationError")
+
+			// Same origin, different path: nothing moves, so the credential stays.
+			const samePath = yield* service.update(
+				orgId,
+				target.id,
+				new UpdateScrapeTargetRequest({ url: "https://metrics.example.com/other" }),
+			)
+			assert.strictEqual(samePath.url, "https://metrics.example.com/other")
+			assert.isTrue(samePath.hasCredentials)
+
+			// Re-supplying the credential in the same request is the way across.
+			const moved = yield* service.update(
+				orgId,
+				target.id,
+				new UpdateScrapeTargetRequest({
+					url: "https://other.example.com/metrics",
+					authCredentials: JSON.stringify({ token: "fresh-token" }),
+				}),
+			)
+			assert.strictEqual(moved.url, "https://other.example.com/metrics")
+			assert.isTrue(moved.hasCredentials)
+		}).pipe(Effect.provide(makeLayer(testDb)))
+	})
+
+	it.effect("refuses generic update/delete against an integration-managed target", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			const service = yield* ScrapeTargetsService
+			const orgId = asOrgId("org_1")
+			const target = yield* service.create(
+				orgId,
+				new CreateScrapeTargetRequest({
+					name: "Managed target",
+					url: "https://metrics.example.com/metrics",
+				}),
+			)
+			yield* Effect.promise(() =>
+				executeSql(testDb, "UPDATE scrape_targets SET managed_by = $1 WHERE id = $2", [
+					"planetscale:conn_1",
+					target.id,
+				]),
+			)
+
+			const updateError = yield* service
+				.update(orgId, target.id, new UpdateScrapeTargetRequest({ enabled: false }))
+				.pipe(Effect.flip)
+			assert.strictEqual(updateError._tag, "@maple/http/errors/ScrapeTargetValidationError")
+			assert.include(updateError.message, "managed by an integration")
+
+			const deleteError = yield* service.delete(orgId, target.id).pipe(Effect.flip)
+			assert.strictEqual(deleteError._tag, "@maple/http/errors/ScrapeTargetValidationError")
+
+			// The owning integration still writes through.
+			const disabled = yield* service.update(
+				orgId,
+				target.id,
+				new UpdateScrapeTargetRequest({ enabled: false }),
+				{ allowManaged: true },
+			)
+			assert.isFalse(disabled.enabled)
+			const deleted = yield* service.delete(orgId, target.id, { allowManaged: true })
+			assert.strictEqual(deleted.id, target.id)
 		}).pipe(Effect.provide(makeLayer(testDb)))
 	})
 

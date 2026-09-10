@@ -3,6 +3,18 @@ import { formatWarehouseDateTime, resolveRelativeRangeToWarehouse } from "@maple
 import { normalizeTimestampInput } from "@/lib/timezone-format"
 
 /**
+ * Floor a resolved range to the cache-key snap grid, scaled to the window
+ * width. Apply this wherever a relative preset is resolved into the range that
+ * feeds a query — without it the key moves with the clock and the atom idle
+ * TTLs never get to fire. See `snapRangeForCache` in `@maple/query-engine`.
+ *
+ * Do *not* apply it where a preset is materialized into an absolute range the
+ * user sees and keeps (the picker writing to the URL) — that should record the
+ * instant they actually chose.
+ */
+export { snapRangeForCache } from "@maple/query-engine"
+
+/**
  * Format a Date as the ClickHouse/Tinybird `YYYY-MM-DD HH:mm:ss` shape.
  * Thin Date-taking wrapper over the shared epoch-ms formatter.
  */
@@ -32,26 +44,16 @@ export function isTimeRangeWithin(
 	return Number.isFinite(durationSeconds) && durationSeconds >= 0 && durationSeconds <= maxRangeSeconds
 }
 
-/**
- * Resolve a relative shorthand ("15m", "7d", "3mo", "today") to an absolute
- * window.
- *
- * Delegates to the shared resolver so this app, the API, and the query engine
- * can't drift on what a shorthand means. The shared implementation reproduces
- * date-fns' local-calendar semantics — month-end clamping and local midnight
- * for "today" — so behaviour here is unchanged.
- */
+/** Resolves shorthand with the shared local-calendar semantics. */
 export function relativeToAbsolute(shorthand: string): { startTime: string; endTime: string } | null {
 	return resolveRelativeRangeToWarehouse(shorthand)
 }
 
 export function presetLabel(shorthand: string): string {
 	if (shorthand === "12mo") return "Last 1 year"
-	// Check PRESET_OPTIONS first for exact match
 	const preset = PRESET_OPTIONS.find((p) => p.value === shorthand)
 	if (preset) return preset.label
 
-	// Generate dynamically
 	const trimmed = shorthand.trim().toLowerCase()
 	if (trimmed === "today") return "Today"
 
@@ -67,7 +69,7 @@ export function presetLabel(shorthand: string): string {
 		d: ["day", "days"],
 		w: ["week", "weeks"],
 		mo: ["month", "months"],
-	}
+	} satisfies Record<string, [string, string]>
 
 	const [singular, plural] = unitLabels[unit] ?? [unit, unit]
 	return `Last ${amount} ${amount === 1 ? singular : plural}`
@@ -91,7 +93,6 @@ export function formatTimeRangeDisplay(startTime?: string, endTime?: string): st
 	const days = Math.round(diffMs / (24 * 60 * 60 * 1000))
 	const weeks = Math.round(diffMs / (7 * 24 * 60 * 60 * 1000))
 
-	// Check if end time is approximately now (within 1 minute)
 	const isRelative = Math.abs(end.getTime() - Date.now()) < 60 * 1000
 
 	if (isRelative) {

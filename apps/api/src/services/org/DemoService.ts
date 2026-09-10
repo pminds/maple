@@ -1,5 +1,5 @@
 import { DemoSeedError, DemoSeedResponse } from "@maple/domain/http"
-import { Context, Effect, Layer } from "effect"
+import { Array as Arr, Context, Effect, Layer } from "effect"
 import { WarehouseQueryService } from "@/services/warehouse/WarehouseQueryService"
 import type { TenantContext } from "@/services/auth/AuthService"
 import { generateDemoRows } from "./demo/fixtures"
@@ -10,17 +10,11 @@ const DEMO_RATE_PER_HOUR = 250
 // total for the 6h default) without fanning out into many tiny requests.
 const INGEST_CHUNK = 500
 
-const chunk = <T>(rows: ReadonlyArray<T>, size: number): T[][] => {
-	const out: T[][] = []
-	for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size))
-	return out
-}
-
-export interface DemoServiceShape {
+export interface DemoServiceApi {
 	readonly seed: (tenant: TenantContext, hours?: number) => Effect.Effect<DemoSeedResponse, DemoSeedError>
 }
 
-export class DemoService extends Context.Service<DemoService, DemoServiceShape>()(
+export class DemoService extends Context.Service<DemoService, DemoServiceApi>()(
 	"@maple/api/services/DemoService",
 	{
 		make: Effect.gen(function* () {
@@ -42,7 +36,7 @@ export class DemoService extends Context.Service<DemoService, DemoServiceShape>(
 					rows: ReadonlyArray<unknown>,
 				) =>
 					Effect.forEach(
-						chunk(rows, INGEST_CHUNK),
+						Arr.chunksOf(rows, INGEST_CHUNK),
 						(batch) =>
 							warehouse
 								.ingest(tenant, datasource, batch)
@@ -74,7 +68,7 @@ export class DemoService extends Context.Service<DemoService, DemoServiceShape>(
 				})
 			})
 
-			return { seed } satisfies DemoServiceShape
+			return { seed } satisfies DemoServiceApi
 		}),
 	},
 ) {

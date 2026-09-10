@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+// TEST-SEAM: This focused test replaces process-global modules that have no instance-level injection seam.
 
 import { cleanup, render } from "@testing-library/react"
 import type { ReactNode } from "react"
@@ -32,6 +33,7 @@ vi.mock("@/components/layout/dashboard-layout", () => {
 			Sticky: passthrough,
 			Header: passthrough,
 			Scroll: passthrough,
+			Fill: passthrough,
 			RightPanel: passthrough,
 			Title: passthrough,
 			Description: passthrough,

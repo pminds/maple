@@ -12,6 +12,7 @@ import {
 	UserId,
 } from "@maple/domain/http"
 import {
+	ActorId,
 	AlertDestinationId,
 	ErrorIncidentId,
 	ErrorIssueEventId,
@@ -19,11 +20,14 @@ import {
 } from "@maple/domain/primitives"
 import {
 	alertDestinations,
+	errorFingerprintCandidates,
 	errorIncidents,
+	errorNotificationDeliveries,
 	errorIssues,
 	errorIssueEvents,
 	errorIssueStates,
 	errorNotificationPolicies,
+	errorTickStates,
 	issueEscalations,
 	orgIngestKeys,
 } from "@maple/db"
@@ -32,14 +36,24 @@ import type { CompiledQuery } from "@maple/query-engine/ch"
 import { EdgeCacheService, makeEdgeCacheService, makeMemoryBackend } from "@maple/cache"
 import { Database, DatabaseError } from "@/platform/DatabaseLive"
 import { Env } from "@/platform/Env"
+import { isRetryablePostgresContention } from "@/platform/postgres-errors"
 import { cleanupTestDbs, createTestDb, type TestDb } from "@/platform/test-pglite"
-import type { SqlQueryOptions, WarehouseQueryServiceShape } from "@/services/warehouse/WarehouseQueryService"
+import { msToDate } from "@/platform/time"
+import { AuditLogService } from "@/services/audit/AuditLogService"
+import type { SqlQueryOptions, WarehouseQueryServiceApi } from "@/services/warehouse/WarehouseQueryService"
 import { WarehouseQueryService } from "@/services/warehouse/WarehouseQueryService"
-import { describeCause, ErrorsService, isBusyDatabaseError, makePersistenceError } from "./ErrorsService"
+import { ErrorActorsService } from "./ErrorActorsService"
+import { ErrorIssueReadModelsService } from "./ErrorIssueReadModelsService"
+import { ErrorIssueWorkflowService } from "./ErrorIssueWorkflowService"
+import { ErrorPolicyService } from "./ErrorPolicyService"
+import { ErrorsService } from "./ErrorsService"
+import { describeCause, makePersistenceError } from "./error-persistence"
+import { isErrorTickClaimLost, persistErrorTickWindow } from "./error-tick-persistence"
 import { NotificationDispatcher } from "@/services/alerts/NotificationDispatcher"
 import { InvestigationService } from "@/services/errors/InvestigationService"
 
 import { formatWarehouseDateTime } from "@maple/query-engine"
+import { compiledQueryOf } from "@maple/query-engine/execution"
 describe("makePersistenceError", () => {
 	it("omits the cause key when the source has no cause", () => {
 		const err = makePersistenceError(new Error("boom"))
@@ -80,50 +94,41 @@ describe("describeCause", () => {
 	})
 })
 
-describe("isBusyDatabaseError", () => {
+describe("isRetryablePostgresContention", () => {
 	const makeError = (message: string, cause: unknown = null) => new DatabaseError({ message, cause })
-
-	it("matches SQLITE_BUSY in message", () => {
-		expect(isBusyDatabaseError(makeError("SQLITE_BUSY: database is locked"))).toBe(true)
-	})
-
-	it("matches D1_BUSY in message", () => {
-		expect(isBusyDatabaseError(makeError("D1_BUSY: write conflict"))).toBe(true)
-	})
-
-	it("matches busy pattern in nested cause", () => {
-		const cause = new Error("internal SQLITE_BUSY trying to commit")
-		expect(isBusyDatabaseError(makeError("wrapper", cause))).toBe(true)
-	})
 
 	it("matches Postgres serialization_failure (SQLSTATE 40001) via the cause code", () => {
 		const cause = Object.assign(new Error("could not serialize access due to concurrent update"), {
 			code: "40001",
 		})
-		expect(isBusyDatabaseError(makeError("query failed", cause))).toBe(true)
+		expect(isRetryablePostgresContention(makeError("query failed", cause))).toBe(true)
 	})
 
 	it("matches Postgres deadlock_detected (SQLSTATE 40P01) via the cause code", () => {
-		const cause = Object.assign(new Error("deadlock detected"), { code: "40P01" })
-		expect(isBusyDatabaseError(makeError("query failed", cause))).toBe(true)
+		const cause = Object.assign(new Error("deadlock detected"), {
+			code: "40P01",
+		})
+		expect(isRetryablePostgresContention(makeError("query failed", cause))).toBe(true)
 	})
 
-	it("matches PG contention codes appearing in the message", () => {
-		expect(isBusyDatabaseError(makeError("SQLSTATE 40001: could not serialize access"))).toBe(true)
-		expect(isBusyDatabaseError(makeError("SQLSTATE 40P01: deadlock detected"))).toBe(true)
+	it("matches Postgres contention codes appearing in either message", () => {
+		expect(isRetryablePostgresContention(makeError("SQLSTATE 40001: could not serialize access"))).toBe(
+			true,
+		)
+		expect(isRetryablePostgresContention(makeError("wrapper", "SQLSTATE 40P01: deadlock"))).toBe(true)
 	})
 
 	it("rejects unrelated database errors", () => {
-		expect(isBusyDatabaseError(makeError("UNIQUE constraint failed"))).toBe(false)
-		expect(isBusyDatabaseError(makeError("no such table"))).toBe(false)
-		const uniqueViolation = Object.assign(new Error("duplicate key value"), { code: "23505" })
-		expect(isBusyDatabaseError(makeError("query failed", uniqueViolation))).toBe(false)
+		expect(isRetryablePostgresContention(makeError("UNIQUE constraint failed"))).toBe(false)
+		expect(isRetryablePostgresContention(makeError("no such table"))).toBe(false)
+		const uniqueViolation = Object.assign(new Error("duplicate key value"), {
+			code: "23505",
+		})
+		expect(isRetryablePostgresContention(makeError("query failed", uniqueViolation))).toBe(false)
 	})
 })
 
-// ---------------------------------------------------------------------------
 // PGlite-backed integration harness (fresh in-memory DB per test)
-// ---------------------------------------------------------------------------
 
 const createdDbs: TestDb[] = []
 
@@ -155,7 +160,7 @@ const makeWarehouseStub = (
 	scanRows: () => ReadonlyArray<Record<string, unknown>> = () => [],
 	onScan?: () => void,
 	fingerprintRows?: () => ReadonlyArray<Record<string, unknown>>,
-): WarehouseQueryServiceShape => ({
+): WarehouseQueryServiceApi => ({
 	query: () => Effect.die(new Error("unexpected warehouse query")),
 	rawSqlQuery: () => Effect.succeed([]),
 	// Active-org discovery is a declared cross-org read, so it arrives here
@@ -164,25 +169,29 @@ const makeWarehouseStub = (
 	crossOrgQuery: <T>(tenant: unknown, compiled: CompiledQuery<T>) =>
 		Effect.suspend(() => {
 			const orgId = (tenant as { orgId?: string }).orgId ?? ""
-			return Effect.orDie(compiled.decodeRows(scanRows().length > 0 ? [{ orgId }] : []))
+			return Effect.orDie(
+				compiledQueryOf(compiled).decodeRows(scanRows().length > 0 ? [{ orgId }] : []),
+			)
 		}),
 	compiledQuery: <T>(tenant: unknown, compiled: CompiledQuery<T>, options?: SqlQueryOptions) =>
 		Effect.suspend(() => {
 			if (options?.context === "errorIssuesScan") {
 				onScan?.()
-				return Effect.orDie(compiled.decodeRows(scanRows()))
+				return Effect.orDie(compiledQueryOf(compiled).decodeRows(scanRows()))
 			}
 			// listIssues' deployment-environment filter (shaped like ErrorFingerprintsOutput).
 			if (options?.context === "errorIssueEnvFingerprints") {
-				return Effect.orDie(compiled.decodeRows(fingerprintRows?.() ?? []))
+				return Effect.orDie(compiledQueryOf(compiled).decodeRows(fingerprintRows?.() ?? []))
 			}
 			// Active-org discovery reads the same data the scan does, so model that
 			// consistency: surface the org iff it currently has error rows.
 			if (options?.context === "errorActiveOrgsDiscovery") {
 				const orgId = (tenant as { orgId?: string }).orgId ?? ""
-				return Effect.orDie(compiled.decodeRows(scanRows().length > 0 ? [{ orgId }] : []))
+				return Effect.orDie(
+					compiledQueryOf(compiled).decodeRows(scanRows().length > 0 ? [{ orgId }] : []),
+				)
 			}
-			return Effect.orDie(compiled.decodeRows([]))
+			return Effect.orDie(compiledQueryOf(compiled).decodeRows([]))
 		}),
 	compiledQueryFirst: () => Effect.die(new Error("unexpected warehouse query")),
 	ingest: () => Effect.void,
@@ -201,11 +210,28 @@ const makeErrorsLayer = (
 	const testDb = createTestDb(createdDbs)
 	const envLive = Env.layer.pipe(Layer.provide(testConfig()))
 	const databaseLive = testDb.layer
+	const errorActorsLive = ErrorActorsService.layer.pipe(Layer.provide(databaseLive))
+	const errorIssueWorkflowLive = ErrorIssueWorkflowService.layer.pipe(
+		Layer.provide(AuditLogService.layerMemory),
+		Layer.provide(databaseLive),
+		Layer.provide(errorActorsLive),
+	)
+	const errorPolicyLive = ErrorPolicyService.layer.pipe(Layer.provide(databaseLive))
+	const warehouseLive = Layer.succeed(
+		WarehouseQueryService,
+		makeWarehouseStub(scanRows, onScan, fingerprintRows),
+	)
+	const errorIssueReadModelsLive = ErrorIssueReadModelsService.layer.pipe(
+		Layer.provide(databaseLive),
+		Layer.provide(warehouseLive),
+		Layer.provide(errorIssueWorkflowLive),
+	)
 	// Held only so the service can hand an autonomous investigation turn its `submit_diagnosis`
 	// tool; no test here starts one. The real layer is cheap — it depends on nothing beyond Env
 	// and the database already wired above.
 	const investigationsLive = InvestigationService.layer.pipe(
-		Layer.provide(Layer.mergeAll(envLive, databaseLive)),
+		Layer.provide(envLive),
+		Layer.provide(databaseLive),
 	)
 	const dispatcherStub = Layer.succeed(
 		NotificationDispatcher,
@@ -213,19 +239,26 @@ const makeErrorsLayer = (
 			dispatch: () => Effect.succeed({ delivered: 0, failed: 0 }),
 		},
 	)
-	return ErrorsService.layer.pipe(
+	const errorsLive = ErrorsService.layer.pipe(
+		Layer.provide(envLive),
+		Layer.provide(databaseLive),
+		Layer.provide(warehouseLive),
 		Layer.provide(
-			Layer.mergeAll(
-				envLive,
-				databaseLive,
-				Layer.succeed(WarehouseQueryService, makeWarehouseStub(scanRows, onScan, fingerprintRows)),
-				Layer.succeed(EdgeCacheService, makeEdgeCacheService(edgeBackend ?? makeMemoryBackend())),
-				dispatcherStub,
-				investigationsLive,
-			),
+			Layer.succeed(EdgeCacheService, makeEdgeCacheService(edgeBackend ?? makeMemoryBackend())),
 		),
-		Layer.provideMerge(databaseLive),
+		Layer.provide(dispatcherStub),
+		Layer.provide(errorActorsLive),
+		Layer.provide(errorIssueWorkflowLive),
+		Layer.provide(errorPolicyLive),
+		Layer.provide(investigationsLive),
 	)
+	return Layer.mergeAll(
+		errorsLive,
+		errorActorsLive,
+		errorIssueReadModelsLive,
+		errorIssueWorkflowLive,
+		errorPolicyLive,
+	).pipe(Layer.provideMerge(databaseLive))
 }
 
 /**
@@ -267,6 +300,13 @@ const makeGatingLayer = (opts: {
 	const testDb = createTestDb(createdDbs)
 	const envLive = Env.layer.pipe(Layer.provide(testConfig()))
 	const databaseLive = testDb.layer
+	const errorActorsLive = ErrorActorsService.layer.pipe(Layer.provide(databaseLive))
+	const errorIssueWorkflowLive = ErrorIssueWorkflowService.layer.pipe(
+		Layer.provide(AuditLogService.layerMemory),
+		Layer.provide(databaseLive),
+		Layer.provide(errorActorsLive),
+	)
+	const errorPolicyLive = ErrorPolicyService.layer.pipe(Layer.provide(databaseLive))
 	// Held only so the service can hand an autonomous investigation turn its `submit_diagnosis`
 	// tool; no test here starts one. The real layer is cheap — it depends on nothing beyond Env
 	// and the database already wired above.
@@ -277,7 +317,7 @@ const makeGatingLayer = (opts: {
 		dispatch: () => Effect.succeed({ delivered: 0, failed: 0 }),
 	})
 	const scanRows = opts.scanRows ?? (() => [])
-	const warehouseStub: WarehouseQueryServiceShape = {
+	const warehouseStub: WarehouseQueryServiceApi = {
 		query: () => Effect.die(new Error("unexpected warehouse query")),
 		rawSqlQuery: () => Effect.succeed([]),
 		crossOrgQuery: <T>(
@@ -289,23 +329,27 @@ const makeGatingLayer = (opts: {
 				if (options?.context) opts.profiles?.set(options.context, options.profile)
 				if (opts.failDiscovery) return Effect.die(new Error("discovery down"))
 				const orgId = (tenant as { orgId?: string }).orgId ?? ""
-				return Effect.orDie(compiled.decodeRows(scanRows().length > 0 ? [{ orgId }] : []))
+				return Effect.orDie(
+					compiledQueryOf(compiled).decodeRows(scanRows().length > 0 ? [{ orgId }] : []),
+				)
 			}),
 		compiledQuery: <T>(tenant: unknown, compiled: CompiledQuery<T>, options?: SqlQueryOptions) => {
 			if (options?.context) opts.profiles?.set(options.context, options.profile)
 			if (options?.context === "errorActiveOrgsDiscovery") {
 				if (opts.failDiscovery) return Effect.die(new Error("discovery down"))
 				const orgId = (tenant as { orgId?: string }).orgId ?? ""
-				return Effect.orDie(compiled.decodeRows(scanRows().length > 0 ? [{ orgId }] : []))
+				return Effect.orDie(
+					compiledQueryOf(compiled).decodeRows(scanRows().length > 0 ? [{ orgId }] : []),
+				)
 			}
 			if (options?.context === "errorIssuesScan") {
 				const orgId = (tenant as { orgId?: string }).orgId ?? ""
 				return Effect.suspend(() => {
 					opts.scanned?.add(orgId)
-					return Effect.orDie(compiled.decodeRows(scanRows()))
+					return Effect.orDie(compiledQueryOf(compiled).decodeRows(scanRows()))
 				})
 			}
-			return Effect.orDie(compiled.decodeRows([]))
+			return Effect.orDie(compiledQueryOf(compiled).decodeRows([]))
 		},
 		compiledQueryFirst: () => Effect.die(new Error("unexpected warehouse query")),
 		ingest: () => Effect.void,
@@ -313,23 +357,24 @@ const makeGatingLayer = (opts: {
 			throw new Error("asExecutor is not supported by this test stub")
 		},
 	}
+	const warehouseLive = Layer.succeed(WarehouseQueryService, warehouseStub)
 	return ErrorsService.layer.pipe(
-		Layer.provide(
-			Layer.mergeAll(
-				envLive,
-				databaseLive,
-				Layer.succeed(WarehouseQueryService, warehouseStub),
-				Layer.succeed(EdgeCacheService, makeEdgeCacheService(makeMemoryBackend())),
-				dispatcherStub,
-				investigationsLive,
-			),
-		),
+		Layer.provide(envLive),
+		Layer.provide(databaseLive),
+		Layer.provide(warehouseLive),
+		Layer.provide(Layer.succeed(EdgeCacheService, makeEdgeCacheService(makeMemoryBackend()))),
+		Layer.provide(dispatcherStub),
+		Layer.provide(errorActorsLive),
+		Layer.provide(errorIssueWorkflowLive),
+		Layer.provide(errorPolicyLive),
+		Layer.provide(investigationsLive),
 		Layer.provideMerge(databaseLive),
 	)
 }
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
 const asUserId = Schema.decodeUnknownSync(UserId)
+const asActorId = Schema.decodeUnknownSync(ActorId)
 const asIssueId = Schema.decodeUnknownSync(ErrorIssueId)
 const asIncidentId = Schema.decodeUnknownSync(ErrorIncidentId)
 const asEventId = Schema.decodeUnknownSync(ErrorIssueEventId)
@@ -385,28 +430,40 @@ const seedIngestKey = (orgId: string) =>
 		)
 	})
 
-// ---------------------------------------------------------------------------
 // countOpenIssuesByService
-// ---------------------------------------------------------------------------
 
-describe("ErrorsService.countOpenIssuesByService", () => {
+describe("ErrorIssueReadModelsService.countOpenIssuesByService", () => {
 	it.effect("groups actionable error issues by service, excluding done/alert/archived", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const readModels = yield* ErrorIssueReadModelsService
 			const now = new Date()
-			yield* seedIssue(asIssueId(randomUUID()), { serviceName: "checkout-api" })
+			yield* seedIssue(asIssueId(randomUUID()), {
+				serviceName: "checkout-api",
+			})
 			yield* seedIssue(asIssueId(randomUUID()), {
 				serviceName: "checkout-api",
 				workflowState: "in_progress",
 			})
-			yield* seedIssue(asIssueId(randomUUID()), { serviceName: "ingest", workflowState: "todo" })
+			yield* seedIssue(asIssueId(randomUUID()), {
+				serviceName: "ingest",
+				workflowState: "todo",
+			})
 			// Non-actionable, alert-kind, archived, and empty-service rows are all excluded.
-			yield* seedIssue(asIssueId(randomUUID()), { serviceName: "checkout-api", workflowState: "done" })
-			yield* seedIssue(asIssueId(randomUUID()), { serviceName: "alerting", kind: "alert" })
-			yield* seedIssue(asIssueId(randomUUID()), { serviceName: "ingest", archivedAt: now })
+			yield* seedIssue(asIssueId(randomUUID()), {
+				serviceName: "checkout-api",
+				workflowState: "done",
+			})
+			yield* seedIssue(asIssueId(randomUUID()), {
+				serviceName: "alerting",
+				kind: "alert",
+			})
+			yield* seedIssue(asIssueId(randomUUID()), {
+				serviceName: "ingest",
+				archivedAt: now,
+			})
 			yield* seedIssue(asIssueId(randomUUID()), { serviceName: "" })
 
-			const counts = yield* errors.countOpenIssuesByService(ORG)
+			const counts = yield* readModels.countOpenIssuesByService(ORG)
 			const byService = new Map(counts.map((row) => [row.serviceName, row.openCount]))
 			assert.strictEqual(byService.get("checkout-api"), 2)
 			assert.strictEqual(byService.get("ingest"), 1)
@@ -416,20 +473,19 @@ describe("ErrorsService.countOpenIssuesByService", () => {
 	)
 })
 
-// ---------------------------------------------------------------------------
 // setSeverity
-// ---------------------------------------------------------------------------
 
-describe("ErrorsService.setSeverity", () => {
+describe("Error issue severity, policies, and read models", () => {
 	it.effect("sets a manual severity, records the event, and queues an escalation", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const workflow = yield* ErrorIssueWorkflowService
 			const database = yield* Database
 			const issueId = asIssueId(randomUUID())
 			yield* seedIssue(issueId)
-			const actor = yield* errors.ensureUserActor(ORG, USER)
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
 
-			const updated = yield* errors.setSeverity(ORG, actor.id, issueId, "critical", {
+			const updated = yield* workflow.setSeverity(ORG, actor.id, issueId, "critical", {
 				note: "paging-worthy",
 			})
 			assert.strictEqual(updated.severity, "critical")
@@ -457,13 +513,14 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("an AI write never clobbers a manual severity", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const workflow = yield* ErrorIssueWorkflowService
 			const issueId = asIssueId(randomUUID())
 			yield* seedIssue(issueId)
-			const actor = yield* errors.ensureUserActor(ORG, USER)
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
 
-			yield* errors.setSeverity(ORG, actor.id, issueId, "low")
-			const afterAi = yield* errors.setSeverity(ORG, actor.id, issueId, "critical", {
+			yield* workflow.setSeverity(ORG, actor.id, issueId, "low")
+			const afterAi = yield* workflow.setSeverity(ORG, actor.id, issueId, "critical", {
 				source: "ai",
 			})
 			assert.strictEqual(afterAi.severity, "low")
@@ -473,14 +530,15 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("clearing severity nulls both fields and skips escalation", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const workflow = yield* ErrorIssueWorkflowService
 			const database = yield* Database
 			const issueId = asIssueId(randomUUID())
 			yield* seedIssue(issueId)
-			const actor = yield* errors.ensureUserActor(ORG, USER)
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
 
-			yield* errors.setSeverity(ORG, actor.id, issueId, "medium")
-			const cleared = yield* errors.setSeverity(ORG, actor.id, issueId, null)
+			yield* workflow.setSeverity(ORG, actor.id, issueId, "medium")
+			const cleared = yield* workflow.setSeverity(ORG, actor.id, issueId, null)
 			assert.isNull(cleared.severity)
 			assert.isNull(cleared.severitySource)
 
@@ -494,7 +552,7 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("upsertEscalationPolicy rejects destination IDs the org does not own", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const policies = yield* ErrorPolicyService
 			const database = yield* Database
 			const now = yield* Clock.currentTimeMillis
 			const ownedId = asDestinationId(randomUUID())
@@ -517,7 +575,7 @@ describe("ErrorsService.setSeverity", () => {
 				}),
 			)
 
-			const rejected = yield* errors
+			const rejected = yield* policies
 				.upsertEscalationPolicy(
 					ORG,
 					USER,
@@ -538,13 +596,16 @@ describe("ErrorsService.setSeverity", () => {
 				assert.notInclude(rejected.details, ownedId)
 			}
 
-			const accepted = yield* errors.upsertEscalationPolicy(
+			const accepted = yield* policies.upsertEscalationPolicy(
 				ORG,
 				USER,
 				new IssueEscalationPolicyUpsertRequest({
 					enabled: true,
 					rules: [
-						new IssueEscalationPolicyRule({ severity: "critical", destinationIds: [ownedId] }),
+						new IssueEscalationPolicyRule({
+							severity: "critical",
+							destinationIds: [ownedId],
+						}),
 					],
 				}),
 			)
@@ -554,12 +615,14 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("listIssues filters by severity and kind", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const workflow = yield* ErrorIssueWorkflowService
+			const readModels = yield* ErrorIssueReadModelsService
 			const database = yield* Database
 			const issueId = asIssueId(randomUUID())
 			yield* seedIssue(issueId)
-			const actor = yield* errors.ensureUserActor(ORG, USER)
-			yield* errors.setSeverity(ORG, actor.id, issueId, "high")
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			yield* workflow.setSeverity(ORG, actor.id, issueId, "high")
 
 			const alertIssueId = asIssueId(randomUUID())
 			const now = yield* Clock.currentTimeMillis
@@ -580,19 +643,19 @@ describe("ErrorsService.setSeverity", () => {
 				}),
 			)
 
-			const high = yield* errors.listIssues(ORG, { severity: "high" })
+			const high = yield* readModels.listIssues(ORG, { severity: "high" })
 			assert.deepStrictEqual(
 				high.issues.map((i) => i.id),
 				[issueId],
 			)
 
-			const unset = yield* errors.listIssues(ORG, { severity: "unset" })
+			const unset = yield* readModels.listIssues(ORG, { severity: "unset" })
 			assert.deepStrictEqual(
 				unset.issues.map((i) => i.id),
 				[alertIssueId],
 			)
 
-			const alerts = yield* errors.listIssues(ORG, { kind: "alert" })
+			const alerts = yield* readModels.listIssues(ORG, { kind: "alert" })
 			assert.deepStrictEqual(
 				alerts.issues.map((i) => i.id),
 				[alertIssueId],
@@ -603,20 +666,22 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("listIssues deploymentEnv filter keeps only warehouse-observed fingerprints", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const readModels = yield* ErrorIssueReadModelsService
 			const prodIssueId = asIssueId(randomUUID())
 			const otherIssueId = asIssueId(randomUUID())
 			yield* seedIssue(prodIssueId, { fingerprintHash: "111" })
 			yield* seedIssue(otherIssueId, { fingerprintHash: "222" })
 
-			const filtered = yield* errors.listIssues(ORG, { deploymentEnv: "production" })
+			const filtered = yield* readModels.listIssues(ORG, {
+				deploymentEnv: "production",
+			})
 			assert.deepStrictEqual(
 				filtered.issues.map((i) => i.id),
 				[prodIssueId],
 			)
 
 			// The unfiltered list still returns both.
-			const all = yield* errors.listIssues(ORG, {})
+			const all = yield* readModels.listIssues(ORG, {})
 			assert.strictEqual(all.issues.length, 2)
 		}).pipe(
 			// The warehouse saw only fingerprint 111 in the selected environment.
@@ -628,10 +693,12 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("listIssues deploymentEnv filter short-circuits when no fingerprints match", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const readModels = yield* ErrorIssueReadModelsService
 			yield* seedIssue(asIssueId(randomUUID()))
 
-			const filtered = yield* errors.listIssues(ORG, { deploymentEnv: "staging" })
+			const filtered = yield* readModels.listIssues(ORG, {
+				deploymentEnv: "staging",
+			})
 			assert.deepStrictEqual(filtered.issues, [])
 			assert.strictEqual(filtered.nextCursor, undefined)
 		}).pipe(
@@ -642,7 +709,7 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("listIssues paginates with a keyset cursor", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const readModels = yield* ErrorIssueReadModelsService
 			const now = yield* Clock.currentTimeMillis
 			// 5 issues with strictly decreasing lastSeenAt so page order is stable.
 			const ids: Array<ErrorIssueId> = []
@@ -652,7 +719,7 @@ describe("ErrorsService.setSeverity", () => {
 				yield* seedIssue(id, { lastSeenAt: new Date(now - i * 60_000) })
 			}
 
-			const page1 = yield* errors.listIssues(ORG, { limit: 2 })
+			const page1 = yield* readModels.listIssues(ORG, { limit: 2 })
 			assert.deepStrictEqual(
 				page1.issues.map((i) => i.id),
 				[ids[0], ids[1]],
@@ -660,7 +727,10 @@ describe("ErrorsService.setSeverity", () => {
 			assert.isString(page1.nextCursor)
 
 			const cursor1 = Schema.decodeUnknownSync(IssueListCursor)(page1.nextCursor)
-			const page2 = yield* errors.listIssues(ORG, { limit: 2, cursor: cursor1 })
+			const page2 = yield* readModels.listIssues(ORG, {
+				limit: 2,
+				cursor: cursor1,
+			})
 			assert.deepStrictEqual(
 				page2.issues.map((i) => i.id),
 				[ids[2], ids[3]],
@@ -668,7 +738,10 @@ describe("ErrorsService.setSeverity", () => {
 			assert.isString(page2.nextCursor)
 
 			const cursor2 = Schema.decodeUnknownSync(IssueListCursor)(page2.nextCursor)
-			const page3 = yield* errors.listIssues(ORG, { limit: 2, cursor: cursor2 })
+			const page3 = yield* readModels.listIssues(ORG, {
+				limit: 2,
+				cursor: cursor2,
+			})
 			assert.deepStrictEqual(
 				page3.issues.map((i) => i.id),
 				[ids[4]],
@@ -683,7 +756,7 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("listIssues pages tie-broken by id when lastSeenAt collides", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const readModels = yield* ErrorIssueReadModelsService
 			const now = yield* Clock.currentTimeMillis
 			const sameInstant = new Date(now)
 			const ids = ["cccc", "bbbb", "aaaa"].map((prefix) =>
@@ -693,8 +766,8 @@ describe("ErrorsService.setSeverity", () => {
 				yield* seedIssue(id, { lastSeenAt: sameInstant })
 			}
 
-			const page1 = yield* errors.listIssues(ORG, { limit: 2 })
-			const page2 = yield* errors.listIssues(ORG, {
+			const page1 = yield* readModels.listIssues(ORG, { limit: 2 })
+			const page2 = yield* readModels.listIssues(ORG, {
 				limit: 2,
 				cursor: Schema.decodeUnknownSync(IssueListCursor)(page1.nextCursor),
 			})
@@ -707,7 +780,7 @@ describe("ErrorsService.setSeverity", () => {
 
 	it.effect("listIssues returns bounded actionable issues in severity order", () =>
 		Effect.gen(function* () {
-			const errors = yield* ErrorsService
+			const readModels = yield* ErrorIssueReadModelsService
 			const now = yield* Clock.currentTimeMillis
 			const critical = asIssueId("00000000-0000-4000-8000-000000000001")
 			const high = asIssueId("00000000-0000-4000-8000-000000000002")
@@ -721,13 +794,22 @@ describe("ErrorsService.setSeverity", () => {
 				workflowState: "triage",
 				lastSeenAt: new Date(now - 60_000),
 			})
-			yield* seedIssue(high, { severity: "high", workflowState: "in_progress" })
+			yield* seedIssue(high, {
+				severity: "high",
+				workflowState: "in_progress",
+			})
 			yield* seedIssue(medium, { severity: "medium", workflowState: "todo" })
 			yield* seedIssue(done, { severity: "critical", workflowState: "done" })
-			yield* seedIssue(otherService, { severity: "critical", serviceName: "catalog-api" })
-			yield* seedIssue(otherOrg, { orgId: asOrgId("org_errors_service_foreign"), severity: "critical" })
+			yield* seedIssue(otherService, {
+				severity: "critical",
+				serviceName: "catalog-api",
+			})
+			yield* seedIssue(otherOrg, {
+				orgId: asOrgId("org_errors_service_foreign"),
+				severity: "critical",
+			})
 
-			const first = yield* errors.listIssues(ORG, {
+			const first = yield* readModels.listIssues(ORG, {
 				service: "checkout-api",
 				actionable: true,
 				sort: "severity",
@@ -740,7 +822,7 @@ describe("ErrorsService.setSeverity", () => {
 			assert.match(first.nextCursor ?? "", /^sev_/)
 
 			const cursor = Schema.decodeUnknownSync(IssueSeverityListCursor)(first.nextCursor?.slice(4))
-			const second = yield* errors.listIssues(ORG, {
+			const second = yield* readModels.listIssues(ORG, {
 				service: "checkout-api",
 				actionable: true,
 				sort: "severity",
@@ -756,16 +838,14 @@ describe("ErrorsService.setSeverity", () => {
 	)
 })
 
-// ---------------------------------------------------------------------------
 // runTick — the per-minute scheduled tick that turns warehouse error rows
 // into issues/incidents. The warehouse stub feeds synthetic scan rows; the
 // TestClock pins the tick window.
-// ---------------------------------------------------------------------------
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
-// Multiple of TICK_WINDOW_MS * RETENTION_PHASE_EVERY_N_TICKS (2min * 30 = 1h),
-// so a tick at exactly this instant runs the retention phase.
+// Multiple of the one-minute cron phase * 60, so a tick at exactly this
+// instant runs the retention phase.
 const RETENTION_TICK_MS = 1_750_003_200_000
 // One tick later — the retention phase does not run.
 const TICK_MS = RETENTION_TICK_MS + 120_000
@@ -784,8 +864,13 @@ const scanRow = (overrides: Record<string, unknown> = {}): Record<string, unknow
 	topFrame: "checkout/handler.ts:42",
 	count: 3,
 	affectedServicesCount: 1,
-	firstSeen: formatWarehouseDateTime(TICK_MS - 60_000),
-	lastSeen: formatWarehouseDateTime(TICK_MS - 1_000),
+	// The compiled query derives its row schema from the SELECT now, so a fixture
+	// missing a column fails the same way a warehouse that stopped returning one
+	// would. Empty by default: most of these tests are not about build sets, and
+	// a version here would put them on the pre-fix-build path.
+	serviceVersions: [],
+	firstSeen: formatWarehouseDateTime(TICK_MS - 120_000),
+	lastSeen: formatWarehouseDateTime(TICK_MS - 60_000 - 1_000),
 	...overrides,
 })
 
@@ -794,6 +879,32 @@ const loadIssuesByFingerprint = (fingerprintHash: string) =>
 		const database = yield* Database
 		return yield* database.execute((db) =>
 			db.select().from(errorIssues).where(eq(errorIssues.fingerprintHash, fingerprintHash)),
+		)
+	})
+
+/**
+ * Push an issue's resolution into the past so the reopen grace window has
+ * elapsed. The tick steps through 5-minute windows, so advancing TestClock far
+ * enough to clear the one-hour grace would mean driving a dozen empty ticks;
+ * backdating the resolution expresses the same situation directly.
+ */
+const backdateResolution = (issueId: ErrorIssueId, resolvedAtMs: number) =>
+	Effect.gen(function* () {
+		const database = yield* Database
+		return yield* database.execute((db) =>
+			db
+				.update(errorIssues)
+				.set({ resolvedAt: new Date(resolvedAtMs) })
+				.where(eq(errorIssues.id, issueId)),
+		)
+	})
+
+/** Seed the build snapshot a resolution would have captured. */
+const setResolvedVersions = (issueId: ErrorIssueId, versions: ReadonlyArray<string>) =>
+	Effect.gen(function* () {
+		const database = yield* Database
+		return yield* database.execute((db) =>
+			db.update(errorIssues).set({ resolvedVersionsJson: versions }).where(eq(errorIssues.id, issueId)),
 		)
 	})
 
@@ -812,6 +923,37 @@ const loadEventsForIssue = (issueId: ErrorIssueId) =>
 			db.select().from(errorIssueEvents).where(eq(errorIssueEvents.issueId, issueId)),
 		)
 	})
+
+/**
+ * Walk the cursor forward to the current cutoff the way the once-a-minute cron
+ * does. The evaluator advances by at most `TICK_MAX_WINDOW_MS` of event time per
+ * invocation, so a test that jumps the clock has to run the ticks that jump
+ * skipped — a single `runTick` after a 31-minute leap only covers the first
+ * five minutes of it.
+ */
+const runTicksUntilCaughtUp = Effect.fn("test.runTicksUntilCaughtUp")(function* (maxTicks = 32) {
+	const errors = yield* ErrorsService
+	const database = yield* Database
+	const totals = {
+		issuesTouched: 0,
+		incidentsOpened: 0,
+		incidentsResolved: 0,
+		ticks: 0,
+	}
+	for (let i = 0; i < maxTicks; i++) {
+		const nowMs = yield* Clock.currentTimeMillis
+		const cutoffMs = Math.floor(nowMs / 60_000) * 60_000 - 60_000
+		const cursor = yield* database.execute((db) => db.select().from(errorTickStates))
+		const behind = cursor.length === 0 || cursor.some((row) => row.processedThrough.getTime() < cutoffMs)
+		if (!behind) break
+		const result = yield* errors.runTick()
+		totals.issuesTouched += result.issuesTouched
+		totals.incidentsOpened += result.incidentsOpened
+		totals.incidentsResolved += result.incidentsResolved
+		totals.ticks += 1
+	}
+	return totals
+})
 
 describe("ErrorsService.runTick", () => {
 	it.effect("with no known orgs the tick scans nothing and writes nothing", () =>
@@ -881,7 +1023,7 @@ describe("ErrorsService.runTick", () => {
 		}).pipe(Effect.provide(makeGatingLayer({ failDiscovery: true, scanned })))
 	})
 
-	it.effect("discovery uses the 5s discovery profile; the per-org scan uses the list profile", () => {
+	it.effect("discovery uses the 5s profile; the minutely tick scan uses aggregation", () => {
 		const profiles = new Map<string, string | undefined>()
 		return Effect.gen(function* () {
 			const errors = yield* ErrorsService
@@ -891,7 +1033,7 @@ describe("ErrorsService.runTick", () => {
 			yield* errors.runTick()
 
 			assert.strictEqual(profiles.get("errorActiveOrgsDiscovery"), "discovery")
-			assert.strictEqual(profiles.get("errorIssuesScan"), "list")
+			assert.strictEqual(profiles.get("errorIssuesScan"), "aggregation")
 		}).pipe(Effect.provide(makeGatingLayer({ scanRows: () => [scanRow()], profiles })))
 	})
 
@@ -951,9 +1093,9 @@ describe("ErrorsService.runTick", () => {
 				assert.strictEqual(issue.errorLabel, "TimeoutError: upstream timed out")
 				assert.strictEqual(issue.topFrame, "checkout/handler.ts:42")
 				assert.strictEqual(issue.occurrenceCount, 3)
-				assert.strictEqual(issue.firstSeenAt.getTime(), TICK_MS - 60_000)
-				assert.strictEqual(issue.lastSeenAt.getTime(), TICK_MS - 1_000)
-				assert.strictEqual(issue.createdAt.getTime(), TICK_MS)
+				assert.strictEqual(issue.firstSeenAt.getTime(), TICK_MS - 120_000)
+				assert.strictEqual(issue.lastSeenAt.getTime(), TICK_MS - 60_000 - 1_000)
+				assert.strictEqual(issue.createdAt.getTime(), TICK_MS - 60_000)
 
 				const events = yield* loadEventsForIssue(issue.id)
 				assert.deepStrictEqual(
@@ -977,7 +1119,33 @@ describe("ErrorsService.runTick", () => {
 		},
 	)
 
-	it.effect("re-running the tick over the same scan rows refreshes the issue, never duplicates it", () => {
+	it.effect("a scan row carrying NUL bytes is stored stripped instead of failing the tick", () => {
+		// ClickHouse String is bytes; a CLI crash once shipped raw chDB metadata in
+		// its message and Postgres refused the row with 22021. The tick then
+		// re-reported its own DatabaseError — params and NULs included — and failed
+		// on that, once a minute, until the row was sanitized at this boundary.
+		const rows = [
+			scanRow({
+				exceptionMessage: "failed at position 1 (\u0000\u0000): \u0000garbage",
+				topFrame: "cli/store.ts:1\u0000",
+			}),
+		]
+		return Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			yield* TestClock.setTime(TICK_MS)
+			yield* seedIssue(asIssueId(randomUUID()))
+
+			const result = yield* errors.runTick()
+			assert.strictEqual(result.issuesTouched, 1)
+
+			const issues = yield* loadIssuesByFingerprint(SCAN_FINGERPRINT)
+			assert.lengthOf(issues, 1)
+			assert.strictEqual(issues[0]!.exceptionMessage, "failed at position 1 (): garbage")
+			assert.strictEqual(issues[0]!.topFrame, "cli/store.ts:1")
+		}).pipe(Effect.provide(makeErrorsLayer(() => rows)))
+	})
+
+	it.effect("re-running the same completed window is a no-op", () => {
 		const rows = [scanRow()]
 		return Effect.gen(function* () {
 			const errors = yield* ErrorsService
@@ -987,20 +1155,27 @@ describe("ErrorsService.runTick", () => {
 			const first = yield* errors.runTick()
 			assert.strictEqual(first.incidentsOpened, 1)
 
-			yield* TestClock.setTime(TICK_MS + 60_000)
+			// Same aligned minute boundary: the persisted cursor has already committed
+			// this half-open window, so the second invocation cannot count it again.
 			const second = yield* errors.runTick()
-			assert.strictEqual(second.issuesTouched, 1)
+			assert.strictEqual(second.issuesTouched, 0)
 			assert.strictEqual(second.incidentsOpened, 0)
 
 			const issues = yield* loadIssuesByFingerprint(SCAN_FINGERPRINT)
 			assert.lengthOf(issues, 1)
-			// Re-observation accumulates occurrences onto the same issue row.
-			assert.strictEqual(issues[0]?.occurrenceCount, 6)
+			assert.strictEqual(issues[0]?.occurrenceCount, 3)
 
 			const incidents = yield* loadIncidentsForIssue(issues[0]!.id)
 			assert.lengthOf(incidents, 1)
 			assert.strictEqual(incidents[0]?.status, "open")
-			assert.strictEqual(incidents[0]?.occurrenceCount, 6)
+			assert.strictEqual(incidents[0]?.occurrenceCount, 3)
+
+			const database = yield* Database
+			const cursors = yield* database.execute((db) =>
+				db.select().from(errorTickStates).where(eq(errorTickStates.orgId, ORG)),
+			)
+			assert.strictEqual(cursors[0]?.processedThrough.getTime(), TICK_MS - 60_000)
+			assert.isTrue(cursors[0]?.bootstrapCompleted)
 
 			const events = yield* loadEventsForIssue(issues[0]!.id)
 			assert.lengthOf(
@@ -1008,6 +1183,75 @@ describe("ErrorsService.runTick", () => {
 				1,
 			)
 		}).pipe(Effect.provide(makeErrorsLayer(() => rows)))
+	})
+
+	it.effect("failed incident notifications stay queued and succeed on a later tick", () => {
+		let rows: ReadonlyArray<Record<string, unknown>> = [scanRow()]
+		let attempts = 0
+		const destinationId = "7d31c9e1-0000-4000-8000-000000000001" as AlertDestinationId
+		const retryingDispatcher: (typeof NotificationDispatcher)["Service"] = {
+			dispatch: (_orgId, _destinationIds, _context) =>
+				Effect.sync(() => {
+					attempts += 1
+					return attempts === 1
+						? {
+								delivered: 0,
+								failed: 1,
+								destinations: [
+									{
+										destinationId,
+										destinationName: "test",
+										status: "failed" as const,
+										error: "temporary failure",
+									},
+								],
+							}
+						: {
+								delivered: 1,
+								failed: 0,
+								destinations: [
+									{
+										destinationId,
+										destinationName: "test",
+										status: "delivered" as const,
+										error: null,
+									},
+								],
+							}
+				}),
+		}
+
+		return Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const database = yield* Database
+			yield* TestClock.setTime(TICK_MS)
+			yield* seedIssue(asIssueId(randomUUID()))
+			yield* database.execute((db) =>
+				db.insert(errorNotificationPolicies).values({
+					orgId: ORG,
+					enabled: true,
+					destinationIdsJson: [destinationId],
+					updatedAt: new Date(TICK_MS),
+					updatedBy: "test",
+				}),
+			)
+
+			yield* errors.runTick()
+			let deliveries = yield* database.execute((db) => db.select().from(errorNotificationDeliveries))
+			assert.lengthOf(deliveries, 1)
+			assert.strictEqual(deliveries[0]?.status, "queued")
+			assert.strictEqual(deliveries[0]?.attemptCount, 1)
+
+			rows = []
+			yield* TestClock.setTime(TICK_MS + 60_000)
+			yield* errors.runTick()
+			deliveries = yield* database.execute((db) => db.select().from(errorNotificationDeliveries))
+			assert.strictEqual(deliveries[0]?.status, "success")
+			assert.strictEqual(deliveries[0]?.attemptCount, 2)
+			assert.strictEqual(attempts, 2)
+		}).pipe(
+			Effect.provide(makeErrorsLayer(() => rows, undefined, undefined, undefined, retryingDispatcher)),
+		)
 	})
 
 	it.effect("overlapping ticks dispatch each incident notification exactly once", () => {
@@ -1044,15 +1288,17 @@ describe("ErrorsService.runTick", () => {
 				1,
 			)
 
-			// Stale window elapsed, no fresh errors: two OVERLAPPING ticks race the
-			// open→resolved flip. The CAS lets exactly one dispatch the resolve.
+			// Stale window elapsed, no fresh errors. Two OVERLAPPING ticks race the
+			// open→resolved flip: the cursor row lock plus the state CAS let exactly
+			// one of them do it. The cursor has to walk the quiet period first.
 			rows = []
 			yield* TestClock.setTime(TICK_MS + 31 * 60_000)
+			const caughtUp = yield* runTicksUntilCaughtUp()
 			const resolveResults = yield* Effect.all([errors.runTick(), errors.runTick()], {
 				concurrency: 2,
 			})
 			assert.strictEqual(
-				resolveResults.reduce((s, r) => s + r.incidentsResolved, 0),
+				caughtUp.incidentsResolved + resolveResults.reduce((s, r) => s + r.incidentsResolved, 0),
 				1,
 			)
 			assert.lengthOf(
@@ -1065,8 +1311,8 @@ describe("ErrorsService.runTick", () => {
 			const reopenMs = TICK_MS + 32 * 60_000
 			rows = [
 				scanRow({
-					firstSeen: formatWarehouseDateTime(reopenMs - 60_000),
-					lastSeen: formatWarehouseDateTime(reopenMs - 1_000),
+					firstSeen: formatWarehouseDateTime(reopenMs - 120_000),
+					lastSeen: formatWarehouseDateTime(reopenMs - 60_000 - 1_000),
 				}),
 			]
 			yield* TestClock.setTime(reopenMs)
@@ -1103,6 +1349,7 @@ describe("ErrorsService.runTick", () => {
 			const rows = [scanRow()]
 			return Effect.gen(function* () {
 				const errors = yield* ErrorsService
+				const actorService = yield* ErrorActorsService
 				yield* TestClock.setTime(TICK_MS)
 				yield* seedIssue(asIssueId(randomUUID()))
 				yield* errors.runTick()
@@ -1110,7 +1357,7 @@ describe("ErrorsService.runTick", () => {
 
 				// Walk the long way round on purpose: the direct triage -> done path is
 				// covered separately, and this keeps the multi-step route exercised.
-				const actor = yield* errors.ensureUserActor(ORG, USER)
+				const actor = yield* actorService.ensureUserActor(ORG, USER)
 				yield* errors.transitionIssue(ORG, actor.id, issue.id, "in_progress")
 				yield* errors.transitionIssue(ORG, actor.id, issue.id, "in_review")
 				yield* errors.transitionIssue(ORG, actor.id, issue.id, "done")
@@ -1118,17 +1365,23 @@ describe("ErrorsService.runTick", () => {
 				const resolved = (yield* loadIssuesByFingerprint(SCAN_FINGERPRINT))[0]!
 				assert.strictEqual(resolved.workflowState, "done")
 				assert.isNotNull(resolved.resolvedAt)
+				yield* backdateResolution(issue.id, TICK_MS - 3 * 60 * 60 * 1000)
 
 				yield* TestClock.setTime(TICK_MS + 120_000)
 				const second = yield* errors.runTick()
 				assert.strictEqual(second.issuesTouched, 1)
 				assert.strictEqual(second.incidentsOpened, 1)
 
-				// A done issue reopens immediately on re-observation — the errors tick
-				// has no reopen cool-down window.
+				// Reopening lands in `regressed`, not `triage`: an issue that was fixed
+				// and came back is not the same as one nobody has looked at, and
+				// flattening the two is what let the same bug be fixed twice.
 				const reopened = (yield* loadIssuesByFingerprint(SCAN_FINGERPRINT))[0]!
-				assert.strictEqual(reopened.workflowState, "triage")
+				assert.strictEqual(reopened.workflowState, "regressed")
 				assert.isNull(reopened.resolvedAt)
+				assert.strictEqual(reopened.regressionCount, 1)
+				assert.isNotNull(reopened.lastRegressedAt)
+				// The fix itself stays on record so the next reader knows it happened.
+				assert.isNotNull(reopened.lastResolvedAt)
 
 				const events = yield* loadEventsForIssue(issue.id)
 				assert.lengthOf(
@@ -1151,6 +1404,7 @@ describe("ErrorsService.runTick", () => {
 			const rows = [scanRow()]
 			return Effect.gen(function* () {
 				const errors = yield* ErrorsService
+				const actorService = yield* ErrorActorsService
 				yield* TestClock.setTime(TICK_MS)
 				yield* seedIssue(asIssueId(randomUUID()))
 				yield* errors.runTick()
@@ -1160,7 +1414,7 @@ describe("ErrorsService.runTick", () => {
 				// The path auto-resolve uses. It was previously illegal, which is why
 				// nothing could ever retire a quiet alert- or integration-kind issue:
 				// those are created in triage and never advance through review.
-				const actor = yield* errors.ensureUserActor(ORG, USER)
+				const actor = yield* actorService.ensureUserActor(ORG, USER)
 				yield* errors.transitionIssue(ORG, actor.id, issue.id, "done")
 
 				const resolved = (yield* loadIssuesByFingerprint(SCAN_FINGERPRINT))[0]!
@@ -1215,7 +1469,10 @@ describe("ErrorsService.runTick", () => {
 			const errors = yield* ErrorsService
 			yield* TestClock.setTime(TICK_MS)
 			const issueId = asIssueId(randomUUID())
-			yield* seedIssue(issueId, { workflowState: "wontfix", snoozeUntil: new Date(TICK_MS - 1_000) })
+			yield* seedIssue(issueId, {
+				workflowState: "wontfix",
+				snoozeUntil: new Date(TICK_MS - 1_000),
+			})
 
 			const result = yield* errors.runTick()
 			assert.strictEqual(result.issuesReopened, 1)
@@ -1287,14 +1544,20 @@ describe("ErrorsService.runTick", () => {
 			rows.length = 0
 			const resolveTickMs = TICK_MS + 31 * 60_000
 			yield* TestClock.setTime(resolveTickMs)
-			const second = yield* errors.runTick()
-			assert.strictEqual(second.issuesTouched, 0)
-			assert.strictEqual(second.incidentsResolved, 1)
+			const caughtUp = yield* runTicksUntilCaughtUp()
+			assert.strictEqual(caughtUp.issuesTouched, 0)
+			assert.strictEqual(caughtUp.incidentsResolved, 1)
 
 			const incidents = yield* loadIncidentsForIssue(issue.id)
 			assert.lengthOf(incidents, 1)
 			assert.strictEqual(incidents[0]?.status, "resolved")
-			assert.strictEqual(incidents[0]?.resolvedAt?.getTime(), resolveTickMs)
+			// Staleness is measured in event time against the window being applied,
+			// so the flip lands in the first window that closes more than 30 minutes
+			// after the last occurrence — within one window width of that boundary.
+			const lastTriggeredMs = incidents[0]!.lastTriggeredAt.getTime()
+			const resolvedAtMs = incidents[0]!.resolvedAt!.getTime()
+			assert.isAbove(resolvedAtMs, lastTriggeredMs + 30 * 60_000)
+			assert.isAtMost(resolvedAtMs, lastTriggeredMs + 35 * 60_000)
 
 			const states = yield* database.execute((db) =>
 				db.select().from(errorIssueStates).where(eq(errorIssueStates.issueId, issue.id)),
@@ -1308,13 +1571,331 @@ describe("ErrorsService.runTick", () => {
 		}).pipe(Effect.provide(makeErrorsLayer(() => rows)))
 	})
 
+	it.effect("a window over the fingerprint cap is halved and rescanned before it is applied", () => {
+		// One fingerprint per row: a cardinality explosion, which is exactly the
+		// shape a time-based window cap cannot bound.
+		const oversized = Array.from({ length: 20_001 }, (_, i) => scanRow({ fingerprintHash: `9${i}` }))
+		let issueScans = 0
+		// Oversized only on the first scan of the second tick; the rescan of the
+		// halved window comes back empty, so nothing is applied and the assertion
+		// is about the cursor, not about 20k inserted rows.
+		const rowsFor = () => (issueScans === 2 ? oversized : [])
+		return Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const database = yield* Database
+			yield* TestClock.setTime(TICK_MS)
+			yield* seedIssue(asIssueId(randomUUID()))
+			yield* errors.runTick()
+			assert.strictEqual(issueScans, 1)
+
+			// Cursor sits at TICK_MS - 60s; a 6-minute jump offers a 5-minute window.
+			yield* TestClock.setTime(TICK_MS + 6 * 60_000)
+			const result = yield* errors.runTick()
+
+			// Two scans in one tick: the oversized one and the halved rescan.
+			assert.strictEqual(issueScans, 3)
+			assert.strictEqual(result.issuesTouched, 0)
+
+			// 5 minutes halved is 3, so the cursor advances 3 of the 5 available
+			// minutes and the next cron picks up the remainder.
+			const cursor = yield* database.execute((db) =>
+				db.select().from(errorTickStates).where(eq(errorTickStates.orgId, ORG)),
+			)
+			assert.strictEqual(cursor[0]?.processedThrough.getTime(), TICK_MS + 120_000)
+		}).pipe(
+			Effect.provide(
+				makeErrorsLayer(rowsFor, () => {
+					issueScans += 1
+				}),
+			),
+		)
+	})
+
+	it.effect("a window applied without the cursor claim commits nothing", () => {
+		const rows = [scanRow()]
+		return Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const database = yield* Database
+			yield* TestClock.setTime(TICK_MS)
+			yield* seedIssue(asIssueId(randomUUID()))
+			yield* errors.runTick()
+
+			const before = yield* database.execute((db) =>
+				db.select().from(errorTickStates).where(eq(errorTickStates.orgId, ORG)),
+			)
+			const issuesBefore = yield* loadIssuesByFingerprint("77777777777777777777")
+
+			// Stand in for a worker that stalled past the crash-recovery TTL and had
+			// its claim taken over: the window must roll back whole, not half-apply.
+			const outcome = yield* database
+				.execute((db) =>
+					persistErrorTickWindow(db, {
+						orgId: ORG,
+						actorId: asActorId("00000000-0000-4000-8000-0000000000aa"),
+						rows: [
+							{
+								fingerprintHash: "77777777777777777777",
+								serviceName: "checkout-api",
+								exceptionType: "TimeoutError",
+								exceptionMessage: "upstream timed out",
+								errorLabel: "TimeoutError: upstream timed out",
+								topFrame: "",
+								count: 5,
+								firstSeenMs: TICK_MS - 120_000,
+								lastSeenMs: TICK_MS - 61_000,
+							},
+						],
+						policy: {
+							orgId: ORG,
+							enabled: false,
+							destinationIdsJson: [],
+							notifyOnFirstSeen: true,
+							notifyOnRegression: true,
+							notifyOnResolve: false,
+							notifyOnTransitionInReview: false,
+							notifyOnTransitionDone: false,
+							notifyOnClaim: false,
+							minOccurrenceCount: 1,
+							severity: "warning",
+							updatedAt: new Date(TICK_MS),
+							updatedBy: "test",
+						},
+						destinationIds: [],
+						windowEndMs: TICK_MS + 60_000,
+						autoResolveMinutes: 30,
+						claimToken: "a-token-this-worker-no-longer-holds",
+						makeIssueId: () => asIssueId(randomUUID()),
+						makeIncidentId: () => asIncidentId(randomUUID()),
+						makeEventId: () => asEventId(randomUUID()),
+					}),
+				)
+				.pipe(Effect.flip)
+
+			assert.isTrue(isErrorTickClaimLost(outcome))
+
+			// Neither the issue nor the cursor moved.
+			const issuesAfter = yield* loadIssuesByFingerprint("77777777777777777777")
+			assert.deepStrictEqual(issuesAfter, issuesBefore)
+			const after = yield* database.execute((db) =>
+				db.select().from(errorTickStates).where(eq(errorTickStates.orgId, ORG)),
+			)
+			assert.strictEqual(after[0]?.processedThrough.getTime(), before[0]?.processedThrough.getTime())
+		}).pipe(Effect.provide(makeErrorsLayer(() => rows)))
+	})
+
+	it.effect("holds a rare fingerprint as a candidate and promotes it with its earned totals", () => {
+		// One occurrence per tick, under PROMOTION_MIN_OCCURRENCES. Nothing used to
+		// stand between "a fingerprint appeared once" and "a durable row plus a
+		// first-seen notification", which is how one unapplied migration minted
+		// 2,531 issues in three days.
+		const rows = [scanRow({ count: 1, serviceVersions: ["1.0.0"] })]
+		return Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const database = yield* Database
+			const candidates = () =>
+				database.execute((db) =>
+					db
+						.select()
+						.from(errorFingerprintCandidates)
+						.where(eq(errorFingerprintCandidates.fingerprintHash, SCAN_FINGERPRINT)),
+				)
+
+			yield* TestClock.setTime(TICK_MS)
+			// An unrelated issue, purely so the org is discovered as active.
+			yield* seedIssue(asIssueId(randomUUID()))
+			yield* errors.runTick()
+			assert.lengthOf(yield* loadIssuesByFingerprint(SCAN_FINGERPRINT), 0)
+			assert.lengthOf(yield* candidates(), 1)
+
+			// Second tick, second build. The ON CONFLICT path has to accumulate the
+			// count AND union the build set rather than overwrite either.
+			rows[0] = scanRow({ count: 1, serviceVersions: ["1.1.0"] })
+			yield* TestClock.setTime(TICK_MS + 120_000)
+			yield* errors.runTick()
+			assert.lengthOf(yield* loadIssuesByFingerprint(SCAN_FINGERPRINT), 0)
+			const pending = (yield* candidates())[0]!
+			assert.strictEqual(pending.occurrenceCount, 2)
+			assert.sameMembers([...pending.serviceVersionsJson], ["1.0.0", "1.1.0"])
+
+			// Third occurrence clears the threshold.
+			rows[0] = scanRow({ count: 1, serviceVersions: ["1.1.0"] })
+			yield* TestClock.setTime(TICK_MS + 240_000)
+			yield* errors.runTick()
+
+			const promoted = (yield* loadIssuesByFingerprint(SCAN_FINGERPRINT))[0]!
+			// The issue opens with the occurrences it earned across all three ticks,
+			// not just the one in the promoting window.
+			assert.strictEqual(promoted.occurrenceCount, 3)
+			assert.sameMembers([...promoted.seenVersionsJson], ["1.0.0", "1.1.0"])
+			// The candidate row is handed over, not left behind to double-count.
+			assert.lengthOf(yield* candidates(), 0)
+		}).pipe(Effect.provide(makeErrorsLayer(() => rows)))
+	})
+
+	it.effect(
+		"an occurrence from a pre-fix build leaves a done issue alone and opens no incident",
+		() => {
+			const rows = [scanRow()]
+			return Effect.gen(function* () {
+				const errors = yield* ErrorsService
+				const actorService = yield* ErrorActorsService
+				yield* TestClock.setTime(TICK_MS)
+				yield* seedIssue(asIssueId(randomUUID()))
+				yield* errors.runTick()
+				const issue = (yield* loadIssuesByFingerprint(SCAN_FINGERPRINT))[0]!
+
+				const actor = yield* actorService.ensureUserActor(ORG, USER)
+				yield* errors.transitionIssue(ORG, actor.id, issue.id, "done")
+				// Record the build the issue was fixed on, then backdate the fix so the
+				// rollout grace window is not what keeps the issue closed.
+				yield* setResolvedVersions(issue.id, ["1.2.3"])
+				yield* backdateResolution(issue.id, TICK_MS - 3 * 60 * 60 * 1000)
+				const incidentsBefore = yield* loadIncidentsForIssue(issue.id)
+				const openBefore = incidentsBefore.filter((i) => i.status === "open").length
+
+				rows[0] = scanRow({ serviceVersions: ["1.2.3"] })
+				yield* TestClock.setTime(TICK_MS + 120_000)
+				const second = yield* errors.runTick()
+
+				// An old client still running the pre-fix build is not new work: the
+				// issue stays fixed, and — the part that matters — no fresh incident,
+				// notification, or investigation is raised off the back of it.
+				const after = (yield* loadIssuesByFingerprint(SCAN_FINGERPRINT))[0]!
+				assert.strictEqual(after.workflowState, "done")
+				assert.strictEqual(after.regressionCount, 0)
+				assert.strictEqual(second.incidentsOpened, 0)
+				assert.strictEqual(second.issuesTouched, 0)
+
+				const incidentsAfter = yield* loadIncidentsForIssue(issue.id)
+				assert.lengthOf(incidentsAfter, incidentsBefore.length)
+				assert.strictEqual(incidentsAfter.filter((i) => i.status === "open").length, openBefore)
+
+				// The occurrence still happened, so the counters stay truthful.
+				assert.isAbove(after.occurrenceCount, issue.occurrenceCount)
+			}).pipe(Effect.provide(makeErrorsLayer(() => rows)))
+		},
+		15_000,
+	)
+
+	it.effect("one batched window applies new, ongoing, regressed and snoozed fingerprints", () => {
+		const ONGOING = "11111111111111111111"
+		const REGRESSED = "22222222222222222222"
+		const SNOOZED = "33333333333333333333"
+		const FRESH = "44444444444444444444"
+		let rows: ReadonlyArray<Record<string, unknown>> = [scanRow({ fingerprintHash: ONGOING, count: 3 })]
+		return Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const database = yield* Database
+			yield* TestClock.setTime(TICK_MS)
+			// Makes the org discoverable; unrelated to the fingerprints under test.
+			yield* seedIssue(asIssueId(randomUUID()), {
+				fingerprintHash: "fp-anchor",
+			})
+
+			// ONGOING gets a real issue + open incident from a first tick.
+			yield* errors.runTick()
+			const ongoing = (yield* loadIssuesByFingerprint(ONGOING))[0]!
+			const openIncident = (yield* loadIncidentsForIssue(ongoing.id))[0]!
+			assert.strictEqual(openIncident.status, "open")
+
+			const regressedId = asIssueId(randomUUID())
+			yield* seedIssue(regressedId, {
+				fingerprintHash: REGRESSED,
+				workflowState: "done",
+				// Resolved well before this window, so the rollout grace has elapsed.
+				resolvedAt: new Date(TICK_MS - 3 * 60 * 60 * 1000),
+				occurrenceCount: 10,
+				firstSeenAt: new Date(TICK_MS - 600_000),
+				lastSeenAt: new Date(TICK_MS - 600_000),
+			})
+			const snoozedId = asIssueId(randomUUID())
+			yield* seedIssue(snoozedId, {
+				fingerprintHash: SNOOZED,
+				workflowState: "wontfix",
+				snoozeUntil: null,
+				occurrenceCount: 7,
+			})
+			const snoozedBefore = (yield* loadIssuesByFingerprint(SNOOZED))[0]!
+
+			const secondMs = TICK_MS + 60_000
+			const firstSeen = formatWarehouseDateTime(secondMs - 120_000)
+			const lastSeen = formatWarehouseDateTime(secondMs - 61_000)
+			rows = [
+				scanRow({ fingerprintHash: ONGOING, count: 4, firstSeen, lastSeen }),
+				scanRow({
+					fingerprintHash: REGRESSED,
+					count: 2,
+					firstSeen,
+					lastSeen,
+				}),
+				scanRow({ fingerprintHash: SNOOZED, count: 9, firstSeen, lastSeen }),
+				scanRow({ fingerprintHash: FRESH, count: 6, firstSeen, lastSeen }),
+			]
+			yield* TestClock.setTime(secondMs)
+			const result = yield* errors.runTick()
+
+			// The snoozed fingerprint is skipped, the other three are applied.
+			assert.strictEqual(result.issuesTouched, 3)
+
+			// Ongoing: counters accumulate, bounds widen, no second incident.
+			const ongoingAfter = (yield* loadIssuesByFingerprint(ONGOING))[0]!
+			assert.strictEqual(ongoingAfter.occurrenceCount, 3 + 4)
+			assert.strictEqual(ongoingAfter.firstSeenAt.getTime(), ongoing.firstSeenAt.getTime())
+			assert.isAbove(ongoingAfter.lastSeenAt.getTime(), ongoing.lastSeenAt.getTime())
+			const ongoingIncidents = yield* loadIncidentsForIssue(ongoing.id)
+			assert.lengthOf(ongoingIncidents, 1)
+			assert.strictEqual(ongoingIncidents[0]?.occurrenceCount, 3 + 4)
+			assert.strictEqual(ongoingIncidents[0]?.status, "open")
+
+			// Regressed: reopened, resolution cleared, both audit events written.
+			const regressedAfter = (yield* loadIssuesByFingerprint(REGRESSED))[0]!
+			assert.strictEqual(regressedAfter.workflowState, "regressed")
+			assert.isNull(regressedAfter.resolvedAt)
+			assert.strictEqual(regressedAfter.occurrenceCount, 12)
+			const regressedEvents = yield* loadEventsForIssue(regressedId)
+			assert.lengthOf(
+				regressedEvents.filter((e) => e.type === "regression"),
+				1,
+			)
+			assert.lengthOf(
+				regressedEvents.filter((e) => e.type === "state_change" && e.fromState === "done"),
+				1,
+			)
+			const regressedIncidents = yield* loadIncidentsForIssue(regressedId)
+			assert.lengthOf(regressedIncidents, 1)
+			assert.strictEqual(regressedIncidents[0]?.reason, "regression")
+
+			// Snoozed: byte-identical to before the window ran.
+			const snoozedAfter = (yield* loadIssuesByFingerprint(SNOOZED))[0]!
+			assert.deepStrictEqual(snoozedAfter, snoozedBefore)
+			assert.lengthOf(yield* loadIncidentsForIssue(snoozedId), 0)
+
+			// Fresh: created with a first_seen incident.
+			const freshAfter = (yield* loadIssuesByFingerprint(FRESH))[0]!
+			assert.strictEqual(freshAfter.occurrenceCount, 6)
+			assert.strictEqual(freshAfter.workflowState, "triage")
+			const freshEvents = yield* loadEventsForIssue(freshAfter.id)
+			assert.lengthOf(
+				freshEvents.filter((e) => e.type === "created"),
+				1,
+			)
+			const freshIncidents = yield* loadIncidentsForIssue(freshAfter.id)
+			assert.lengthOf(freshIncidents, 1)
+			assert.strictEqual(freshIncidents[0]?.reason, "first_seen")
+
+			assert.strictEqual(result.incidentsOpened, 2)
+			void database
+		}).pipe(Effect.provide(makeErrorsLayer(() => rows)))
+	})
+
 	it.effect("expired leases are released and in_progress issues fall back to todo", () =>
 		Effect.gen(function* () {
 			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
 			yield* TestClock.setTime(TICK_MS)
 			const issueId = asIssueId(randomUUID())
 			yield* seedIssue(issueId)
-			const actor = yield* errors.ensureUserActor(ORG, USER)
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
 			// Default lease is 30 minutes; claiming moves triage -> in_progress.
 			yield* errors.claimIssue(ORG, actor.id, issueId)
 
@@ -1438,6 +2019,309 @@ describe("ErrorsService.runTick", () => {
 				db.select().from(errorIssueStates).where(eq(errorIssueStates.issueId, purgeCandidate)),
 			)
 			assert.lengthOf(purgedStates, 0)
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+})
+
+describe("ErrorsService.claimIssue audit events", () => {
+	for (const scenario of [
+		{ name: "picks up an unowned issue", holder: null, renewed: false },
+		{ name: "renews its own lease", holder: "self", renewed: true },
+		{ name: "takes over another actor's expired lease", holder: "other", renewed: false },
+	] as const) {
+		it.effect(`records one claim when it ${scenario.name}`, () =>
+			Effect.gen(function* () {
+				const errors = yield* ErrorsService
+				const actorService = yield* ErrorActorsService
+				yield* TestClock.setTime(TICK_MS)
+				const actor = yield* actorService.ensureUserActor(ORG, USER)
+				const issueId = asIssueId(randomUUID())
+				const leaseDurationMs = 60_000
+				yield* seedIssue(issueId, {
+					workflowState: "in_progress",
+					leaseHolderActorId:
+						scenario.holder === "self"
+							? actor.id
+							: scenario.holder === "other"
+								? asActorId(randomUUID())
+								: null,
+					leaseExpiresAt:
+						scenario.holder === null
+							? null
+							: msToDate(TICK_MS + (scenario.holder === "self" ? 30_000 : -1)),
+				})
+
+				yield* errors.claimIssue(ORG, actor.id, issueId, leaseDurationMs)
+
+				const events = yield* loadEventsForIssue(issueId)
+				expect(
+					events.filter((event) => event.type === "claim").map((event) => event.payloadJson),
+				).toEqual([
+					{
+						leaseExpiresAt: TICK_MS + leaseDurationMs,
+						leaseDurationMs,
+						renewed: scenario.renewed,
+					},
+				])
+			}).pipe(Effect.provide(makeErrorsLayer())),
+		)
+	}
+})
+
+describe("ErrorsService.proposeFix claims the issue", () => {
+	// The production bug, pinned. `propose_fix` on a `triage` issue failed with
+	// "Illegal transition from 'triage' to 'in_review'" — 18 occurrences in two
+	// days in the internal org — and failed only AFTER writing the fix_proposed
+	// event. Agents land on issues in `triage`; this is the state that matters.
+	it.effect("takes a triage issue all the way to in_review", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const database = yield* Database
+			const issueId = asIssueId(randomUUID())
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			yield* seedIssue(issueId, { workflowState: "triage" })
+
+			const issue = yield* errors.proposeFix(ORG, actor.id, issueId, {
+				patchSummary: "Guard the self-PID case",
+			})
+
+			assert.strictEqual(issue.workflowState, "in_review")
+
+			// The lease is the whole point: an agent that only ever calls
+			// `propose_fix` must still end up holding it.
+			const [row] = yield* database.execute((db) =>
+				db
+					.select({
+						leaseHolderActorId: errorIssues.leaseHolderActorId,
+						leaseExpiresAt: errorIssues.leaseExpiresAt,
+					})
+					.from(errorIssues)
+					.where(eq(errorIssues.id, issueId)),
+			)
+			assert.strictEqual(row?.leaseHolderActorId, actor.id)
+			assert.isNotNull(row?.leaseExpiresAt)
+
+			const events = yield* database.execute((db) =>
+				db
+					.select({ type: errorIssueEvents.type, toState: errorIssueEvents.toState })
+					.from(errorIssueEvents)
+					.where(eq(errorIssueEvents.issueId, issueId)),
+			)
+			const types = events.map((event) => event.type)
+			expect(types).toContain("claim")
+			expect(types).toContain("fix_proposed")
+			// It walked triage → in_progress → in_review, not a single illegal hop.
+			expect(events.filter((e) => e.type === "state_change").map((e) => e.toState)).toEqual([
+				"in_progress",
+				"in_review",
+			])
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+
+	it.effect("works from every state an issue can be worked from", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			for (const from of ["triage", "regressed", "todo", "in_progress", "in_review"] as const) {
+				const issueId = asIssueId(randomUUID())
+				yield* seedIssue(issueId, { workflowState: from })
+				const issue = yield* errors.proposeFix(ORG, actor.id, issueId, {
+					patchSummary: `fix from ${from}`,
+				})
+				assert.strictEqual(issue.workflowState, "in_review", from)
+			}
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+
+	it.effect("refuses a closed issue before writing anything", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const database = yield* Database
+			const issueId = asIssueId(randomUUID())
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			yield* seedIssue(issueId, { workflowState: "cancelled" })
+
+			const exit = yield* errors
+				.proposeFix(ORG, actor.id, issueId, { patchSummary: "too late" })
+				.pipe(Effect.exit)
+			assert.isTrue(exit._tag === "Failure")
+
+			// The regression that made the old ordering dangerous: no half-written
+			// proposal left behind by a rejected call.
+			const events = yield* database.execute((db) =>
+				db
+					.select({ type: errorIssueEvents.type })
+					.from(errorIssueEvents)
+					.where(eq(errorIssueEvents.issueId, issueId)),
+			)
+			expect(events.map((event) => event.type)).not.toContain("fix_proposed")
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+
+	it.effect("refuses a pr_url that is not a pull request, instead of silently dropping it", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const database = yield* Database
+			const issueId = asIssueId(randomUUID())
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			yield* seedIssue(issueId, { workflowState: "triage" })
+
+			const exit = yield* errors
+				.proposeFix(ORG, actor.id, issueId, {
+					patchSummary: "fixed it",
+					prUrl: "https://example.com/not-a-pr",
+				})
+				.pipe(Effect.exit)
+
+			// It used to succeed, swallow the link failure, and report back
+			// "- PR: https://example.com/not-a-pr" — so the agent believed the fix
+			// was attached and would be verified after merge. Nothing was linked and
+			// no verification would ever run.
+			assert.isTrue(exit._tag === "Failure")
+			const events = yield* database.execute((db) =>
+				db
+					.select({ type: errorIssueEvents.type })
+					.from(errorIssueEvents)
+					.where(eq(errorIssueEvents.issueId, issueId)),
+			)
+			expect(events.map((event) => event.type)).not.toContain("fix_proposed")
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+
+	it.effect("fails when another actor holds the lease", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const issueId = asIssueId(randomUUID())
+			const mine = yield* actorService.ensureUserActor(ORG, USER)
+			const now = yield* Clock.currentTimeMillis
+			yield* seedIssue(issueId, {
+				workflowState: "in_progress",
+				leaseHolderActorId: asActorId(randomUUID()),
+				claimedAt: new Date(now),
+				leaseExpiresAt: new Date(now + 600_000),
+			})
+
+			const exit = yield* errors
+				.proposeFix(ORG, mine.id, issueId, { patchSummary: "racing" })
+				.pipe(Effect.exit)
+
+			// The duplicate-work collision the lease exists to catch, finally caught
+			// on the path agents actually take.
+			assert.isTrue(exit._tag === "Failure")
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+})
+
+describe("ErrorsService.transitionIssue claims on in_progress", () => {
+	// The path the internal org's agent actually took: transition to in_progress
+	// by hand, then to in_review. It left every one of 50 live issues unclaimed.
+	it.effect("takes the lease when an actor moves an issue to in_progress", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const database = yield* Database
+			const issueId = asIssueId(randomUUID())
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			yield* seedIssue(issueId, { workflowState: "triage" })
+
+			yield* errors.transitionIssue(ORG, actor.id, issueId, "in_progress")
+
+			const [row] = yield* database.execute((db) =>
+				db
+					.select({ leaseHolderActorId: errorIssues.leaseHolderActorId })
+					.from(errorIssues)
+					.where(eq(errorIssues.id, issueId)),
+			)
+			assert.strictEqual(row?.leaseHolderActorId, actor.id)
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+
+	it.effect("leaves another actor's lease alone rather than refusing the move", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const database = yield* Database
+			const issueId = asIssueId(randomUUID())
+			const holder = asActorId(randomUUID())
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			const now = yield* Clock.currentTimeMillis
+			yield* seedIssue(issueId, {
+				workflowState: "triage",
+				leaseHolderActorId: holder,
+				claimedAt: new Date(now),
+				leaseExpiresAt: new Date(now + 600_000),
+			})
+
+			const issue = yield* errors.transitionIssue(ORG, actor.id, issueId, "in_progress")
+
+			assert.strictEqual(issue.workflowState, "in_progress")
+			const [row] = yield* database.execute((db) =>
+				db
+					.select({ leaseHolderActorId: errorIssues.leaseHolderActorId })
+					.from(errorIssues)
+					.where(eq(errorIssues.id, issueId)),
+			)
+			assert.strictEqual(row?.leaseHolderActorId, holder)
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+})
+
+describe("ErrorsService.transitionIssue lease renewal", () => {
+	// Covers the non-terminal branch of `applyTransition`: an agent moving its own
+	// claimed issue along is working on it, so the lease should follow rather than
+	// lapse underneath it. `heartbeat_error_issue` used to be the only renewal and
+	// was called zero times in production.
+	it.effect("extends the holder's lease on a non-terminal transition", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const database = yield* Database
+			const issueId = asIssueId(randomUUID())
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			const now = yield* Clock.currentTimeMillis
+			yield* seedIssue(issueId, {
+				workflowState: "in_progress",
+				leaseHolderActorId: actor.id,
+				claimedAt: new Date(now),
+				leaseExpiresAt: new Date(now + 60_000),
+			})
+
+			yield* errors.transitionIssue(ORG, actor.id, issueId, "in_review")
+
+			const [row] = yield* database.execute((db) =>
+				db
+					.select({ leaseExpiresAt: errorIssues.leaseExpiresAt })
+					.from(errorIssues)
+					.where(eq(errorIssues.id, issueId)),
+			)
+			assert.isNotNull(row?.leaseExpiresAt)
+			expect(row.leaseExpiresAt.getTime()).toBeGreaterThan(now + 60_000)
+		}).pipe(Effect.provide(makeErrorsLayer())),
+	)
+
+	it.effect("clears the lease when the transition is terminal", () =>
+		Effect.gen(function* () {
+			const errors = yield* ErrorsService
+			const actorService = yield* ErrorActorsService
+			const issueId = asIssueId(randomUUID())
+			const actor = yield* actorService.ensureUserActor(ORG, USER)
+			const now = yield* Clock.currentTimeMillis
+			yield* seedIssue(issueId, {
+				workflowState: "in_progress",
+				leaseHolderActorId: actor.id,
+				claimedAt: new Date(now),
+				leaseExpiresAt: new Date(now + 60_000),
+			})
+
+			const done = yield* errors.transitionIssue(ORG, actor.id, issueId, "done")
+
+			assert.strictEqual(done.workflowState, "done")
+			assert.isNull(done.leaseExpiresAt)
 		}).pipe(Effect.provide(makeErrorsLayer())),
 	)
 })

@@ -1,8 +1,11 @@
 import { afterAll, assert, beforeAll, describe, it } from "@effect/vitest"
 import { ConfigProvider, Effect, Layer, Schema } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
 import { clickHouseVersionAtLeast } from "@maple/domain/clickhouse"
 import { OrgId, RawSqlValidationError, UserId } from "@maple/domain/http"
 import { prepareRawSql } from "@maple/query-engine/runtime"
+import { parseStatement } from "@maple-dev/effect-clickhouse/sql"
+import { EdgeCacheService, MemoryCacheBackendLive } from "@maple/cache"
 import { OrgClickHouseSettingsService } from "@/services/org/OrgClickHouseSettingsService"
 import { TinybirdOrgTokenService } from "@/services/integrations/TinybirdOrgTokenService"
 import type { TenantContext } from "@/services/auth/AuthService"
@@ -172,8 +175,9 @@ const buildLayer = () => {
 		}),
 	)
 	const envLive = Env.layer.pipe(Layer.provide(configLive))
+	const edgeCacheLive = EdgeCacheService.layer.pipe(Layer.provide(MemoryCacheBackendLive))
 	const orgSettingsLive = OrgClickHouseSettingsService.layer.pipe(
-		Layer.provide(Layer.mergeAll(envLive, testDb.layer)),
+		Layer.provide(Layer.mergeAll(envLive, testDb.layer, edgeCacheLive)),
 	)
 	const tokensLive = TinybirdOrgTokenService.layer.pipe(Layer.provide(envLive))
 	return WarehouseQueryService.layer.pipe(
@@ -283,16 +287,27 @@ describe.skipIf(!enabled)("WarehouseQueryService ClickHouse raw-SQL E2E", () => 
 	// (output_format_json_quote_64bit_integers=0), exactly like the Tinybird SDK,
 	// so schema-less queries decode identically on both backends.
 	it("returns 64-bit integers as JSON numbers through the production client", async () => {
-		const client = __testables.createClickHouseSqlClient({
-			kind: "clickhouse",
-			url: clickhouseUrl,
-			username: clickhouseUser,
-			password: clickhousePassword,
-			database,
-		})
+		const client = await Effect.runPromise(
+			__testables
+				.createClickHouseSqlClient({
+					kind: "clickhouse",
+					url: clickhouseUrl,
+					username: clickhouseUser,
+					password: clickhousePassword,
+					database,
+				})
+				.pipe(Effect.provide(FetchHttpClient.layer)),
+		)
+		// A parsed statement, not SQL text: the driver port takes a
+		// `ClickHouseStatement` so the executor owns the terminal clauses. Passing
+		// a bare string reached the client as `query: undefined`, and apps/api's
+		// tsconfig excludes `*.test.ts`, so only this job saw it.
+		//
 		// No trailing FORMAT: the client owns the output format (the executor's
 		// normalizeSqlForClient strips it on the real path).
-		const result = await client.sql("SELECT toUInt64(42) AS wide, count() AS c FROM system.one")
+		const result = await Effect.runPromise(
+			client.sql(parseStatement("SELECT toUInt64(42) AS wide, count() AS c FROM system.one")),
+		)
 		const row = result.data[0]
 		assert.isDefined(row)
 		assert.strictEqual(typeof row!.wide, "number", "UInt64 arrived as a string — the quote pin is gone")

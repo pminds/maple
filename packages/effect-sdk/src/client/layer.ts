@@ -1,6 +1,8 @@
 import type { Duration } from "effect"
 import { Effect, Layer } from "effect"
 import { Otlp } from "effect/unstable/observability"
+import { trySyncOrUndefined } from "../shared/try-sync.js"
+import { browserNavigator } from "./browser-globals.js"
 import { consentHttpClientLayer } from "./consent-http-client.js"
 import { type ClientReplayConfig, startClientSession } from "./replay-loader.js"
 import { withSessionLink } from "./session-link.js"
@@ -29,7 +31,7 @@ export interface MapleClientConfig {
 	 * Post session metadata rows for the standalone session so it appears in
 	 * Maple's Sessions UI (list entry + linked traces, no replay recording).
 	 * Default `true`; no-ops when `@maple-dev/browser` is on the page (it owns
-	 * the session rows), during SSR, or without an ingest key.
+	 * the session rows), without a browser DOM, or without an ingest key.
 	 */
 	readonly emitSessionMeta?: boolean | undefined
 	/**
@@ -80,17 +82,19 @@ export interface MapleClientConfig {
 export const layer = (config: MapleClientConfig) => {
 	const attributes: Record<string, unknown> = {
 		"maple.sdk.type": "client",
-	}
-	const g = globalThis as Record<string, any>
-	if (typeof g["navigator"] !== "undefined") {
-		const nav = g["navigator"]
-		if (nav.userAgent) attributes["browser.user_agent"] = nav.userAgent
+	} satisfies Record<string, unknown>
+	const nav = browserNavigator()
+	if (nav) {
+		// `user_agent.original` is the semconv key; `browser.user_agent` was
+		// deprecated in favour of it.
+		if (nav.userAgent) attributes["user_agent.original"] = nav.userAgent
 		if (nav.language) attributes["browser.language"] = nav.language
 	}
 	if (typeof Intl !== "undefined") {
-		try {
-			attributes["browser.timezone"] = Intl.DateTimeFormat().resolvedOptions().timeZone
-		} catch {}
+		// A locale-stripped build throws from `DateTimeFormat` rather than
+		// reporting an unknown zone.
+		const timezone = trySyncOrUndefined(() => Intl.DateTimeFormat().resolvedOptions().timeZone)
+		if (timezone) attributes["browser.timezone"] = timezone
 	}
 	if (config.environment) {
 		// Dual-emit: legacy key (pre-extracted by Tinybird MVs) + the canonical
@@ -98,7 +102,11 @@ export const layer = (config: MapleClientConfig) => {
 		attributes["deployment.environment"] = config.environment
 		attributes["deployment.environment.name"] = config.environment
 	}
-	if (config.serviceVersion) attributes["deployment.commit_sha"] = config.serviceVersion
+	// `serviceVersion` may be a semver release string, which belongs in
+	// `service.version` but not in `vcs.*` — only a SHA-shaped value is stamped.
+	if (config.serviceVersion && /^[0-9a-f]{7,40}$/i.test(config.serviceVersion)) {
+		attributes["vcs.ref.head.revision"] = config.serviceVersion
+	}
 	if (config.serviceNamespace) attributes["service.namespace"] = config.serviceNamespace
 	if (config.attributes) Object.assign(attributes, config.attributes)
 

@@ -9,7 +9,6 @@ import { Context, Effect, Layer } from "effect"
 import { VcsRepository } from "./VcsRepository"
 import { VcsSyncQueue } from "./VcsSyncQueue"
 
-// ---------------------------------------------------------------------------
 // Vendor-agnostic producer for the periodic (cron) VCS sync. Once every 12h it
 // enqueues one `installation-sync` job (reason "scheduled") per processable
 // installation across every org. All provider work — re-listing repos,
@@ -17,7 +16,6 @@ import { VcsSyncQueue } from "./VcsSyncQueue"
 // the queue consumer (VcsSyncService) behind the VcsProviderClient port, so this
 // scheduler never touches a provider module. It is the backstop for any webhook
 // delivery (push, branch, installation) that was dropped.
-// ---------------------------------------------------------------------------
 
 interface VcsScheduledSyncResult {
 	/** Installations found across all orgs, regardless of status. */
@@ -28,7 +26,7 @@ interface VcsScheduledSyncResult {
 	readonly skipped: number
 }
 
-export interface VcsScheduledSyncServiceShape {
+export interface VcsScheduledSyncServiceApi {
 	readonly runScheduledSync: () => Effect.Effect<
 		VcsScheduledSyncResult,
 		VcsRepoPersistenceError | VcsRepoDecodeError | VcsQueueError
@@ -37,7 +35,7 @@ export interface VcsScheduledSyncServiceShape {
 
 export class VcsScheduledSyncService extends Context.Service<
 	VcsScheduledSyncService,
-	VcsScheduledSyncServiceShape
+	VcsScheduledSyncServiceApi
 >()("@maple/api/services/vcs/VcsScheduledSyncService", {
 	make: Effect.gen(function* () {
 		const repo = yield* VcsRepository
@@ -77,7 +75,7 @@ export class VcsScheduledSyncService extends Context.Service<
 			Effect.tapCause(() => Effect.annotateCurrentSpan({ "vcs.scheduled.outcome": "failed" })),
 		)
 
-		return { runScheduledSync } satisfies VcsScheduledSyncServiceShape
+		return { runScheduledSync } satisfies VcsScheduledSyncServiceApi
 	}),
 }) {
 	static readonly layer = Layer.effect(this, this.make)

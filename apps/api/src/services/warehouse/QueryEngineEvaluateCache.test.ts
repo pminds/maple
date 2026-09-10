@@ -11,13 +11,14 @@ import {
 } from "@maple/query-engine/runtime"
 import { QueryEngineService } from "./QueryEngineService"
 import type { TenantContext } from "@/services/auth/AuthService"
-import { WarehouseQueryService, type WarehouseQueryServiceShape } from "@/services/warehouse/WarehouseQueryService"
+import {
+	WarehouseQueryService,
+	type WarehouseQueryServiceApi,
+} from "@/services/warehouse/WarehouseQueryService"
 import { BucketCacheService } from "@maple/query-engine/caching"
-import { EdgeCacheService, type EdgeCacheServiceShape } from "@maple/cache"
-import { CacheBackendLive } from "@/platform/CacheBackendLive"
+import { EdgeCacheService, type EdgeCacheServiceApi } from "@maple/cache"
 import { traceCacheTtlSeconds } from "@/services/warehouse/trace-detail-cache"
-
-const edgeCacheLive = EdgeCacheService.layer.pipe(Layer.provide(CacheBackendLive))
+import { compiledQueryOf } from "@maple/query-engine/execution"
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
 const asUserId = Schema.decodeUnknownSync(UserId)
@@ -40,19 +41,25 @@ const traceRow = (
 		p99Duration: number
 		errorRate: number
 		apdexScore: number
+		spanCount: number
 		estimatedSpanCount: number
 	}> = {},
 ) => ({
 	bucket: "2026-01-01 00:00:00",
 	groupName: "all",
 	count: 0,
+	// The sample-count columns follow `count` unless overridden — the reducers
+	// read them, so leaving them at 0 makes every fixture "no data".
+	spanCount: overrides.count ?? 0,
+	estimatedSpanCount: overrides.count ?? 0,
 	avgDuration: 0,
 	p50Duration: 0,
 	p95Duration: 0,
 	p99Duration: 0,
 	errorRate: 0,
+	satisfiedCount: 0,
+	toleratingCount: 0,
 	apdexScore: 0,
-	estimatedSpanCount: 0,
 	...overrides,
 })
 
@@ -79,12 +86,12 @@ const evalStub = (rows: ReadonlyArray<Record<string, unknown>>) =>
 	({
 		sqlQuery: () => Effect.succeed(rows as never),
 		rawSqlQuery: () => Effect.die(new Error("rawSqlQuery is not used by evaluate cache tests")),
-		compiledQuery: (_tenant, compiled) => compiled.decodeRows(rows).pipe(Effect.orDie),
+		compiledQuery: (_tenant, compiled) => compiledQueryOf(compiled).decodeRows(rows).pipe(Effect.orDie),
 		compiledQueryWithCapabilities: (_tenant, compile) =>
-			compile(baselineWarehouseCapabilities()).decodeRows(rows).pipe(Effect.orDie),
+			Effect.runSync(compile(baselineWarehouseCapabilities())).decodeRows(rows).pipe(Effect.orDie),
 	}) satisfies Parameters<typeof makeQueryEngineEvaluate>[0]
 
-describe("makeQueryEngineEvaluate (shared bucket-encoding core)", () => {
+describe("makeQueryEngineEvaluate (shared alert-lowering core)", () => {
 	it.effect("reduces per-bucket values with sum and sums sample counts", () =>
 		Effect.gen(function* () {
 			const result = yield* makeQueryEngineEvaluate(evalStub(COUNT_ROWS))(tenant, countRequest("sum"))
@@ -176,8 +183,6 @@ describe("makeQueryEngineEvaluateSeries (per-bucket preview core)", () => {
 	)
 })
 
-// --- Raw SQL is just a fourth source of the same bucket observations. ---
-
 const rawStub = (rows: ReadonlyArray<Record<string, unknown>>) =>
 	({
 		sqlQuery: () => Effect.die(new Error("sqlQuery is not used by raw SQL tests")),
@@ -230,7 +235,7 @@ describe("evaluate with a raw_sql source", () => {
 	it.effect("treats a null value as no data rather than a missing scalar", () =>
 		Effect.gen(function* () {
 			// `hasData === sampleCount > 0` must hold for raw rows exactly as it does
-			// for the spec sources — that invariant is what the bucket codec assumes.
+			// for the spec sources.
 			const raw = yield* makeQueryEngineEvaluate(rawStub([{ value: null }]))(tenant, rawRequest("sum"))
 			assert.deepStrictEqual(raw, [{ groupKey: "all", value: null, sampleCount: 0, hasData: false }])
 		}),
@@ -243,37 +248,21 @@ describe("evaluate with a raw_sql source", () => {
 			assert.deepStrictEqual(raw, spec)
 		}),
 	)
-
-	it.effect("rejects a group key containing NUL, which would collide with the codec", () =>
-		Effect.gen(function* () {
-			const exit = yield* Effect.exit(
-				makeQueryEngineEvaluate(rawStub([{ value: 1, group: "a\u0000v\u0000b" }]))(
-					tenant,
-					rawRequest("sum"),
-				),
-			)
-			assert.equal(exit._tag, "Failure")
-		}),
-	)
 })
 
-// --- Full-service: the bucket-cached evaluate path. ---
-
-const makeConfig = (overrides: Record<string, string> = {}) =>
+const makeConfig = () =>
 	ConfigProvider.layer(
 		ConfigProvider.fromUnknown({
 			QE_BUCKET_CACHE_ENABLED: "true",
 			QE_BUCKET_CACHE_TTL_SECONDS: "86400",
 			QE_BUCKET_CACHE_FLUX_SECONDS: "0",
-			QE_EVAL_BUCKET_CACHE_ENABLED: "true",
-			...overrides,
 		}),
 	)
 
 const makeFullStub = (
 	rows: ReadonlyArray<Record<string, unknown>>,
 	counter: { n: number },
-): WarehouseQueryServiceShape =>
+): WarehouseQueryServiceApi =>
 	({
 		query: () => Effect.die(new Error("query not expected")),
 		sqlQuery: () => {
@@ -282,7 +271,7 @@ const makeFullStub = (
 		},
 		compiledQuery: <Output>(_tenant: unknown, compiled: CompiledQuery<Output>) => {
 			counter.n += 1
-			return compiled.decodeRows(rows).pipe(Effect.orDie)
+			return compiledQueryOf(compiled).decodeRows(rows).pipe(Effect.orDie)
 		},
 		compiledQueryWithCapabilities: <Output>(
 			_tenant: unknown,
@@ -291,70 +280,26 @@ const makeFullStub = (
 			) => CompiledQuery<Output>,
 		) => {
 			counter.n += 1
-			return compile(baselineWarehouseCapabilities()).decodeRows(rows).pipe(Effect.orDie)
+			return Effect.runSync(compile(baselineWarehouseCapabilities()))
+				.decodeRows(rows)
+				.pipe(Effect.orDie)
 		},
 		compiledQueryFirst: <Output>(_tenant: unknown, compiled: CompiledQuery<Output>) => {
 			counter.n += 1
-			return compiled.decodeFirstRow(rows).pipe(Effect.orDie)
+			return compiledQueryOf(compiled).decodeFirstRow(rows).pipe(Effect.orDie)
 		},
+		// Deliberately does not touch `counter`: warming resolves route config, it
+		// does not issue a warehouse query, and these tests assert query counts.
+		warmRoute: () => Effect.void,
 		ingest: () => Effect.void,
 		sql: () => Promise.resolve({ data: [] }),
-	}) as unknown as WarehouseQueryServiceShape
-
-const makeQueryEngineLayer = (stub: WarehouseQueryServiceShape) =>
-	QueryEngineService.layer.pipe(
-		Layer.provide(Layer.succeed(WarehouseQueryService, stub)),
-		Layer.provide(edgeCacheLive),
-		Layer.provide(BucketCacheService.layer.pipe(Layer.provide(edgeCacheLive))),
-		Layer.provide(makeConfig()),
-	)
-
-describe("QueryEngineService.evaluate via bucket cache", () => {
-	it.live("matches the direct path and serves an identical repeat from cache", () => {
-		const counter = { n: 0 }
-		const layer = makeQueryEngineLayer(makeFullStub(COUNT_ROWS, counter))
-
-		return Effect.gen(function* () {
-			const qe = yield* QueryEngineService
-			const first = yield* qe.evaluate(tenant, countRequest("sum"))
-			const second = yield* qe.evaluate(tenant, countRequest("sum"))
-
-			// Parity: cached repeat equals the first (computed) result.
-			assert.deepStrictEqual(second, first)
-			// The second evaluation is a pure bucket-cache hit — no new SQL.
-			assert.strictEqual(counter.n, 1)
-			// Parity with the uncached direct path.
-			const direct = yield* makeQueryEngineEvaluate(evalStub(COUNT_ROWS))(tenant, countRequest("sum"))
-			assert.deepStrictEqual(first, direct)
-			assert.deepStrictEqual(first, [{ groupKey: "all", value: 10, sampleCount: 10, hasData: true }])
-		}).pipe(Effect.provide(layer))
-	})
-
-	it.live("falls back to the blob path and never caches when the kill switch is off", () => {
-		const counter = { n: 0 }
-		const layer = QueryEngineService.layer.pipe(
-			Layer.provide(Layer.succeed(WarehouseQueryService, makeFullStub(COUNT_ROWS, counter))),
-			Layer.provide(edgeCacheLive),
-			Layer.provide(BucketCacheService.layer.pipe(Layer.provide(edgeCacheLive))),
-			Layer.provide(makeConfig({ QE_EVAL_BUCKET_CACHE_ENABLED: "false" })),
-		)
-
-		return Effect.gen(function* () {
-			const qe = yield* QueryEngineService
-			const result = yield* qe.evaluate(tenant, countRequest("sum"))
-			// Same answer as the bucket path.
-			assert.deepStrictEqual(result, [{ groupKey: "all", value: 10, sampleCount: 10, hasData: true }])
-		}).pipe(Effect.provide(layer))
-	})
-})
-
-// --- cachedDirect: per-route TTL plumbing. ---
+	}) as WarehouseQueryServiceApi
 
 // Records cache options so we can assert both TTL plumbing and the matching
 // time-snap window used by each direct route key.
 const makeRecordingEdge = (
 	calls: Array<{ bucket: string; key: string; ttlSeconds: number }>,
-): EdgeCacheServiceShape => ({
+): EdgeCacheServiceApi => ({
 	getOrCompute: (options, compute) => {
 		calls.push({
 			bucket: options.bucket,
@@ -501,8 +446,6 @@ describe("QueryEngineService.cachedDirect TTL", () => {
 		}).pipe(Effect.provide(layer))
 	})
 })
-
-// --- trace-detail cache TTL: age-conditional tiers. ---
 
 describe("traceCacheTtlSeconds", () => {
 	const nowMs = Date.parse("2026-07-17T12:00:00Z")

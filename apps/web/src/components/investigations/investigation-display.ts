@@ -4,7 +4,7 @@ import { toEpochMs } from "@maple/ui/lib/time-format"
 import { SEVERITY_ORDER, severityRank } from "@/components/errors/severity-badge"
 import { CONFIDENCE_RANK } from "./confidence-meter"
 
-export type InvestigationKindKey = "alert" | "error" | "anomaly" | "question"
+export type InvestigationKindKey = "alert" | "error" | "anomaly" | "question" | "verification"
 
 /**
  * The exact title the API writes when the seed context carried no name of its
@@ -21,7 +21,11 @@ const trimmed = (value: string | null | undefined): string | null => {
 }
 
 export const investigationKindKey = (subject: V2Investigation["subject"]): InvestigationKindKey =>
-	subject.type === "freeform" ? "question" : subject.incident_kind
+	subject.type === "freeform"
+		? "question"
+		: subject.type === "fix_verification"
+			? "verification"
+			: subject.incident_kind
 
 /**
  * The most specific human sentence available. A snapshot title of
@@ -50,6 +54,8 @@ export function investigationScope(investigation: V2Investigation): string | nul
 export type InvestigationFinding =
 	| { readonly kind: "pending"; readonly text: string }
 	| { readonly kind: "cause"; readonly text: string }
+	/** Nothing established, but something ruled out. Not a failure. */
+	| { readonly kind: "partial"; readonly text: string }
 	| { readonly kind: "failure"; readonly text: string }
 	| { readonly kind: "none" }
 
@@ -61,6 +67,15 @@ export type InvestigationFinding =
 export function investigationFinding(investigation: V2Investigation): InvestigationFinding {
 	if (investigation.status === "investigating") {
 		return { kind: "pending", text: "Gathering evidence…" }
+	}
+	// Before `failed`, and a distinct kind rather than a `cause` with a caveat.
+	// The hub is scanned, not read: a partial that renders identically to a
+	// confirmed cause is worse than one that renders as a failure, because it
+	// makes an unconfirmed lead look like an answer.
+	if (investigation.status === "inconclusive") {
+		const report = investigation.report
+		const text = trimmed(report?.suspectedCause) ?? trimmed(report?.summary)
+		return { kind: "partial", text: text ?? "No cause established — see what was ruled out." }
 	}
 	if (investigation.status === "failed") {
 		return {
@@ -145,4 +160,44 @@ export function sortInvestigations(
 		}
 		return updatedWeight(b) - updatedWeight(a) || a.id.localeCompare(b.id)
 	})
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Durations
+ * -----------------------------------------------------------------------------------------------*/
+
+export interface Elapsed {
+	value: string
+	unit: string
+}
+
+const pad = (n: number) => String(n).padStart(2, "0")
+
+/**
+ * A duration split into the number and its unit, so the number can carry the
+ * display weight and the unit ride its baseline.
+ *
+ * Deliberately not `formatDuration`, which is tuned for span durations: it gives
+ * seconds two decimals ("7.04s") and minutes one ("1.4min"). At this display
+ * weight the decimals read as false precision, and on the live Elapsed stat a
+ * tenth-of-a-minute resolution sits frozen for six seconds and then lurches.
+ * Clock notation past a minute keeps every second visible.
+ *
+ * It lives here rather than in `verdict-card` because the provenance canvas
+ * stamps the same elapsed time on its investigation node, and having one
+ * component import the other for it built an import cycle that threw at runtime.
+ */
+export const splitDuration = (ms: number): Elapsed => {
+	// A pass that died before it started is a real case (`workflow_binding_unavailable`
+	// fails in microseconds), and "0 µs" reads as a broken clock rather than an
+	// instant failure. Sub-second resolution buys nothing at this display size.
+	if (ms < 1000) return { value: "<1", unit: "s" }
+	const totalSeconds = Math.floor(ms / 1000)
+	if (totalSeconds < 60) return { value: String(totalSeconds), unit: "s" }
+	const seconds = totalSeconds % 60
+	const totalMinutes = Math.floor(totalSeconds / 60)
+	if (totalMinutes < 60) return { value: `${totalMinutes}:${pad(seconds)}`, unit: "min" }
+	const minutes = totalMinutes % 60
+	const hours = Math.floor(totalMinutes / 60)
+	return { value: `${hours}:${pad(minutes)}:${pad(seconds)}`, unit: "h" }
 }

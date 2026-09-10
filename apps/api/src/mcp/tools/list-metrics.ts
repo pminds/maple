@@ -1,5 +1,5 @@
-import { optionalNumberParam, optionalStringParam, type McpToolRegistrar } from "./types"
-import { queryWarehouse, resolveTenant } from "@/mcp/lib/query-warehouse"
+import { optionalNumberParam, optionalStringParam, optionalTimeParam, type McpToolRegistrar } from "./types"
+import { queryWarehouse, CurrentMcpTenant } from "@/mcp/lib/query-warehouse"
 import { resolveTimeRange, rangeExceededResult, MCP_DISCOVERY_MAX_HOURS } from "@/mcp/lib/time"
 import { clampLimit, clampOffset } from "@/mcp/lib/limits"
 import { formatNumber, formatTable } from "@/mcp/lib/format"
@@ -12,8 +12,8 @@ export function registerListMetricsTool(server: McpToolRegistrar) {
 		"list_metrics",
 		"Discover available custom metrics with their types, units, monotonicity, and data volume. Supports pagination — check hasMore in the response. Use query_data source=metrics with a discovered metric_name and metric_type. For monotonic sum metrics, prefer metric=rate or metric=increase instead of raw sum.",
 		Schema.Struct({
-			start_time: optionalStringParam("Start of time range (YYYY-MM-DD HH:mm:ss)"),
-			end_time: optionalStringParam("End of time range (YYYY-MM-DD HH:mm:ss)"),
+			start_time: optionalTimeParam("Start of time range (YYYY-MM-DD HH:mm:ss)"),
+			end_time: optionalTimeParam("End of time range (YYYY-MM-DD HH:mm:ss)"),
 			service: optionalStringParam("Filter by service name"),
 			search: optionalStringParam("Search in metric name"),
 			metric_type: optionalStringParam("Filter by type: sum, gauge, histogram, exponential_histogram"),
@@ -36,7 +36,7 @@ export function registerListMetricsTool(server: McpToolRegistrar) {
 			if (range.exceeded) return rangeExceededResult(range, "list_metrics")
 			const lim = clampLimit(limit, { defaultValue: 50, max: 500 })
 			const off = clampOffset(offset, { max: 10_000 })
-			const tenant = yield* resolveTenant
+			const tenant = yield* CurrentMcpTenant
 			yield* Effect.annotateCurrentSpan({
 				orgId: tenant.orgId,
 				service: service ?? "all",

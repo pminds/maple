@@ -20,6 +20,8 @@ import { openGlobalChat } from "@/components/chat/global-chat-sheet"
 import { ConnectButton } from "@/components/header/connect-button"
 import { QuotaBanner } from "@/components/billing/quota-banner"
 import { PaymentFailedBanner } from "@/components/billing/payment-failed-banner"
+import { SubscriptionEndedBanner } from "@/components/billing/subscription-ended-banner"
+import { AppUpdateBanner } from "@/components/layout/app-update-banner"
 import { Link, defaultParseSearch } from "@tanstack/react-router"
 import { isClerkAuthEnabled } from "@/lib/services/common/auth-mode"
 
@@ -155,10 +157,15 @@ function Breadcrumbs({ items, children }: { items: BreadcrumbEntry[]; children?:
 	)
 }
 
-/** Billing banners + the horizontal `Filters | Content | RightPanel` row. */
+/** App-shell banners + the horizontal `Filters | Content | RightPanel` row. */
 function Body({ children }: { children: React.ReactNode }) {
 	return (
 		<>
+			{/* Ungated, unlike the billing banners below: a stale bundle is stale
+			    whether or not the deployment uses Clerk, and self-hosted installs
+			    have the same long-lived-tab problem. */}
+			<AppUpdateBanner />
+			{isClerkAuthEnabled && <SubscriptionEndedBanner />}
 			{isClerkAuthEnabled && <PaymentFailedBanner />}
 			{isClerkAuthEnabled && <QuotaBanner />}
 			<PageLayout.Body>{children}</PageLayout.Body>
@@ -167,8 +174,9 @@ function Body({ children }: { children: React.ReactNode }) {
 }
 
 /** Filter rail, flush left of the content and full height. A sheet below `lg`. */
-function Filters({ children }: { children: React.ReactNode }) {
-	return <PageLayout.FilterSidebar>{children}</PageLayout.FilterSidebar>
+/** `width` is a Tailwind class, forwarded for rails whose content needs more than `w-64`. */
+function Filters({ children, width }: { children: React.ReactNode; width?: string }) {
+	return <PageLayout.FilterSidebar width={width}>{children}</PageLayout.FilterSidebar>
 }
 
 /** The main column: `Sticky` (optional) above `Scroll`. */
@@ -208,8 +216,8 @@ function Header({
 }
 
 /** The scrolling page body. */
-function Scroll({ children }: { children: React.ReactNode }) {
-	return <PageLayout.ScrollArea>{children}</PageLayout.ScrollArea>
+function Scroll({ children, className }: { children: React.ReactNode; className?: string }) {
+	return <PageLayout.ScrollArea className={className}>{children}</PageLayout.ScrollArea>
 }
 
 /**
@@ -227,13 +235,17 @@ function RightPanel({
 	title,
 	/** Widen past the `w-72` default where the rail carries the page's substance. */
 	width,
+	open,
+	onOpenChange,
 }: {
 	children: React.ReactNode
 	title?: string
 	width?: string
+	open?: boolean
+	onOpenChange?: (open: boolean) => void
 }) {
 	return (
-		<PageLayout.RightSidebar title={title} width={width}>
+		<PageLayout.RightSidebar title={title} width={width} open={open} onOpenChange={onOpenChange}>
 			{children}
 		</PageLayout.RightSidebar>
 	)

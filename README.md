@@ -13,12 +13,12 @@ Maple is now organized as a monorepo with a SPA frontend and an Effect-based bac
 ## Workspace Layout
 
 - `apps/web`: TanStack Router SPA (Vite)
-- `apps/api`: Effect HTTP API (Tinybird proxy + MCP server code + AI chat/triage on `@maple/llm`)
+- `apps/api`: Effect HTTP API (Tinybird proxy + MCP server code + AI chat/triage on `@opencode-ai/ai`)
 - `apps/ingest`: OTLP ingest gateway (key auth + org enrichment + collector forwarding)
 - `apps/landing`: Astro landing site
 - `apps/alerting`: Alert evaluation worker
 - `apps/cli`: CLI utilities
-- `apps/mobile`: Expo mobile app
+- `apps/ios`: Native SwiftUI app (Clerk + v2 API)
 - `packages/domain`: Shared Effect HTTP contracts and domain types
 - `packages/query-engine`: Shared query and observability logic
 - `packages/ui`: Shared UI primitives and components
@@ -48,28 +48,26 @@ update, and uninstall details.
 
 ## Develop
 
-Run every available `dev` task in the monorepo:
+Run the whole stack — the Cloudflare Workers under alchemy's local runtime,
+the rest as child processes of the same `alchemy dev` — behind
+`https://<app>.localhost`:
 
 ```bash
-bun run dev
+bun dev
 ```
 
-Run individual apps from the repo root with workspace filters:
+Or just some of it (`api`, `alerting`, `electric-sync`, `web`, `landing`,
+`ingest`, `local-ui`, `scraper`):
+
+```bash
+bun dev api web
+```
+
+A single non-Worker app can also run on its raw port, outside the stack:
 
 ```bash
 bun --filter=@maple/web dev
-bun --filter=@maple/api dev
-bun --filter=@maple/ingest dev
-bun --filter=@maple/landing dev
 ```
-
-There is also a dedicated root helper for alerting:
-
-```bash
-bun run dev:alerting
-```
-
-Turbo dev runs in TUI mode so interactive servers stay attached.
 
 ## Validate
 
@@ -97,18 +95,18 @@ Services:
 ## Cloudflare Deploy (Alchemy)
 
 Deployments run on **Alchemy v2** (Effect-based): the root `alchemy.run.ts` exports a
-single `Alchemy.Stack("maple", …)` whose program composes per-app factories:
+single `Alchemy.Stack("maple", …)` whose program yields one module per app:
 
-- `apps/api/alchemy.run.ts` — Hyperdrive (PlanetScale Postgres) `MAPLE_DB`, KV, queue,
-  workflows, the `ChatSession` Durable Object + api Worker with all env bindings
-- `apps/alerting/alchemy.run.ts` — cron-driven alerting Worker (cross-script workflow ref)
-- `apps/electric-sync/alchemy.run.ts` — ElectricSQL shape-proxy Worker
-- `apps/web/alchemy.run.ts` / `apps/landing/alchemy.run.ts` / `apps/local-ui/alchemy.run.ts`
+- `apps/api/src/worker.ts` — the api Worker: Hyperdrive (PlanetScale Postgres) `MAPLE_DB`,
+  KV, queues, the two Workflows and the `ChatSession` Durable Object, all yielded from its init
+- `apps/alerting/src/worker.ts` — cron-driven alerting Worker (cross-script workflow ref)
+- `apps/electric-sync/src/worker.ts` — ElectricSQL shape-proxy Worker
+- `apps/web/src/worker.ts` / `apps/landing/src/worker.ts` / `apps/local-ui/src/worker.ts`
   — static builds via `Command.Build` + asset-serving Workers
 
 Stage grammar is `prd` / `stg` / `pr-<number>` / dev names, resolved via
 `@maple/infra/cloudflare` (`parseMapleStage`, `resolveMapleDomains`, `resolveWorkerName`,
-`resolveHyperdriveName`, `resolveHyperdriveRefId`, `resolveDatabaseMode`). stg/prd bind the
+`resolveHyperdriveRefId`, `resolveDatabaseMode`). stg/prd bind the
 dashboard-managed Hyperdrive by config ID (`resolveHyperdriveRefId`) — origin credentials
 never touch a deploy. `MAPLE_PG_URL` is only needed for dev stages, whose Hyperdrive alchemy
 manages itself. PR previews bind **no database at all** (`resolveDatabaseMode` → `"none"`):
@@ -181,33 +179,36 @@ The web app expects `VITE_API_BASE_URL` to point to the API (defaults to `http:/
 For ingest + key auth, set these at minimum in your root `.env` when running the ingest gateway:
 
 - `MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY`
-- `MAPLE_INGEST_KEY_ENCRYPTION_KEY` (required for D1-backed ingest deployments)
+- `MAPLE_INGEST_KEY_ENCRYPTION_KEY` (required when ingest reads encrypted credentials from Postgres)
 - `INGEST_PORT`
 - `INGEST_FORWARD_OTLP_ENDPOINT`
+- `MAPLE_INTERNAL_ORG_ID` (the org the gateway's own telemetry is filed under; no default)
 - `INGEST_FORWARD_TIMEOUT_MS`
 - `INGEST_MAX_REQUEST_BODY_BYTES`
 - `INGEST_REQUIRE_TLS`
 - `INGEST_REPLAY_MAX_SESSION_BYTES` (optional; ceiling on the decompressed rrweb
   payload one replay session may record, default 1 GiB, `0` disables)
 
-## Persistence (SQLite / Turso)
+## Persistence (PostgreSQL / PGlite)
 
-Maple now persists dashboards in SQLite via libSQL:
+Maple persists application state in PostgreSQL:
 
-- Default local mode: no Turso CLI needed. If `MAPLE_DB_URL` is unset, Maple uses `apps/api/.data/maple.db`.
-- Turso cloud mode: set `MAPLE_DB_URL` to your Turso/libSQL URL and `MAPLE_DB_AUTH_TOKEN` to your token.
-- Self-hosting: persist the `apps/api/.data` directory as a volume so dashboard state survives container/restart cycles.
+- Production and staging use PlanetScale Postgres through Cloudflare Hyperdrive.
+- Wrangler development uses the Docker Postgres started by `bun db:up`.
+- Non-Worker local entrypoints use embedded PGlite under `apps/api/.data/pglite`; set
+  `MAPLE_DB_URL=memory://` for an ephemeral database.
 
 Migration commands:
 
 ```bash
-bun --filter=@maple/api db:migrate
-bun --filter=@maple/db db:generate
-bun --filter=@maple/db db:push
-bun --filter=@maple/db db:studio
+bun db:up
+bun db:migrate:local
+bun run --cwd packages/db db:generate
+bun run --cwd packages/db db:studio
 ```
 
-When running the API (`bun --filter=@maple/api dev` or `bun --filter=@maple/api start`), migrations are applied automatically before boot.
+CI migrates deployed PlanetScale branches over their direct port before Alchemy deploys the
+Workers. See [`docs/persistence.md`](docs/persistence.md) for the full workflow.
 
 ## Ingest Keys
 
@@ -233,6 +234,10 @@ Maple supports exactly two auth modes via `MAPLE_AUTH_MODE`:
     - Set `MAPLE_ROOT_PASSWORD` (required)
     - Set `MAPLE_DEFAULT_ORG_ID` (defaults to `default`)
     - Users must sign in at `/sign-in` with the root password before accessing the dashboard/API.
+    - Session tokens are valid for 12 hours and renew silently against
+      `POST /api/auth/session/refresh`, up to an absolute cap of 7 days from sign-in. Past the cap
+      the root password is required again. Rotating `MAPLE_ROOT_PASSWORD` still invalidates every
+      token immediately — it is the HMAC key, and the only way to revoke a session early.
 
 Start apps:
 
@@ -249,8 +254,10 @@ Validate behavior:
     - Signed-in users with an active org can query the API with bearer auth
 - Self-hosted mode:
     - Signed-out users are redirected to `/sign-in`
-    - `MAPLE_ROOT_PASSWORD` login issues a bearer session token
+    - `MAPLE_ROOT_PASSWORD` login issues a bearer session token with a bounded lifetime
     - Protected API routes reject requests without a valid bearer session token
+    - Expired tokens are rejected; a still-valid one can be traded for a fresh one at
+      `POST /api/auth/session/refresh` until the session's absolute deadline
 
 Breaking change:
 

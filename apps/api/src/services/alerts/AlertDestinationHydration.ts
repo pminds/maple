@@ -51,6 +51,11 @@ const DestinationSecretConfigSchema = Schema.Union([
 		webhookUrl: Schema.String,
 	}),
 	Schema.Struct({
+		type: Schema.Literal("telegram"),
+		botToken: Schema.String,
+		chatId: Schema.String,
+	}),
+	Schema.Struct({
 		type: Schema.Literal("email"),
 		// Snapshot of the selected workspace members, resolved from the auth
 		// provider at save time.
@@ -86,17 +91,17 @@ const parseSecretConfig = <E>(
 	json: string,
 	onError: (cause: unknown) => E,
 ): Effect.Effect<DestinationSecretConfig, E> =>
-	Schema.decodeUnknownEffect(SecretConfigFromJson)(json).pipe(Effect.mapError(onError))
+	Schema.decodeEffect(SecretConfigFromJson)(json).pipe(Effect.mapError(onError))
 
-export const hydrateDestinationRow = <E>(
+export const hydrateDestinationRow = <PublicConfigError, DecryptionError, SecretConfigError>(
 	row: AlertDestinationRow,
 	encryptionKey: Buffer,
 	errors: {
-		onPublicConfigInvalid: (cause: unknown) => E
-		onDecryptFailure: () => E
-		onSecretConfigInvalid: (cause: unknown) => E
+		onPublicConfigInvalid: (cause: unknown) => PublicConfigError
+		onDecryptFailure: () => DecryptionError
+		onSecretConfigInvalid: (cause: unknown) => SecretConfigError
 	},
-): Effect.Effect<HydratedDestination, E> =>
+): Effect.Effect<HydratedDestination, PublicConfigError | DecryptionError | SecretConfigError> =>
 	Effect.gen(function* () {
 		const publicConfig = yield* parsePublicConfig(row, errors.onPublicConfigInvalid)
 		const secretJson = yield* decryptAes256Gcm(

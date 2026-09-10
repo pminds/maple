@@ -1,19 +1,22 @@
+// BOUNDARY: Test doubles preserve opaque values so the consuming boundary can be exercised.
 import { assert } from "@effect/vitest"
 import { createHmac, generateKeyPairSync } from "node:crypto"
 import { OrgId, UserId, type VcsSyncJob } from "@maple/domain/http"
 import { Cause, ConfigProvider, type Context, Effect, Exit, Layer, Option, Schema } from "effect"
 import type { TestDb } from "@/platform/test-pglite"
 import { Env } from "@/platform/Env"
-import { GithubHttp, type GithubHttpShape } from "@/services/integrations/vcs/vendor/github/GithubHttp"
+import { GithubHttp, type GithubHttpApi } from "@/services/integrations/vcs/vendor/github/GithubHttp"
 import { VcsRepository } from "@/services/integrations/vcs/VcsRepository"
-import { clampQueueDelaySeconds, VcsSyncQueue, type VcsSyncQueueShape } from "@/services/integrations/vcs/VcsSyncQueue"
+import {
+	clampQueueDelaySeconds,
+	VcsSyncQueue,
+	type VcsSyncQueueApi,
+} from "@/services/integrations/vcs/VcsSyncQueue"
 
-// ---------------------------------------------------------------------------
 // Shared test harness for the GitHub / VCS integration. The id-resolver
 // helpers, config/env layers, scripted-HTTP seam, recording queue, and
 // assertion utilities live here so the per-service test files don't each
 // re-implement them.
-// ---------------------------------------------------------------------------
 
 export const asOrgId = Schema.decodeUnknownSync(OrgId)
 export const asUserId = Schema.decodeUnknownSync(UserId)
@@ -82,7 +85,7 @@ export const scriptedHttp = (responders: ReadonlyArray<() => Response>) => {
 			i += 1
 			return make()
 		},
-	} satisfies GithubHttpShape)
+	} satisfies GithubHttpApi)
 }
 
 // A recording VcsSyncQueue: captures every enqueued job (and per-send delay).
@@ -95,7 +98,7 @@ export const scriptedHttp = (responders: ReadonlyArray<() => Response>) => {
 export const recordingQueue = (
 	sent: Array<VcsSyncJob>,
 	opts?: { readonly sentDelays?: Array<number | undefined>; readonly failBatch?: () => unknown },
-): VcsSyncQueueShape => ({
+): VcsSyncQueueApi => ({
 	send: (job, options) =>
 		Effect.sync(() => {
 			sent.push(job)
@@ -126,11 +129,9 @@ export const expectSome = <A>(o: Option.Option<A>): A => {
 	return o.value
 }
 
-// ---------------------------------------------------------------------------
 // The repo service speaks our internal ids; these resolve a row by its GitHub
 // external id (the way the sync engine seeds it) and hand the id-based methods
 // the entity, so tests can keep seeding/addressing by external id.
-// ---------------------------------------------------------------------------
 
 // The resolved service shape (the methods), distinct from the `VcsRepository`
 // tag — `Context.Service.Shape` is how you name a class-service's instance type.

@@ -1,7 +1,9 @@
+// BOUNDARY: This module owns unparsed external values and narrows them before domain use.
 import {
 	type BranchEventJob,
 	type InstallationSyncJob,
 	isInstallationProcessable,
+	type PullRequestEventJob,
 	type PushJob,
 	type SyncCommitsJob,
 	type SyncBranchesJob,
@@ -13,21 +15,22 @@ import {
 	type VcsRepo,
 	type VcsRepoDecodeError,
 	type VcsRepoPersistenceError,
+	type VcsRepositoryBlockedError,
 	type VcsRepoUnavailableError,
 	VcsSyncJob,
 } from "@maple/domain/http"
-import { Cause, Clock, Effect, Context, Layer, Option, Schema, Match } from "effect"
+import { Clock, Effect, Context, Layer, Option, Schema, Match } from "effect"
 import type { VcsProviderClient } from "./VcsProviderClient"
+import { PullRequestEventSink } from "./PullRequestEventSink"
 import { VcsProviderRegistry } from "./VcsProviderRegistry"
 import { VcsRepository } from "./VcsRepository"
 import { VcsSyncQueue } from "./VcsSyncQueue"
+import { summarizeCause } from "@/platform/describe-cause"
 
-// ---------------------------------------------------------------------------
 // Vendor-agnostic sync orchestrator. Decodes a queue message, resolves the
 // owning installation (→ orgId + provider auth), then dispatches by job kind:
 // fetch via the provider port → persist via the repo. The provider port is the
 // only provider-specific surface it touches.
-// ---------------------------------------------------------------------------
 
 // The historical window every branch commit-sync walks — each tracked branch is
 // backfilled over the same span. Exported because the dashboard's "track a branch"
@@ -54,20 +57,21 @@ type SyncError =
 	| VcsQueueError
 	| UnknownVcsProviderError
 
-export interface VcsSyncServiceShape {
+export interface VcsSyncServiceApi {
 	readonly processMessage: (raw: unknown) => Effect.Effect<void, SyncError>
 	// Last-resort terminal write for a message that has exhausted its queue retries.
 	// Total (never fails) so the consumer can call it as a final step without risk.
 	readonly recordExhaustedFailure: (raw: unknown) => Effect.Effect<void>
 }
 
-export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServiceShape>()(
+export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServiceApi>()(
 	"@maple/api/services/vcs/VcsSyncService",
 	{
 		make: Effect.gen(function* () {
 			const repo = yield* VcsRepository
 			const registry = yield* VcsProviderRegistry
 			const queue = yield* VcsSyncQueue
+			const sink = yield* PullRequestEventSink
 
 			// The repo's single tracked branch, with the default-branch fallback for a
 			// row whose `trackedBranch` was never set (legacy) — the one place the
@@ -111,6 +115,40 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 				)
 			})
 
+			/**
+			 * A repository the provider permanently refuses (DMCA/legal block). TERMINAL:
+			 * the job drains here so the queue never redelivers it — a single blocked repo
+			 * was costing ~12 retries per scheduled run, every 12h, indefinitely. The block
+			 * is recorded on the repo row (`sync_status = "error"` + `last_sync_error`), the
+			 * span stays Ok with `error.type`, and the operator sees a Warn log.
+			 */
+			const drainBlockedRepository = (
+				installation: VcsInstallation,
+				repository: VcsRepo,
+				error: VcsRepositoryBlockedError,
+				scope: "commits" | "branches",
+			) =>
+				Effect.annotateCurrentSpan({
+					[`vcs.${scope}.outcome`]: "skipped",
+					[`vcs.${scope}.reason`]: "repository_blocked",
+					"error.type": "vcs_repository_blocked",
+					...(error.status !== undefined
+						? { "http.response.status_code": error.status }
+						: undefined),
+				}).pipe(
+					Effect.andThen(repo.markRepoSyncError(repository.id, error.message)),
+					Effect.andThen(
+						Effect.logWarning("[VCS] Repository blocked by provider — sync disabled").pipe(
+							Effect.annotateLogs({
+								provider: installation.provider,
+								externalRepoId: repository.externalRepoId,
+								status: error.status,
+								"error.message": error.message,
+							}),
+						),
+					),
+				)
+
 			const syncCommits = (
 				provider: VcsProviderClient,
 				installation: VcsInstallation,
@@ -118,6 +156,28 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 				job: SyncCommitsJob,
 			) =>
 				Effect.gen(function* () {
+					// A tracked-branch change wipes the repo's commits and enqueues a fresh
+					// backfill, but old-branch jobs survive in the queue (a rate-limited
+					// continuation can sit delayed for hours). Drop them — and re-check
+					// after the provider fetch below — so a stale job can never repopulate
+					// the wiped set, mark it ready, or overwrite the new backfill's status.
+					if (job.branch !== trackedBranchOf(repository)) {
+						yield* Effect.annotateCurrentSpan({
+							"vcs.commits.outcome": "skipped",
+							"vcs.commits.reason": "stale_tracked_branch",
+						})
+						yield* Effect.logInfo(
+							"[VCS] Dropping commit sync for a branch no longer tracked",
+						).pipe(
+							Effect.annotateLogs({
+								provider: installation.provider,
+								externalRepoId: job.externalRepoId,
+								branch: job.branch,
+								trackedBranch: trackedBranchOf(repository),
+							}),
+						)
+						return
+					}
 					// Mark the backfill in progress before the first provider call — the
 					// execution path owns every sync_status transition, so this is what the
 					// dashboard sees the moment a (re)sync actually starts (e.g. after a
@@ -144,9 +204,22 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 						{
 							sinceMs: job.sinceMs,
 							branch: job.branch,
-							...(job.untilMs === undefined ? {} : { untilMs: job.untilMs }),
+							...(!(job.untilMs === undefined) ? { untilMs: job.untilMs } : undefined),
 						},
 					)
+
+					// Re-read the tracked branch after the provider round-trip: a retarget
+					// that committed (wipe + fresh backfill) while we were fetching must
+					// invalidate this walk before it writes, or old-branch commits reappear
+					// in the freshly reset repo. `None` covers a concurrent purge.
+					const current = yield* repo.getRepositoryById(repository.orgId, repository.id)
+					if (Option.isNone(current) || trackedBranchOf(current.value) !== job.branch) {
+						yield* Effect.annotateCurrentSpan({
+							"vcs.commits.outcome": "skipped",
+							"vcs.commits.reason": "tracked_branch_changed_mid_fetch",
+						})
+						return
+					}
 
 					// Commits belong to the repo (no branch link), and the repo's commit set
 					// is reset up front whenever the tracked branch changes — so a walk just
@@ -263,22 +336,26 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 					//  - VcsRepoUnavailableError (repo gone) → record on the repo and drain.
 					//  - VcsInstallationGoneError → propagates to processMessage (disconnect).
 					//  - VcsProviderError (transient) → propagates so the queue retries.
-					Effect.catchTag("@maple/http/errors/VcsRepoUnavailableError", (error) =>
-						Effect.annotateCurrentSpan({
-							"vcs.commits.outcome": "skipped",
-							"vcs.commits.reason": "repository_unavailable",
-						}).pipe(
-							Effect.andThen(repo.markRepoSyncError(repository.id, error.message)),
-							Effect.flatMap(() =>
-								Effect.logWarning("[VCS] Repository unavailable — backfill skipped").pipe(
-									Effect.annotateLogs({
-										provider: installation.provider,
-										externalRepoId: job.externalRepoId,
-									}),
+					//  - VcsRepositoryBlockedError (legal block) → terminal, drain (never retried).
+					Effect.catchTags({
+						"@maple/http/errors/VcsRepositoryBlockedError": (error) =>
+							drainBlockedRepository(installation, repository, error, "commits"),
+						"@maple/http/errors/VcsRepoUnavailableError": (error) =>
+							Effect.annotateCurrentSpan({
+								"vcs.commits.outcome": "skipped",
+								"vcs.commits.reason": "repository_unavailable",
+							}).pipe(
+								Effect.andThen(repo.markRepoSyncError(repository.id, error.message)),
+								Effect.flatMap(() =>
+									Effect.logWarning("[VCS] Repository unavailable — backfill skipped").pipe(
+										Effect.annotateLogs({
+											provider: installation.provider,
+											externalRepoId: job.externalRepoId,
+										}),
+									),
 								),
 							),
-						),
-					),
+					}),
 					Effect.withSpan("VcsSyncService.syncCommits"),
 				)
 
@@ -385,21 +462,26 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 					// A repo-scoped fetch failure drains here (branch sync owns no sync_status —
 					// that belongs to the commit backfill). Installation-gone propagates to the
 					// disconnect handler in processMessage.
-					Effect.catchTag("@maple/http/errors/VcsRepoUnavailableError", () =>
-						Effect.annotateCurrentSpan({
-							"vcs.branches.outcome": "skipped",
-							"vcs.branches.reason": "repository_unavailable",
-						}).pipe(
-							Effect.andThen(
-								Effect.logWarning("[VCS] Repository unavailable — branch sync skipped").pipe(
-									Effect.annotateLogs({
-										provider: installation.provider,
-										externalRepoId: repository.externalRepoId,
-									}),
+					Effect.catchTags({
+						"@maple/http/errors/VcsRepositoryBlockedError": (error) =>
+							drainBlockedRepository(installation, repository, error, "branches"),
+						"@maple/http/errors/VcsRepoUnavailableError": () =>
+							Effect.annotateCurrentSpan({
+								"vcs.branches.outcome": "skipped",
+								"vcs.branches.reason": "repository_unavailable",
+							}).pipe(
+								Effect.andThen(
+									Effect.logWarning(
+										"[VCS] Repository unavailable — branch sync skipped",
+									).pipe(
+										Effect.annotateLogs({
+											provider: installation.provider,
+											externalRepoId: repository.externalRepoId,
+										}),
+									),
 								),
 							),
-						),
-					),
+					}),
 					Effect.withSpan("VcsSyncService.syncBranches"),
 				)
 
@@ -523,139 +605,167 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 				return repositoryOpt
 			})
 
-			// ---- One handler per job kind ----------------------------------------
 			// Each owns its own decision-making (the gate, repo resolution, and any
 			// reason-specific branching); processMessage only resolves the installation
 			// and dispatches by kind.
 
-			const handleInstallationSync = Effect.fn("VcsSyncService.handleInstallationSync")(function* (
-				provider: VcsProviderClient,
-				installation: VcsInstallation,
-				job: InstallationSyncJob,
-			) {
-				yield* Effect.annotateCurrentSpan({
-					"vcs.installation.sync_reason": job.reason,
-					"vcs.installation.id": installation.id,
-					"vcs.installation.external_id": installation.externalInstallationId,
-					"vcs.provider": installation.provider,
-				})
-				// Status-transition reasons change the gate's answer for subsequent jobs
-				// rather than processing data themselves.
-				if (job.reason === "suspend" || job.reason === "deleted") {
-					const status = job.reason === "suspend" ? "suspended" : "disconnected"
-					yield* repo.markInstallationStatus(installation.id, status)
+			const handleInstallationSync = Effect.fn("VcsSyncService.handleInstallationSync")(
+				function* (
+					provider: VcsProviderClient,
+					installation: VcsInstallation,
+					job: InstallationSyncJob,
+				) {
 					yield* Effect.annotateCurrentSpan({
-						"vcs.installation.transition": status,
+						"vcs.installation.sync_reason": job.reason,
+						"vcs.installation.id": installation.id,
+						"vcs.installation.external_id": installation.externalInstallationId,
+						"vcs.provider": installation.provider,
+					})
+					// Status-transition reasons change the gate's answer for subsequent jobs
+					// rather than processing data themselves.
+					if (job.reason === "suspend" || job.reason === "deleted") {
+						const status = job.reason === "suspend" ? "suspended" : "disconnected"
+						yield* repo.markInstallationStatus(installation.id, status)
+						yield* Effect.annotateCurrentSpan({
+							"vcs.installation.transition": status,
+							"vcs.installation_sync.outcome": "handled",
+							"vcs.installation_sync.reason": job.reason,
+						})
+						return
+					}
+					let active = installation
+					// Reasons that represent a (re)connection or provider re-enable restore the
+					// installation to active before the gate, so the sync proceeds. This is what
+					// makes the dashboard's reconnect flow actually revive a previously
+					// disconnected/suspended row: completeConnect re-enqueues "created"/"updated"
+					// for the same external id, and upsertInstallation leaves status untouched on
+					// conflict (status is owned here) — so without this it would stay disconnected
+					// and the gate below would drop the sync. Idempotent for a fresh install
+					// (already active). A bare data refresh (scheduled / repositories_*) must NOT
+					// reactivate: a stray webhook can't silently revive an integration the user
+					// removed on GitHub.
+					const reactivates =
+						job.reason === "unsuspend" || job.reason === "created" || job.reason === "updated"
+					if (reactivates && installation.status !== "active") {
+						// Reflect the new status on the entity we already hold rather than re-reading it.
+						yield* repo.markInstallationStatus(installation.id, "active")
+						active = new VcsInstallation({ ...installation, status: "active", suspendedAt: null })
+						yield* Effect.annotateCurrentSpan({ "vcs.installation.transition": "active" })
+					}
+
+					if (!(yield* ensureProcessable(active, job.kind))) {
+						yield* Effect.annotateCurrentSpan({
+							"vcs.installation_sync.outcome": "skipped",
+							"vcs.installation_sync.reason": "installation_not_processable",
+						})
+						return
+					}
+
+					// A newly-created installation gives the org a clean single-installation
+					// slate: hard-delete every *other* installation (and its repos/commits) for
+					// the same org + provider. A user can remove the old GitHub installation on
+					// GitHub's side without Maple ever receiving the `installation.deleted` webhook
+					// (delivery isn't guaranteed), stranding a stale "active" row — which would
+					// otherwise leave the org with several active installations, a state the
+					// dashboard (one active installation per org) does not support. Purge (not just
+					// suspend) so nothing lingers. Idempotent: a duplicate "created" — the GitHub
+					// webhook and the dashboard callback each enqueue one — finds no siblings left.
+					// "updated" (a reconnect) runs the same purge; it just finds nothing to remove.
+					if (job.reason === "created" || job.reason === "updated") {
+						// Strictly-older siblings only: "supersedes" must be a strict order,
+						// or two concurrent created/updated jobs for different installations
+						// could each observe the other and mutually purge both. The newest
+						// installation wins; the older job finds nothing to remove, and its
+						// later writes no-op against the purged row (the repo layer gates
+						// child upserts on a live parent).
+						const superseded = (yield* repo.listInstallationsByOrg(active.orgId)).filter(
+							(other) =>
+								other.provider === active.provider &&
+								other.id !== active.id &&
+								(other.createdAt < active.createdAt ||
+									(other.createdAt === active.createdAt && other.id < active.id)),
+						)
+						if (superseded.length > 0) {
+							yield* Effect.forEach(
+								superseded,
+								(other) => repo.purgeInstallation(active.orgId, other.id),
+								{
+									discard: true,
+								},
+							)
+							yield* Effect.annotateCurrentSpan({
+								"vcs.installation.superseded": superseded.length,
+							})
+							yield* Effect.logInfo(
+								"[VCS] Purged superseded VCS installations after new install",
+							).pipe(
+								Effect.annotateLogs({
+									provider: active.provider,
+									externalInstallationId: active.externalInstallationId,
+									orgId: active.orgId,
+									superseded: superseded.length,
+								}),
+							)
+						}
+					}
+
+					const repos = yield* provider.fetchRepositories(active)
+					yield* repo.upsertRepositories(installation, repos)
+					yield* Effect.annotateCurrentSpan({ "vcs.repositories.reconciled": repos.length })
+
+					// Reconcile removals: soft-delete local repos no longer visible
+					// upstream. The row and its synced commits are kept (a re-grant
+					// reactivates via upsertRepositories); the "removed" status pauses
+					// any further event processing for them. A user must explicitly
+					// purge to drop the data. The periodic "scheduled" reconcile runs
+					// this too, so it catches a `repositories_removed` webhook we missed.
+					if (job.reason === "repositories_removed" || job.reason === "scheduled") {
+						const remoteIds = new Set(repos.map((r) => r.externalRepoId))
+						const local = yield* repo.listRepositoriesByInstallation(installation.id, "active")
+						yield* Effect.forEach(
+							local.filter((r) => !remoteIds.has(r.externalRepoId)),
+							(r) => repo.markRepositoryRemoved(r.id),
+							{ discard: true },
+						)
+					}
+
+					// Per repo: sync its branch list (names only); sync-branches then enqueues
+					// the commit backfill, keeping all commit-sync enqueuing in one place.
+					yield* queue.sendBatch(
+						repos.map(
+							(r): VcsSyncJob => ({
+								kind: "sync-branches",
+								provider: installation.provider,
+								externalInstallationId: installation.externalInstallationId,
+								externalRepoId: r.externalRepoId,
+								owner: r.owner,
+								name: r.name,
+							}),
+						),
+					)
+					yield* Effect.annotateCurrentSpan({
 						"vcs.installation_sync.outcome": "handled",
 						"vcs.installation_sync.reason": job.reason,
 					})
-					return
-				}
-				let active = installation
-				// Reasons that represent a (re)connection or provider re-enable restore the
-				// installation to active before the gate, so the sync proceeds. This is what
-				// makes the dashboard's reconnect flow actually revive a previously
-				// disconnected/suspended row: completeConnect re-enqueues "created"/"updated"
-				// for the same external id, and upsertInstallation leaves status untouched on
-				// conflict (status is owned here) — so without this it would stay disconnected
-				// and the gate below would drop the sync. Idempotent for a fresh install
-				// (already active). A bare data refresh (scheduled / repositories_*) must NOT
-				// reactivate: a stray webhook can't silently revive an integration the user
-				// removed on GitHub.
-				const reactivates =
-					job.reason === "unsuspend" || job.reason === "created" || job.reason === "updated"
-				if (reactivates && installation.status !== "active") {
-					// Reflect the new status on the entity we already hold rather than re-reading it.
-					yield* repo.markInstallationStatus(installation.id, "active")
-					active = new VcsInstallation({ ...installation, status: "active", suspendedAt: null })
-					yield* Effect.annotateCurrentSpan({ "vcs.installation.transition": "active" })
-				}
-
-				if (!(yield* ensureProcessable(active, job.kind))) {
-					yield* Effect.annotateCurrentSpan({
-						"vcs.installation_sync.outcome": "skipped",
-						"vcs.installation_sync.reason": "installation_not_processable",
-					})
-					return
-				}
-
-				// A newly-created installation gives the org a clean single-installation
-				// slate: hard-delete every *other* installation (and its repos/commits) for
-				// the same org + provider. A user can remove the old GitHub installation on
-				// GitHub's side without Maple ever receiving the `installation.deleted` webhook
-				// (delivery isn't guaranteed), stranding a stale "active" row — which would
-				// otherwise leave the org with several active installations, a state the
-				// dashboard (one active installation per org) does not support. Purge (not just
-				// suspend) so nothing lingers. Idempotent: a duplicate "created" — the GitHub
-				// webhook and the dashboard callback each enqueue one — finds no siblings left.
-				// "updated" (a reconnect) runs the same purge; it just finds nothing to remove.
-				if (job.reason === "created" || job.reason === "updated") {
-					const superseded = (yield* repo.listInstallationsByOrg(active.orgId)).filter(
-						(other) => other.provider === active.provider && other.id !== active.id,
-					)
-					if (superseded.length > 0) {
-						yield* Effect.forEach(
-							superseded,
-							(other) => repo.purgeInstallation(active.orgId, other.id),
-							{
-								discard: true,
-							},
-						)
-						yield* Effect.annotateCurrentSpan({
-							"vcs.installation.superseded": superseded.length,
-						})
-						yield* Effect.logInfo(
-							"[VCS] Purged superseded VCS installations after new install",
-						).pipe(
-							Effect.annotateLogs({
-								provider: active.provider,
-								externalInstallationId: active.externalInstallationId,
-								orgId: active.orgId,
-								superseded: superseded.length,
-							}),
-						)
-					}
-				}
-
-				const repos = yield* provider.fetchRepositories(active)
-				yield* repo.upsertRepositories(installation, repos)
-				yield* Effect.annotateCurrentSpan({ "vcs.repositories.reconciled": repos.length })
-
-				// Reconcile removals: soft-delete local repos no longer visible
-				// upstream. The row and its synced commits are kept (a re-grant
-				// reactivates via upsertRepositories); the "removed" status pauses
-				// any further event processing for them. A user must explicitly
-				// purge to drop the data. The periodic "scheduled" reconcile runs
-				// this too, so it catches a `repositories_removed` webhook we missed.
-				if (job.reason === "repositories_removed" || job.reason === "scheduled") {
-					const remoteIds = new Set(repos.map((r) => r.externalRepoId))
-					const local = yield* repo.listRepositoriesByInstallation(installation.id, "active")
-					yield* Effect.forEach(
-						local.filter((r) => !remoteIds.has(r.externalRepoId)),
-						(r) => repo.markRepositoryRemoved(r.id),
-						{ discard: true },
-					)
-				}
-
-				// Per repo: sync its branch list (names only); sync-branches then enqueues
-				// the commit backfill, keeping all commit-sync enqueuing in one place.
-				yield* queue.sendBatch(
-					repos.map(
-						(r): VcsSyncJob => ({
-							kind: "sync-branches",
-							provider: installation.provider,
-							externalInstallationId: installation.externalInstallationId,
-							externalRepoId: r.externalRepoId,
-							owner: r.owner,
-							name: r.name,
-						}),
+				},
+				// The repository *listing* is installation-scoped, so a legal block there is
+				// not attributable to one repo row — there is nothing to mark. It is still
+				// terminal: drain rather than let the queue retry it forever.
+				(effect) =>
+					Effect.catchTag(effect, "@maple/http/errors/VcsRepositoryBlockedError", (error) =>
+						Effect.annotateCurrentSpan({
+							"vcs.installation_sync.outcome": "skipped",
+							"vcs.installation_sync.reason": "repository_blocked",
+							"error.type": "vcs_repository_blocked",
+						}).pipe(
+							Effect.andThen(
+								Effect.logWarning(
+									"[VCS] Provider blocked the repository listing — installation sync skipped",
+								).pipe(Effect.annotateLogs({ "error.message": error.message })),
+							),
+						),
 					),
-				)
-				yield* Effect.annotateCurrentSpan({
-					"vcs.installation_sync.outcome": "handled",
-					"vcs.installation_sync.reason": job.reason,
-				})
-			})
+			)
 
 			const handleSyncCommits = Effect.fn("VcsSyncService.handleSyncCommits")(function* (
 				provider: VcsProviderClient,
@@ -697,6 +807,29 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 				const repositoryOpt = yield* resolveRepositoryForJob(installation, job)
 				if (Option.isNone(repositoryOpt)) return
 				yield* applyBranchEvent(installation, repositoryOpt.value, job)
+			})
+
+			/**
+			 * A pull request changed. Unlike every other handler this one persists
+			 * nothing here — it resolves the owning org and forwards to the sink,
+			 * which owns the issue link and the verification window.
+			 *
+			 * Deliberately NOT behind `ensureProcessable`: that gate asks whether a
+			 * repository is synced, and a PR can name an issue in a repository this
+			 * org never asked Maple to index. Requiring a synced repo would drop
+			 * exactly the link a user most wants.
+			 */
+			const handlePullRequestEvent = Effect.fn("VcsSyncService.handlePullRequestEvent")(function* (
+				installation: VcsInstallation,
+				job: PullRequestEventJob,
+			) {
+				yield* Effect.annotateCurrentSpan({
+					"vcs.repository.external_id": job.externalRepoId,
+					"vcs.pull_request.number": job.number,
+					"vcs.pull_request.action": job.action,
+					"vcs.pull_request.merged": job.merged,
+				})
+				yield* sink.onPullRequestEvent(installation.orgId, job)
 			})
 
 			const processMessage = Effect.fn("VcsSyncService.processMessage")(function* (raw: unknown) {
@@ -776,6 +909,9 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 					Match.discriminator("kind")("branch-event", (job) =>
 						handleBranchEvent(installation, job),
 					),
+					Match.discriminator("kind")("pull-request-event", (job) =>
+						handlePullRequestEvent(installation, job),
+					),
 					Match.exhaustive,
 				)
 
@@ -849,6 +985,15 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 						})
 						return
 					}
+					// An exhausted job for a branch no longer tracked must not flag the NEW
+					// branch's backfill as errored — the stale walk it represents is moot.
+					if (job.branch !== trackedBranchOf(repositoryOpt.value)) {
+						yield* Effect.annotateCurrentSpan({
+							"vcs.exhausted.outcome": "noop",
+							"vcs.exhausted.reason": "stale_tracked_branch",
+						})
+						return
+					}
 					yield* repo.markRepoSyncError(
 						repositoryOpt.value.id,
 						"backfill failed: exhausted queue retries",
@@ -879,16 +1024,16 @@ export class VcsSyncService extends Context.Service<VcsSyncService, VcsSyncServi
 						}).pipe(
 							Effect.andThen(
 								Effect.logError("[VCS] Failed to record exhausted VCS sync failure").pipe(
-									Effect.annotateLogs({ error: Cause.pretty(cause) }),
+									Effect.annotateLogs({ error: summarizeCause(cause) }),
 								),
 							),
 						),
 					),
 					Effect.withSpan("VcsSyncService.recordExhaustedFailure"),
-					Effect.catchCause(() => Effect.void),
+					Effect.ignoreCause,
 				)
 
-			return { processMessage, recordExhaustedFailure } satisfies VcsSyncServiceShape
+			return { processMessage, recordExhaustedFailure } satisfies VcsSyncServiceApi
 		}),
 	},
 ) {

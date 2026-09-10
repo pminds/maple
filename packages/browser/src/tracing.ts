@@ -1,4 +1,12 @@
-import { consentAllowedSince, hasConsent, readSessionSink, recordTraceId } from "@maple/browser-session"
+import {
+	consentAllowedSince,
+	hasConsent,
+	readSessionSink,
+	recordTraceId,
+	SDK_HINT_HEADER,
+	sdkHint,
+} from "@maple/browser-session"
+import { context, propagation, ProxyTracerProvider, trace } from "@opentelemetry/api"
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
 import { registerInstrumentations } from "@opentelemetry/instrumentation"
 import { FetchInstrumentation } from "@opentelemetry/instrumentation-fetch"
@@ -8,6 +16,7 @@ import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base"
 import { WebTracerProvider } from "@opentelemetry/sdk-trace-web"
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions"
 import type { ResolvedConfig } from "./config"
+import { SDK_NAME, SDK_VERSION } from "./version"
 
 /**
  * Captures every span's trace id into the session sink. Lightweight — runs
@@ -67,6 +76,16 @@ class ConsentSpanExporter implements SpanExporter {
 }
 
 /**
+ * How long a span may sit in the batch queue before export.
+ *
+ * Shorter than OTel's 5s default: in a browser the queue is only as durable as
+ * the tab, and the unload flush below is a best-effort catch rather than a
+ * guarantee (a crashed or killed tab fires neither event). 2s trades a few more
+ * requests for a materially smaller loss window.
+ */
+const EXPORT_INTERVAL_MS = 2_000
+
+/**
  * Set up browser OTel tracing exporting to Maple's ingest. When
  * `tracingInstrumentFetch` is true, fetch() calls are auto-instrumented and
  * their trace ids feed the session. Disable it when an external tracer (e.g.
@@ -84,13 +103,17 @@ export function setupTracing(config: ResolvedConfig): () => Promise<void> {
 	const attributes: Record<string, string> = {
 		[ATTR_SERVICE_NAME]: config.serviceName,
 		"maple.sdk.type": "browser",
-	}
+	} satisfies Record<string, string>
 	if (config.serviceNamespace) {
 		attributes["service.namespace"] = config.serviceNamespace
 	}
 	if (config.serviceVersion) {
 		attributes[ATTR_SERVICE_VERSION] = config.serviceVersion
-		attributes["deployment.commit_sha"] = config.serviceVersion
+		// A semver release string belongs in `service.version` but not in
+		// `vcs.*` — only a SHA-shaped value is stamped as the head revision.
+		if (/^[0-9a-f]{7,40}$/i.test(config.serviceVersion)) {
+			attributes["vcs.ref.head.revision"] = config.serviceVersion
+		}
 	}
 	if (config.environment) {
 		// Dual-emit: legacy key (pre-extracted by Tinybird MVs) + the canonical
@@ -102,7 +125,11 @@ export function setupTracing(config: ResolvedConfig): () => Promise<void> {
 	const exporter = new ConsentSpanExporter(
 		new OTLPTraceExporter({
 			url: `${config.endpoint}/v1/traces`,
-			headers: { Authorization: `Bearer ${config.ingestKey}` },
+			headers: {
+				Authorization: `Bearer ${config.ingestKey}`,
+				// Ingest records this as `maple.sdk`; a page cannot set `user-agent`.
+				[SDK_HINT_HEADER]: sdkHint(SDK_NAME, SDK_VERSION),
+			},
 		}),
 	)
 
@@ -110,9 +137,43 @@ export function setupTracing(config: ResolvedConfig): () => Promise<void> {
 		resource: resourceFromAttributes(attributes),
 		// The id only — the rest of the identity (email, group) belongs on the
 		// session row, not stamped onto every span on the hot path.
-		spanProcessors: [new TraceIdCollector(() => config.identity?.id), new BatchSpanProcessor(exporter)],
+		spanProcessors: [
+			new TraceIdCollector(() => config.identity?.id),
+			new BatchSpanProcessor(exporter, { scheduledDelayMillis: EXPORT_INTERVAL_MS }),
+		],
 	})
 	provider.register()
+	// The OTel globals are first-write-wins. If a host app registered its own
+	// provider before us, ours never became the global one — remember whether we
+	// won so shutdown releases only globals this SDK actually owns.
+	const globalProvider = trace.getTracerProvider()
+	const ownsGlobals =
+		globalProvider === provider ||
+		(globalProvider instanceof ProxyTracerProvider && globalProvider.getDelegate() === provider)
+
+	// Without this the batch processor's queue dies with the tab: its only flush
+	// is `provider.shutdown()`, which a host app that never calls `shutdown()`
+	// never reaches. That silently loses the last window of spans on every tab
+	// close — which is exactly the window containing whatever made the user
+	// leave. Session rows and events already get this treatment on the way out;
+	// traces were the one signal that didn't.
+	//
+	// Both events are needed: `visibilitychange → hidden` is the only reliable
+	// one on mobile, `pagehide` covers desktop tab close and navigation. Flushing
+	// twice is harmless — the second finds an empty queue.
+	const onExit = (): void => {
+		void provider.forceFlush().catch(() => {
+			// Best-effort on the way out; never throw into the host app.
+		})
+	}
+	const onVisibilityChange = (): void => {
+		if (document.visibilityState === "hidden") onExit()
+	}
+	const canListen = typeof document !== "undefined" && typeof document.addEventListener === "function"
+	if (canListen) {
+		document.addEventListener("visibilitychange", onVisibilityChange)
+		window.addEventListener("pagehide", onExit)
+	}
 
 	const unregisterInstrumentations = config.tracingInstrumentFetch
 		? registerInstrumentations({
@@ -127,8 +188,21 @@ export function setupTracing(config: ResolvedConfig): () => Promise<void> {
 		: undefined
 
 	return async () => {
+		if (canListen) {
+			document.removeEventListener("visibilitychange", onVisibilityChange)
+			window.removeEventListener("pagehide", onExit)
+		}
 		unregisterInstrumentations?.()
 		await provider.shutdown()
+		// Release the globals so a later init() can register a live provider.
+		// The global proxy keeps delegating to this now-shut-down provider
+		// otherwise, and the documented init → shutdown → init lifecycle would
+		// silently export nothing on the second session.
+		if (ownsGlobals) {
+			trace.disable()
+			context.disable()
+			propagation.disable()
+		}
 	}
 }
 

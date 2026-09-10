@@ -5,14 +5,16 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { OrgId, UserId } from "@maple/domain/http"
 import { decodePublicId, MapleApiV2 } from "@maple/domain/http/v2"
 import { cleanupTestDbs, createTestDb, executeSql, type TestDb } from "@/platform/test-pglite"
-import type { WarehouseQueryServiceShape } from "@/services/warehouse/WarehouseQueryService"
+import type { WarehouseQueryServiceApi } from "@/services/warehouse/WarehouseQueryService"
 import { WarehouseQueryService } from "@/services/warehouse/WarehouseQueryService"
 import { Database } from "@/platform/DatabaseLive"
 import { Env } from "@/platform/Env"
 import { ApiAuthorizationV2Layer } from "@/services/auth/ApiAuthorizationV2Layer"
+import { AuditLogService } from "@/services/audit/AuditLogService"
 import { ApiKeysService } from "@/services/org/ApiKeysService"
 import { AuthService } from "@/services/auth/AuthService"
 import { DashboardPersistenceService } from "@/services/dashboards/DashboardPersistenceService"
+import { SharedDashboardService } from "@/services/dashboards/SharedDashboardService"
 import { IngestAttributeMappingService } from "@/services/org/IngestAttributeMappingService"
 import { OrgIngestKeysService } from "@/services/org/OrgIngestKeysService"
 import { PlanetScaleDiscoveryService } from "@/services/integrations/PlanetScaleDiscoveryService"
@@ -20,15 +22,18 @@ import { PlanetScaleOAuthService } from "@/services/auth/PlanetScaleOAuthService
 import { RecommendationIssueService } from "@/services/errors/RecommendationIssueService"
 import { ScrapeTargetsService } from "@/services/integrations/ScrapeTargetsService"
 import { SetupAuditService } from "@/services/org/SetupAuditService"
-import { V2SchemaErrorsLive } from "./error-envelope"
+import { V2TransportErrorBoundaryLive } from "./error-envelope"
 import {
 	AlertsServiceStubLayer,
 	AllV2GroupLayersLive,
 	ApiV2RateLimiterAllowAllLayer,
+	makeWarehouseServiceStub,
 	Phase1ResourceStubsLayer,
+	PlanetScaleServiceStubsLayer,
 	SlackIntegrationServiceStubLayer,
 	TelemetryServiceStubsLayer,
 } from "./v2-test-support"
+import { compiledQueryOf } from "@maple/query-engine/execution"
 
 /**
  * End-to-end HTTP tests for `GET /v2/instrumentation/audit` over an embedded PGlite. The pure check
@@ -68,22 +73,26 @@ const testConfig = () =>
  */
 const warehouseStub = (
 	rowsByTable: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>> = {},
-): WarehouseQueryServiceShape => ({
-	query: () => Effect.die(new Error("unexpected warehouse pipe query")),
-	sqlQuery: () => Effect.succeed([]),
-	rawSqlQuery: () => Effect.succeed([]),
-	compiledQuery: (_tenant, compiled) => {
-		const table = Object.keys(rowsByTable).find((name) => compiled.sql.includes(`FROM ${name}`))
-		return compiled.decodeRows(table === undefined ? [] : rowsByTable[table]!).pipe(Effect.orDie)
-	},
-	compiledQueryFirst: () => Effect.die(new Error("unexpected compiled query")),
-	ingest: () => Effect.void,
-	asExecutor: () => {
-		throw new Error("asExecutor is not supported by this test stub")
-	},
-})
+): WarehouseQueryServiceApi =>
+	makeWarehouseServiceStub({
+		query: () => Effect.die(new Error("unexpected warehouse pipe query")),
+		rawSqlQuery: () => Effect.succeed([]),
+		compiledQuery: (_tenant, compiled) => {
+			const table = Object.keys(rowsByTable).find((name) =>
+				compiledQueryOf(compiled).sql.includes(`FROM ${name}`),
+			)
+			return compiledQueryOf(compiled)
+				.decodeRows(table === undefined ? [] : rowsByTable[table]!)
+				.pipe(Effect.orDie)
+		},
+		compiledQueryFirst: () => Effect.die(new Error("unexpected compiled query")),
+		// `fetchWarehouseInputs` / `fetchTraceCompleteness` warm the route before
+		// their fan-outs; nothing to resolve against a stub.
+		warmRoute: () => Effect.void,
+		ingest: () => Effect.void,
+	})
 
-const unavailableWarehouse: WarehouseQueryServiceShape = {
+const unavailableWarehouse: WarehouseQueryServiceApi = {
 	...warehouseStub(),
 	compiledQuery: () => Effect.die(new Error("warehouse unreachable")),
 }
@@ -106,7 +115,7 @@ const planetScaleStubs = Layer.mergeAll(
 	}),
 )
 
-const makeHarness = (warehouse: WarehouseQueryServiceShape = warehouseStub()) => {
+const makeHarness = (warehouse: WarehouseQueryServiceApi = warehouseStub()) => {
 	const testDb = createTestDb(createdDbs)
 	const envLive = Env.layer.pipe(Layer.provide(testConfig()))
 	const warehouseLive = Layer.succeed(WarehouseQueryService, warehouse)
@@ -116,6 +125,7 @@ const makeHarness = (warehouse: WarehouseQueryServiceShape = warehouseStub()) =>
 		ApiKeysService.layer,
 		AuthService.layer,
 		DashboardPersistenceService.layer,
+		SharedDashboardService.layer,
 		IngestAttributeMappingService.layer,
 		OrgIngestKeysService.layer,
 		RecommendationIssueService.layer.pipe(Layer.provide(warehouseLive)),
@@ -125,13 +135,15 @@ const makeHarness = (warehouse: WarehouseQueryServiceShape = warehouseStub()) =>
 
 	const routes = HttpApiBuilder.layer(MapleApiV2).pipe(
 		Layer.provide(AllV2GroupLayersLive),
-		Layer.provide(V2SchemaErrorsLive),
+		Layer.provide(V2TransportErrorBoundaryLive),
 		Layer.provide(AlertsServiceStubLayer),
 		Layer.provide(Phase1ResourceStubsLayer),
 		Layer.provide(SlackIntegrationServiceStubLayer),
+		Layer.provide(PlanetScaleServiceStubsLayer),
 		Layer.provide(TelemetryServiceStubsLayer),
 		Layer.provide(warehouseLive),
 		Layer.provideMerge(ApiAuthorizationV2Layer),
+		Layer.provideMerge(AuditLogService.layerMemory),
 		Layer.provideMerge(ApiV2RateLimiterAllowAllLayer),
 		Layer.provideMerge(servicesLive),
 	)
@@ -141,12 +153,7 @@ const makeHarness = (warehouse: WarehouseQueryServiceShape = warehouseStub()) =>
 
 	// `testDb.layer` applies the migrations when it is first built, so raw seed SQL must wait for it.
 	let migrated: Promise<void> | undefined
-	const ensureSchema = () =>
-		(migrated ??= runtime.runPromise(
-			Effect.gen(function* () {
-				yield* Database
-			}),
-		))
+	const ensureSchema = () => (migrated ??= runtime.runPromise(Effect.asVoid(Database)))
 
 	const request = async (method: string, path: string, options: { token?: string } = {}) => {
 		const response = await handler(
@@ -314,11 +321,18 @@ describe("GET /v2/instrumentation/audit", () => {
 					{
 						serviceName: "unknown_service:node",
 						totalLogCount: "0",
+						totalLogSizeBytes: "0",
 						totalTraceCount: "4000",
+						totalTraceSizeBytes: "1200000",
 						totalSumMetricCount: "0",
+						totalSumMetricSizeBytes: "0",
 						totalGaugeMetricCount: "0",
+						totalGaugeMetricSizeBytes: "0",
 						totalHistogramMetricCount: "0",
+						totalHistogramMetricSizeBytes: "0",
 						totalExpHistogramMetricCount: "0",
+						totalExpHistogramMetricSizeBytes: "0",
+						totalSizeBytes: "1200000",
 					},
 				],
 				attribute_keys_hourly: [{ scope: "span", attributeKey: "user.password", usageCount: "12" }],

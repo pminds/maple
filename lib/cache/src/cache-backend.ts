@@ -1,3 +1,4 @@
+// BOUNDARY: This module owns unparsed external values and narrows them before domain use.
 import { Context, Layer } from "effect"
 
 /**
@@ -28,11 +29,11 @@ export interface EdgeCacheBackend {
 }
 
 /**
- * Injected edge-cache storage backend (Workers KV in prod, in-memory in
+ * Injected edge-cache storage backend (`caches.default` in prod, in-memory in
  * tests/dev).
  *
  * The tag string still names the old home. Tags are identity, not
- * documentation — `EdgeCacheIOError` next door is a `Schema.TaggedErrorClass`
+ * documentation — `EdgeCacheIOError` next door is a `Schema.TaggedError`
  * whose tag is its serialized `_tag`, so renaming this family for tidiness
  * would be a wire-contract change for no behavioural gain.
  */

@@ -19,6 +19,7 @@ import {
 } from "@maple/browser-session"
 import { setupStandaloneSession } from "./standalone-session.js"
 import { getCurrentIdentity } from "./user.js"
+import { CLIENT_SDK_HINT } from "../version.js"
 
 export interface ClientReplayConfig {
 	/** Record rrweb session replays. Default `true`. */
@@ -69,13 +70,18 @@ const noOpHandle: ClientSessionHandle = { stop: () => Promise.resolve() }
 export const startClientSession = (config: ClientSessionConfig): ClientSessionHandle => {
 	configurePrivacy(config.privacy)
 	if (!hasConsent()) clearPendingEvents()
-	if (typeof window === "undefined" || !config.ingestKey || readSessionSink()) return noOpHandle
+	const ingestKey = config.ingestKey
+	// React Native exposes window without a browser DOM or Web Crypto.
+	if (typeof window === "undefined" || typeof document === "undefined" || !ingestKey || readSessionSink())
+		return noOpHandle
 
 	const engineConfig = {
 		endpoint: config.endpoint.replace(/\/$/, ""),
-		ingestKey: config.ingestKey,
+		ingestKey,
+		sdk: CLIENT_SDK_HINT,
 		maskAllInputs: config.replay?.maskAllInputs ?? true,
 		maskAllText: config.replay?.maskAllText ?? false,
+		getIdentity: getCurrentIdentity,
 	}
 	const replayEnabled = (config.replay?.enabled ?? true) && typeof document !== "undefined"
 	const sampled = replayEnabled && Math.random() < (config.replay?.sampleRate ?? 1)
@@ -121,7 +127,8 @@ export const startClientSession = (config: ClientSessionConfig): ClientSessionHa
 					}
 					next.replay = startReplaySession({
 						endpoint: config.endpoint,
-						ingestKey: config.ingestKey!,
+						ingestKey,
+						sdk: CLIENT_SDK_HINT,
 						serviceName: config.serviceName,
 						environment: config.environment,
 						serviceVersion: config.serviceVersion,

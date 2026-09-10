@@ -6,6 +6,7 @@ import tanstackRouter from "@tanstack/router-plugin/vite"
 import viteReact from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
 import { siblingUrl } from "../../packages/infra/src/dev-urls.ts"
+import { versionManifest } from "./vite-plugin-version-manifest.ts"
 
 const envDir = path.resolve(import.meta.dirname, "../..")
 
@@ -47,7 +48,7 @@ export default defineConfig(({ mode }) => {
 		"VITE_CLERK_PUBLISHABLE_KEY",
 		"VITE_MAPLE_INGEST_KEY",
 		// Injected at deploy time (CI sets VITE_COMMIT_SHA=github.sha); stamped onto
-		// browser telemetry as `deployment.commit_sha` / `service.version`.
+		// browser telemetry as `vcs.ref.head.revision` / `service.version`.
 		"VITE_COMMIT_SHA",
 		// "off" disables rrweb self-recording. The perf bench sets it via
 		// process.env (playwright.config.ts) and must win over any `.env*` value,
@@ -72,13 +73,15 @@ export default defineConfig(({ mode }) => {
 		// run — it's executed separately via `bun run test:perf`.
 		test: {
 			include: ["src/**/*.test.{ts,tsx}"],
+			setupFiles: ["./src/test-setup.ts"],
 		},
 		resolve: {
 			tsconfigPaths: true,
 		},
 		define,
 		plugins: [
-			devtools(),
+			// Console piping forwards every browser console line into the dev server's stdout.
+			devtools({ consolePiping: { enabled: false } }),
 			tanstackRouter({
 				target: "react",
 				autoCodeSplitting: true,
@@ -97,6 +100,11 @@ export default defineConfig(({ mode }) => {
 			}),
 			tailwindcss(),
 			viteReact(),
+			// Reads the same `process.env` the `define` block above does, rather than
+			// `import.meta.env`, because this runs in the Vite process and not in the
+			// bundle. An empty value (any build that is not a deploy) makes the
+			// client-side check inert — see `use-app-version.ts`.
+			versionManifest(process.env.VITE_COMMIT_SHA?.trim() || ""),
 		],
 		build: {
 			// The bundle budget reads Vite's static/dynamic import graph instead of

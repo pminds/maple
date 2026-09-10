@@ -10,6 +10,7 @@ import {
 	AnomalyLinkedIssueNotFoundError,
 	AnomalyTimeseriesBucket,
 	type AnomalyIncidentId,
+	type AnomalyIncidentSeverity,
 	type AnomalyIncidentStatus,
 	AnomalyPersistenceError,
 	AnomalySignalType,
@@ -21,6 +22,7 @@ import {
 	RoleName,
 	type UserId,
 	UserId as UserIdSchema,
+	type WarehouseReadError,
 } from "@maple/domain/http"
 import {
 	anomalyDetectorSettings,
@@ -33,22 +35,35 @@ import {
 	orgClickHouseSettings,
 	orgIngestKeys,
 } from "@maple/db"
-import { and, desc, eq, gte, inArray, isNull, lt, lte, ne, or, sql } from "drizzle-orm"
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm"
 import { CH, parseWarehouseDateTime, formatWarehouseDateTime } from "@maple/query-engine"
 import { EdgeCacheService } from "@maple/cache"
 import {
 	isOrgWarehouseQuarantined,
 	quarantineOnConfigClassCause,
 } from "@/services/warehouse/warehouse-org-quarantine"
-import { Array as Arr, Cause, Clock, Context, Effect, Layer, Option, Ref, Schedule, Schema } from "effect"
+import {
+	Array as Arr,
+	Cause,
+	Clock,
+	Context,
+	Effect,
+	Layer,
+	MutableHashMap,
+	Option,
+	Ref,
+	Schema,
+} from "effect"
 import type { TenantContext } from "@/services/auth/AuthService"
-import { INVESTIGATION_AGENT_BINDING, maybeEnqueueTriage } from "@/services/errors/ai-triage-enqueue"
-import { WorkerEnvironment } from "@maple/effect-cloudflare/worker-environment"
-import { Database, DatabaseError, type DatabaseClient } from "@/platform/DatabaseLive"
+import { INVESTIGATION_FANOUT_BINDING, maybeEnqueueTriage } from "@/services/errors/ai-triage-enqueue"
+import { WorkerEnvironment } from "@maple/infra/worker-runtime"
+import { Database } from "@/platform/DatabaseLive"
+import { makeDbExecute, makePersistenceErrorMapper } from "@/platform/db-execute"
 import { Env } from "@/platform/Env"
 import { dateToMs, msToDate } from "@/platform/time"
 import { WarehouseQueryService } from "@/services/warehouse/WarehouseQueryService"
 import {
+	capBusiestLogSeries,
 	ERROR_SPIKE_MIN_COUNT,
 	evaluateErrorSpike,
 	evaluateGoldenSignals,
@@ -60,8 +75,15 @@ import {
 	type GoldenSignalSeries,
 	type LogVolumeSeries,
 } from "./anomaly/detection"
+import { issueSeverityFromAlert } from "@/services/errors/severity-map"
+import {
+	batchDetectorStates,
+	DETECTOR_STATE_FLUSH_CONCURRENCY,
+	effectiveOtherStates,
+} from "./anomaly/detector-state-batch"
 import { rollingCountBuckets } from "./anomaly/rolling-counts"
-import { decideTransition, stateMachineConfigFor, type DetectorStateSnapshot } from "./anomaly/state-machine"
+import { hysteresisConfigFor } from "./anomaly/hysteresis-config"
+import { foldObservation } from "./incident-hysteresis"
 import {
 	attachKeyFor,
 	canAttach,
@@ -73,6 +95,7 @@ import {
 	upsertFingerprintEntry,
 	type IncidentFingerprintEntry,
 } from "./anomaly/consolidation"
+import { summarizeCause } from "@/platform/describe-cause"
 
 const decodeIncidentIdSync = Schema.decodeUnknownSync(AnomalyIncidentDocument.fields.id)
 const decodeMutedSignalResult = Schema.decodeUnknownResult(AnomalySignalType)
@@ -92,6 +115,8 @@ const MAX_OPENS_PER_TICK = 10
 /** Cap evaluated golden-signal/log series to the busiest N per org. */
 const MAX_SERIES_PER_ORG = 200
 const STATE_RETENTION_MS = 14 * 24 * HOUR_MS
+/** Keeps the per-tick state hydration a bounded IN list on a busy org. */
+const DETECTOR_STATE_FETCH_CHUNK = 500
 const RETENTION_PHASE_EVERY_N_TICKS = 36
 const TICK_CADENCE_MS = 5 * 60 * 1000
 const ERROR_SPIKE_BASELINE_CACHE_BUCKET = "anomaly-errbase"
@@ -107,40 +132,10 @@ const ANOMALY_ACTIVE_DISCOVERY_WINDOW_MS = 2 * HOUR_MS
 const ANOMALY_ACTIVE_ORGS_CACHE_BUCKET = "anomaly-active-orgs"
 const ANOMALY_ACTIVE_ORGS_CACHE_KEY = "active"
 const ANOMALY_ACTIVE_ORGS_CACHE_TTL_S = 6 * 60 * 60
-/** D1 caps bound parameters per statement (~100); mirror ErrorsService's chunking. */
-const D1_INARRAY_CHUNK_SIZE = 90
-
-const describeCause = (cause: unknown): string | undefined => {
-	if (cause == null) return undefined
-	if (cause instanceof Error) return cause.stack ?? cause.message
-	if (typeof cause === "string") return cause
-	try {
-		return JSON.stringify(cause)
-	} catch {
-		return String(cause)
-	}
-}
-
-const makePersistenceError = (error: unknown): AnomalyPersistenceError => {
-	const message =
-		error instanceof DatabaseError || error instanceof Error
-			? error.message
-			: "Anomaly persistence failure"
-	const cause = describeCause(error instanceof Error ? error.cause : error)
-	return cause === undefined
-		? new AnomalyPersistenceError({ message })
-		: new AnomalyPersistenceError({ message, cause })
-}
-
-const BUSY_ERROR_PATTERN = /SQLITE_BUSY|database is locked|D1_BUSY|busy/i
-
-const isBusyDatabaseError = (error: DatabaseError): boolean => {
-	if (BUSY_ERROR_PATTERN.test(error.message)) return true
-	const inner = error.cause instanceof Error ? error.cause.message : undefined
-	return inner !== undefined && BUSY_ERROR_PATTERN.test(inner)
-}
-
-const BUSY_RETRY_SCHEDULE = Schedule.max([Schedule.exponential("50 millis", 2.0), Schedule.recurs(3)])
+export const makePersistenceError = makePersistenceErrorMapper(
+	AnomalyPersistenceError,
+	"Anomaly persistence failure",
+)
 
 /**
  * Adapt a drizzle incident row (timestamptz → Date, jsonb → unknown[]) to the
@@ -174,7 +169,18 @@ interface AnomalyTickResult {
 	readonly orgFailures: number
 }
 
-export interface AnomalyDetectionServiceShape {
+/** One (service, environment, signal) group of incidents. */
+export interface AnomalyServiceCountRow {
+	readonly serviceName: string
+	readonly deploymentEnv: string
+	readonly signalType: AnomalySignalType
+	readonly severity: AnomalyIncidentSeverity
+	readonly incidentCount: number
+	/** ISO-8601 UTC. Formatted in SQL — see the note on the query. */
+	readonly lastTriggeredAt: string
+}
+
+export interface AnomalyDetectionServiceApi {
 	readonly runTick: () => Effect.Effect<AnomalyTickResult, AnomalyPersistenceError>
 	readonly listIncidents: (
 		orgId: OrgId,
@@ -190,6 +196,16 @@ export interface AnomalyDetectionServiceShape {
 			readonly offset?: number
 		},
 	) => Effect.Effect<AnomalyIncidentsListResponse, AnomalyPersistenceError>
+	/**
+	 * Incidents collapsed to one row per (service, environment, signal).
+	 *
+	 * Exists because the fleet-health surfaces need every open incident at once
+	 * to shade per-service rows, which is a `GROUP BY`, not a page of a list.
+	 */
+	readonly countIncidentsByService: (
+		orgId: OrgId,
+		opts: { readonly status?: AnomalyIncidentStatus },
+	) => Effect.Effect<ReadonlyArray<AnomalyServiceCountRow>, AnomalyPersistenceError>
 	readonly getIncident: (
 		orgId: OrgId,
 		incidentId: AnomalyIncidentId,
@@ -212,7 +228,7 @@ export interface AnomalyDetectionServiceShape {
 		opts: { readonly startTime?: string; readonly endTime?: string },
 	) => Effect.Effect<
 		AnomalyIncidentTimeseriesResponse,
-		AnomalyPersistenceError | AnomalyIncidentNotFoundError
+		AnomalyPersistenceError | AnomalyIncidentNotFoundError | WarehouseReadError
 	>
 	readonly getSettings: (
 		orgId: OrgId,
@@ -232,27 +248,12 @@ const make = Effect.gen(function* () {
 	// Optional: present only inside a Worker isolate. Used to kick off the
 	// AI triage Workflow when an incident opens (org opt-in).
 	const workerEnv = yield* Effect.serviceOption(WorkerEnvironment)
-	const investigationAgentBinding = Option.match(workerEnv, {
+	const investigationFanoutBinding = Option.match(workerEnv, {
 		onNone: () => undefined,
-		onSome: (e) => e[INVESTIGATION_AGENT_BINDING],
+		onSome: (e) => e[INVESTIGATION_FANOUT_BINDING],
 	})
 
-	const dbExecute = <T>(fn: (db: DatabaseClient) => Promise<T>) =>
-		database.execute(fn).pipe(
-			Effect.retry({
-				schedule: BUSY_RETRY_SCHEDULE,
-				while: isBusyDatabaseError,
-			}),
-			Effect.tapError((error) =>
-				Effect.logError("AnomalyDetectionService dbExecute failed").pipe(
-					Effect.annotateLogs({
-						message: error.message,
-						cause: describeCause(error.cause) ?? "(none)",
-					}),
-				),
-			),
-			Effect.mapError(makePersistenceError),
-		)
+	const dbExecute = makeDbExecute(database, "AnomalyDetectionService", makePersistenceError)
 
 	const isoFromEpoch = (ms: number) => decodeIsoSync(new Date(ms).toISOString())
 
@@ -265,9 +266,6 @@ const make = Effect.gen(function* () {
 		authMode: "self_hosted",
 	})
 
-	// -----------------------------------------------------------------
-	// Active-org gating
-	//
 	// The tick historically evaluated every org with an ingest key, scanning a
 	// 7-day window for each — overwhelmingly idle orgs, which dominated Tinybird
 	// CPU. Instead, run ONE cross-org scan of the recent hourly MVs (pinned to
@@ -276,7 +274,6 @@ const make = Effect.gen(function* () {
 	// and are always evaluated. Fails CLOSED: if discovery errors, reuse the
 	// last-known active set from cache (or just BYO if cold) rather than
 	// evaluating every known org — the old fan-out amplified warehouse stress.
-	// -----------------------------------------------------------------
 
 	const resolveActiveOrgs = Effect.fn("AnomalyDetectionService.resolveActiveOrgs")(function* (
 		knownOrgs: ReadonlyArray<OrgId>,
@@ -295,6 +292,7 @@ const make = Effect.gen(function* () {
 
 		const startTime = formatWarehouseDateTime(nowMs - ANOMALY_ACTIVE_DISCOVERY_WINDOW_MS)
 		const routingTenant = systemTenant(knownOrgs[0])
+		yield* warehouse.warmRoute(routingTenant)
 		return yield* Effect.all(
 			[
 				warehouse.crossOrgQuery(
@@ -351,7 +349,7 @@ const make = Effect.gen(function* () {
 					: Effect.gen(function* () {
 							yield* Effect.logWarning(
 								"Anomaly active-org discovery failed; reusing last-known active set",
-							).pipe(Effect.annotateLogs({ error: Cause.pretty(cause) }))
+							).pipe(Effect.annotateLogs({ error: summarizeCause(cause) }))
 							const cached = yield* edgeCache
 								.rawGet<ReadonlyArray<string>>(
 									ANOMALY_ACTIVE_ORGS_CACHE_BUCKET,
@@ -368,10 +366,6 @@ const make = Effect.gen(function* () {
 			),
 		)
 	})
-
-	// -----------------------------------------------------------------
-	// Settings
-	// -----------------------------------------------------------------
 
 	const parseMutedSignals = (raw: ReadonlyArray<string>): ReadonlyArray<AnomalySignalType> =>
 		Arr.filterMap(raw, (value) => decodeMutedSignalResult(value))
@@ -424,7 +418,7 @@ const make = Effect.gen(function* () {
 		return refreshed
 	})
 
-	const getSettings: AnomalyDetectionServiceShape["getSettings"] = Effect.fn(
+	const getSettings: AnomalyDetectionServiceApi["getSettings"] = Effect.fn(
 		"AnomalyDetectionService.getSettings",
 	)(function* (orgId) {
 		yield* Effect.annotateCurrentSpan({ orgId })
@@ -433,7 +427,7 @@ const make = Effect.gen(function* () {
 		return settingsToDocument(row)
 	})
 
-	const updateSettings: AnomalyDetectionServiceShape["updateSettings"] = Effect.fn(
+	const updateSettings: AnomalyDetectionServiceApi["updateSettings"] = Effect.fn(
 		"AnomalyDetectionService.updateSettings",
 	)(function* (orgId, userId, request) {
 		yield* Effect.annotateCurrentSpan({ orgId })
@@ -453,10 +447,6 @@ const make = Effect.gen(function* () {
 		const refreshed = yield* loadSettingsRow(orgId)
 		return settingsToDocument(refreshed ?? { ...existing, ...next })
 	})
-
-	// -----------------------------------------------------------------
-	// Incident reads
-	// -----------------------------------------------------------------
 
 	const incidentToDocument = (row: AnomalyIncidentRow): AnomalyIncidentDocument =>
 		new AnomalyIncidentDocument({
@@ -503,7 +493,7 @@ const make = Effect.gen(function* () {
 			lastReopenedAt: row.lastReopenedAt ? isoFromDate(row.lastReopenedAt) : null,
 		})
 
-	const listIncidents: AnomalyDetectionServiceShape["listIncidents"] = Effect.fn(
+	const listIncidents: AnomalyDetectionServiceApi["listIncidents"] = Effect.fn(
 		"AnomalyDetectionService.listIncidents",
 	)(function* (orgId, opts) {
 		yield* Effect.annotateCurrentSpan({ orgId })
@@ -537,6 +527,50 @@ const make = Effect.gen(function* () {
 		return new AnomalyIncidentsListResponse({ incidents: rows.map(incidentToDocument) })
 	})
 
+	const countIncidentsByService: AnomalyDetectionServiceApi["countIncidentsByService"] = Effect.fn(
+		"AnomalyDetectionService.countIncidentsByService",
+	)(function* (orgId, opts) {
+		yield* Effect.annotateCurrentSpan({ orgId })
+		const status = opts.status ?? "open"
+		const rows = yield* dbExecute((db) =>
+			db
+				.select({
+					serviceName: anomalyIncidents.serviceName,
+					deploymentEnv: anomalyIncidents.deploymentEnv,
+					signalType: anomalyIncidents.signalType,
+					// Severity is a two-value ladder, so a boolean rollup says
+					// exactly what the caller needs without ordering strings.
+					hasCritical: sql<boolean>`bool_or(${anomalyIncidents.severity} = 'critical')`,
+					incidentCount: sql<number>`count(*)::int`,
+					// Drizzle applies a column's codec to a column reference, not to
+					// an aggregate over it, so `max()` arrives as whatever the driver
+					// hands back — a Date under one, a Postgres datetime string under
+					// another. Formatting in SQL removes the guess: one ISO-8601 UTC
+					// string, identical under postgres.js and PGlite.
+					lastTriggeredAt: sql<string>`to_char(
+						max(${anomalyIncidents.lastTriggeredAt}) AT TIME ZONE 'UTC',
+						'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+					)`,
+				})
+				.from(anomalyIncidents)
+				.where(and(eq(anomalyIncidents.orgId, orgId), eq(anomalyIncidents.status, status)))
+				.groupBy(
+					anomalyIncidents.serviceName,
+					anomalyIncidents.deploymentEnv,
+					anomalyIncidents.signalType,
+				),
+		)
+		yield* Effect.annotateCurrentSpan({ groupCount: rows.length })
+		return rows.map((row) => ({
+			serviceName: row.serviceName,
+			deploymentEnv: row.deploymentEnv,
+			signalType: row.signalType,
+			severity: (row.hasCritical ? "critical" : "warning") satisfies AnomalyIncidentSeverity,
+			incidentCount: row.incidentCount,
+			lastTriggeredAt: row.lastTriggeredAt,
+		}))
+	})
+
 	const requireIncidentRow = Effect.fn("AnomalyDetectionService.requireIncidentRow")(function* (
 		orgId: OrgId,
 		incidentId: AnomalyIncidentId,
@@ -560,7 +594,7 @@ const make = Effect.gen(function* () {
 		return row
 	})
 
-	const getIncident: AnomalyDetectionServiceShape["getIncident"] = Effect.fn(
+	const getIncident: AnomalyDetectionServiceApi["getIncident"] = Effect.fn(
 		"AnomalyDetectionService.getIncident",
 	)(function* (orgId, incidentId) {
 		yield* Effect.annotateCurrentSpan({ orgId, incidentId })
@@ -568,11 +602,7 @@ const make = Effect.gen(function* () {
 		return incidentToDocument(row)
 	})
 
-	// -----------------------------------------------------------------
-	// Incident mutations
-	// -----------------------------------------------------------------
-
-	const resolveIncidentManually: AnomalyDetectionServiceShape["resolveIncidentManually"] = Effect.fn(
+	const resolveIncidentManually: AnomalyDetectionServiceApi["resolveIncidentManually"] = Effect.fn(
 		"AnomalyDetectionService.resolveIncidentManually",
 	)(function* (orgId, incidentId) {
 		yield* Effect.annotateCurrentSpan({ orgId, incidentId })
@@ -624,7 +654,7 @@ const make = Effect.gen(function* () {
 		return incidentToDocument(refreshed)
 	})
 
-	const setIncidentIssue: AnomalyDetectionServiceShape["setIncidentIssue"] = Effect.fn(
+	const setIncidentIssue: AnomalyDetectionServiceApi["setIncidentIssue"] = Effect.fn(
 		"AnomalyDetectionService.setIncidentIssue",
 	)(function* (orgId, incidentId, issueId) {
 		yield* Effect.annotateCurrentSpan({ orgId, incidentId, issueId: issueId ?? "(none)" })
@@ -660,14 +690,12 @@ const make = Effect.gen(function* () {
 		}
 	})
 
-	// -----------------------------------------------------------------
 	// Incident timeseries — observed-vs-baseline chart data
-	// -----------------------------------------------------------------
 
 	/** Max chart window; matches the detector's own baseline horizon. */
 	const TIMESERIES_MAX_WINDOW_MS = BASELINE_WINDOW_MS
 
-	const getIncidentTimeseries: AnomalyDetectionServiceShape["getIncidentTimeseries"] = Effect.fn(
+	const getIncidentTimeseries: AnomalyDetectionServiceApi["getIncidentTimeseries"] = Effect.fn(
 		"AnomalyDetectionService.getIncidentTimeseries",
 	)(function* (tenant, incidentId, opts) {
 		const orgId = tenant.orgId
@@ -717,12 +745,10 @@ const make = Effect.gen(function* () {
 				deploymentEnv: row.deploymentEnv,
 				bucketSeconds,
 			})
-			const rows = yield* warehouse
-				.compiledQuery(tenant, compiled, {
-					profile: "list",
-					context: "anomalyIncidentTimeseries",
-				})
-				.pipe(Effect.mapError(makePersistenceError))
+			const rows = yield* warehouse.compiledQuery(tenant, compiled, {
+				profile: "list",
+				context: "anomalyIncidentTimeseries",
+			})
 			buckets = rollingCountBuckets(
 				rows.map((r) => ({
 					bucketMs: parseWarehouseDateTime(String(r.bucket ?? "")),
@@ -750,12 +776,10 @@ const make = Effect.gen(function* () {
 				serviceName: row.serviceName,
 				deploymentEnv: row.deploymentEnv,
 			})
-			const rows = yield* warehouse
-				.compiledQuery(tenant, compiled, {
-					profile: "list",
-					context: "anomalyIncidentTimeseries",
-				})
-				.pipe(Effect.mapError(makePersistenceError))
+			const rows = yield* warehouse.compiledQuery(tenant, compiled, {
+				profile: "list",
+				context: "anomalyIncidentTimeseries",
+			})
 			buckets = rows.map((r) => {
 				const hourMs = parseWarehouseDateTime(String(r.hour ?? ""))
 				const errorLogCount = Number(r.errorLogCount ?? 0)
@@ -772,12 +796,10 @@ const make = Effect.gen(function* () {
 				serviceName: row.serviceName,
 				deploymentEnv: row.deploymentEnv,
 			})
-			const rows = yield* warehouse
-				.compiledQuery(tenant, compiled, {
-					profile: "list",
-					context: "anomalyIncidentTimeseries",
-				})
-				.pipe(Effect.mapError(makePersistenceError))
+			const rows = yield* warehouse.compiledQuery(tenant, compiled, {
+				profile: "list",
+				context: "anomalyIncidentTimeseries",
+			})
 			const signalType = row.signalType
 			unit =
 				signalType === "error_rate"
@@ -816,9 +838,7 @@ const make = Effect.gen(function* () {
 		})
 	})
 
-	// -----------------------------------------------------------------
 	// Tick: data fetch
-	// -----------------------------------------------------------------
 
 	interface HourRow {
 		readonly hour: string
@@ -1005,7 +1025,7 @@ const make = Effect.gen(function* () {
 				baseline: baseline.get(key) ?? [],
 			})
 		}
-		return series.slice(0, MAX_SERIES_PER_ORG)
+		return capBusiestLogSeries(series, MAX_SERIES_PER_ORG)
 	})
 
 	const fetchErrorSpikes = Effect.fn("AnomalyDetectionService.fetchErrorSpikes")(function* (
@@ -1074,9 +1094,7 @@ const make = Effect.gen(function* () {
 		return { observations, baselines }
 	})
 
-	// -----------------------------------------------------------------
 	// Tick: per-org processing
-	// -----------------------------------------------------------------
 
 	const claimOrg = (orgId: OrgId, nowMs: number) =>
 		dbExecute((db) =>
@@ -1095,6 +1113,53 @@ const make = Effect.gen(function* () {
 				// The returned row is the claim: empty means another tick holds the lock.
 				.returning({ orgId: anomalyDetectorSettings.orgId }),
 		)
+
+	/**
+	 * Flush accumulated detector states as multi-row upserts.
+	 *
+	 * Replaces one `dbExecute` per evaluated series. `set` reads from `excluded.*`
+	 * rather than per-row literals — with many rows in one statement there is no
+	 * single literal to write, and `excluded` is the row the statement is
+	 * currently conflicting on (same pattern as `error-tick-persistence.ts:302`).
+	 *
+	 * Dedupe and chunking live in `batchDetectorStates`, which is pure and tested.
+	 *
+	 * Chunks run concurrently: each is its own dial, and `batchDetectorStates`
+	 * dedupes by `detectorKey` first, so no two chunks ever touch the same row and
+	 * they cannot deadlock against each other. Bounded rather than unbounded
+	 * because `processOrg` is itself already running at concurrency 4 — the cap is
+	 * on connections to the same origin pool, not on this loop in isolation.
+	 */
+	const flushDetectorStates = Effect.fnUntraced(function* (
+		writes: MutableHashMap.MutableHashMap<string, typeof anomalyDetectorStates.$inferInsert>,
+	) {
+		yield* Effect.forEach(
+			batchDetectorStates(Arr.map(Arr.fromIterable(writes), ([, row]) => row)),
+			(chunk) =>
+				dbExecute((db) =>
+					db
+						.insert(anomalyDetectorStates)
+						.values(chunk)
+						.onConflictDoUpdate({
+							target: [anomalyDetectorStates.orgId, anomalyDetectorStates.detectorKey],
+							set: {
+								consecutiveBreaches: sql`excluded.consecutive_breaches`,
+								consecutiveHealthy: sql`excluded.consecutive_healthy`,
+								lastStatus: sql`excluded.last_status`,
+								lastValue: sql`excluded.last_value`,
+								baselineMedian: sql`excluded.baseline_median`,
+								lastSampleCount: sql`excluded.last_sample_count`,
+								lastEvaluatedAt: sql`excluded.last_evaluated_at`,
+								openIncidentId: sql`excluded.open_incident_id`,
+								lastResolvedAt: sql`excluded.last_resolved_at`,
+								lastIncidentId: sql`excluded.last_incident_id`,
+								updatedAt: sql`excluded.updated_at`,
+							},
+						}),
+				),
+			{ concurrency: DETECTOR_STATE_FLUSH_CONCURRENCY, discard: true },
+		)
+	})
 
 	const newIncidentId = () => decodeIncidentIdSync(randomUUID())
 
@@ -1135,6 +1200,10 @@ const make = Effect.gen(function* () {
 		const elapsedMinutes = Math.floor((nowMs - currentHourStartMs) / 60_000)
 		const config = { sensitivity, elapsedMinutes }
 
+		// Warm this org's route before the three-way fan-out. Deliberately here and
+		// not at the outer per-org `Effect.forEach`: the route is per-org, so
+		// warming at the outer level would resolve the wrong org's config.
+		yield* warehouse.warmRoute(tenant)
 		const [goldenSeries, logSeries, spikes] = yield* Effect.all(
 			[
 				fetchGoldenSeries(tenant, nowMs, currentHourStartMs),
@@ -1147,32 +1216,46 @@ const make = Effect.gen(function* () {
 		// Load state before evaluation: an opening floor suppresses noisy new
 		// fingerprints, but an already-open fingerprint falling below that floor
 		// is positive recovery evidence and must advance healthy hysteresis.
-		const stateRows = yield* dbExecute((db) =>
-			db.select().from(anomalyDetectorStates).where(eq(anomalyDetectorStates.orgId, orgId)),
+		// Only the open-incident slice is needed to *build* evaluations: the spike
+		// branch below and the zero-count sweep both ignore rows whose
+		// openIncidentId is null. Loading the whole org partition here read ~5.7k
+		// rows per tick to use one; the rest is fetched by key once the evaluated
+		// set is known.
+		const openStateRows = yield* dbExecute((db) =>
+			db
+				.select()
+				.from(anomalyDetectorStates)
+				.where(
+					and(
+						eq(anomalyDetectorStates.orgId, orgId),
+						isNotNull(anomalyDetectorStates.openIncidentId),
+					),
+				),
 		)
 		const stateByKey = new Map<string, AnomalyDetectorStateRow>(
-			stateRows.map((row) => [row.detectorKey, row]),
+			openStateRows.map((row) => [row.detectorKey, row]),
 		)
 
 		// firstSeenAt per fingerprint so young issues stay with first_seen handling.
-		// Chunked: D1 caps bound parameters at ~100 per statement, so a single
-		// inArray over a busy org's fingerprints fails the whole tick for it
-		// (same constraint as ErrorsService's D1_INARRAY_CHUNK_SIZE).
-		const fingerprints = [...new Set(spikes.observations.map((o) => o.fingerprintHash))]
-		const fingerprintChunks = Arr.chunksOf(fingerprints, D1_INARRAY_CHUNK_SIZE)
-		const issueRowChunks = yield* Effect.forEach(fingerprintChunks, (chunk) =>
-			dbExecute((db) =>
-				db
-					.select({
-						fingerprintHash: errorIssues.fingerprintHash,
-						issueId: errorIssues.id,
-						firstSeenAt: errorIssues.firstSeenAt,
-					})
-					.from(errorIssues)
-					.where(and(eq(errorIssues.orgId, orgId), inArray(errorIssues.fingerprintHash, chunk))),
-			),
-		)
-		const issueRows = issueRowChunks.flat()
+		const fingerprints = Arr.dedupe(Arr.map(spikes.observations, (o) => o.fingerprintHash))
+		const issueRows =
+			fingerprints.length === 0
+				? []
+				: yield* dbExecute((db) =>
+						db
+							.select({
+								fingerprintHash: errorIssues.fingerprintHash,
+								issueId: errorIssues.id,
+								firstSeenAt: errorIssues.firstSeenAt,
+							})
+							.from(errorIssues)
+							.where(
+								and(
+									eq(errorIssues.orgId, orgId),
+									inArray(errorIssues.fingerprintHash, fingerprints),
+								),
+							),
+					)
 		const issueFirstSeenAt = new Map(issueRows.map((r) => [r.fingerprintHash, r.firstSeenAt.getTime()]))
 		const issueIdByFingerprint = new Map(issueRows.map((r) => [r.fingerprintHash, r.issueId]))
 
@@ -1208,10 +1291,9 @@ const make = Effect.gen(function* () {
 		// A zero-count fingerprint is absent from the grouped warehouse result.
 		// Synthesize it from persisted state so an open incident resolves after
 		// three healthy ticks instead of freezing until the one-hour stale sweep.
-		for (const state of stateRows) {
+		for (const state of openStateRows) {
 			if (
 				state.signalType !== "error_spike" ||
-				state.openIncidentId === null ||
 				state.fingerprintHash === null ||
 				observedSpikeKeys.has(state.detectorKey)
 			) {
@@ -1233,6 +1315,33 @@ const make = Effect.gen(function* () {
 
 		const active = evaluations.filter((e) => !muted.has(e.signalType))
 		stats.seriesEvaluated = active.length
+
+		// Hydrate the states the decision loop below reads. The evaluated key set is
+		// only knowable here, but it is bounded by the series actually observed, so
+		// this is a primary-key lookup rather than an org-wide scan.
+		const missingKeys = Arr.dedupe(
+			active.flatMap((e) => (stateByKey.has(e.detectorKey) ? [] : [e.detectorKey])),
+		)
+		yield* Effect.forEach(
+			Arr.chunksOf(missingKeys, DETECTOR_STATE_FETCH_CHUNK),
+			(chunk) =>
+				dbExecute((db) =>
+					db
+						.select()
+						.from(anomalyDetectorStates)
+						.where(
+							and(
+								eq(anomalyDetectorStates.orgId, orgId),
+								inArray(anomalyDetectorStates.detectorKey, chunk),
+							),
+						),
+				).pipe(
+					Effect.map((rows) => {
+						for (const row of rows) stateByKey.set(row.detectorKey, row)
+					}),
+				),
+			{ discard: true },
+		)
 
 		// Open incidents are kept current in memory through the sequential loop
 		// so same-tick attaches and severity recomputes see each other.
@@ -1270,21 +1379,19 @@ const make = Effect.gen(function* () {
 			readonly consecutiveHealthy: number
 		}
 
-		const decisions: PendingDecision[] = active.map((evaluation) => {
+		const decisions: PendingDecision[] = yield* Effect.forEach(active, (evaluation) => {
 			const state = stateByKey.get(evaluation.detectorKey)
-			const snapshot: DetectorStateSnapshot = {
-				consecutiveBreaches: state?.consecutiveBreaches ?? 0,
-				consecutiveHealthy: state?.consecutiveHealthy ?? 0,
-				openIncidentId: state?.openIncidentId ?? null,
-				lastResolvedAt: dateToMs(state?.lastResolvedAt ?? null),
-			}
-			const decision = decideTransition(
-				snapshot,
-				evaluation,
-				stateMachineConfigFor(evaluation.signalType),
+			return foldObservation(
+				{
+					consecutiveBreaches: state?.consecutiveBreaches ?? 0,
+					consecutiveHealthy: state?.consecutiveHealthy ?? 0,
+					incidentOpen: (state?.openIncidentId ?? null) !== null,
+					lastResolvedAtMs: dateToMs(state?.lastResolvedAt ?? null),
+				},
+				evaluation.status,
+				hysteresisConfigFor(evaluation.signalType),
 				nowMs,
-			)
-			return { evaluation, state, ...decision }
+			).pipe(Effect.map((outcome) => ({ evaluation, state, ...outcome })))
 		})
 
 		// Opens run first (strongest deviation first) so the lead fingerprint
@@ -1304,6 +1411,20 @@ const make = Effect.gen(function* () {
 			})
 		const orderedDecisions = [...openDecisions, ...decisions.filter((d) => d.transition !== "open")]
 		let openBudget = MAX_OPENS_PER_TICK
+
+		// Detector-state writes are accumulated here and flushed as one multi-row
+		// upsert after the loop, rather than one `dbExecute` per decision. Under
+		// `DatabasePgLive` each execute dials and tears down its own postgres.js
+		// client, so the handshake count is what costs, not the statement count —
+		// same trade as `error-tick-persistence.ts`. This loop averaged ~70 dials
+		// per org tick and peaked at 628.
+		//
+		// Keyed by `detectorKey` rather than a plain list: the consolidated-incident
+		// refcount below has to see this tick's own buffered writes, and last-wins
+		// on a repeated key is what the sequential per-row loop did anyway. Safe to
+		// mutate directly — the `Effect.forEach` below is sequential (no
+		// `concurrency` option), so writes cannot interleave.
+		const detectorStateWrites = MutableHashMap.empty<string, typeof anomalyDetectorStates.$inferInsert>()
 
 		yield* Effect.forEach(
 			orderedDecisions,
@@ -1527,7 +1648,22 @@ const make = Effect.gen(function* () {
 							createdAt: new Date(nowMs),
 							updatedAt: new Date(nowMs),
 						}
-						yield* dbExecute((db) => db.insert(anomalyIncidents).values(insertValues))
+						// `anomaly_incidents_open_detector_idx` allows one open incident
+						// per detector. The org claim is a bare TTL CAS, so a tick that
+						// outruns ORG_LOCK_TTL_MS can overlap the next one and both can
+						// reach here for the same detector; the loser must not create a
+						// second incident or enqueue a second triage.
+						const insertedIncident = yield* dbExecute((db) =>
+							db.insert(anomalyIncidents).values(insertValues).onConflictDoNothing().returning({
+								id: anomalyIncidents.id,
+							}),
+						)
+						if (insertedIncident.length === 0) {
+							yield* Effect.logWarning(
+								"Skipped duplicate anomaly incident open: another tick won the race",
+							).pipe(Effect.annotateLogs({ orgId, detectorKey: evaluation.detectorKey }))
+							return
+						}
 						const runtime: IncidentRuntime = {
 							row: { ...insertValues, resolvedAt: null, resolveReason: null },
 							entries,
@@ -1558,7 +1694,9 @@ const make = Effect.gen(function* () {
 								serviceName: evaluation.serviceName,
 								deploymentEnv: evaluation.deploymentEnv,
 								fingerprintHash: evaluation.fingerprintHash,
-								severity: evaluation.severity,
+								// Same two-scale mismatch as the alert path: unmapped, a `warning`
+								// anomaly reached the snapshot as an unclassified incident.
+								severity: issueSeverityFromAlert(evaluation.severity),
 								observedValue: evaluation.value,
 								baselineMedian: evaluation.baselineMedian,
 								baselineSigma: evaluation.baselineSigma,
@@ -1566,7 +1704,7 @@ const make = Effect.gen(function* () {
 								sampleCount: evaluation.sampleCount,
 								detectedAt: new Date(nowMs).toISOString(),
 							},
-							agentBinding: investigationAgentBinding,
+							fanoutBinding: investigationFanoutBinding,
 						}).pipe(Effect.provideService(Database, database))
 						if (triage.enqueued) {
 							yield* dbExecute((db) =>
@@ -1620,13 +1758,13 @@ const make = Effect.gen(function* () {
 								severity,
 								lastTriggeredAt: new Date(nowMs),
 								updatedAt: new Date(nowMs),
-								...(fingerprintsJson !== undefined ? { fingerprintsJson } : {}),
+								...(fingerprintsJson !== undefined ? { fingerprintsJson } : undefined),
 							}
 						: {
 								severity,
 								lastTriggeredAt: new Date(nowMs),
 								updatedAt: new Date(nowMs),
-								...(fingerprintsJson !== undefined ? { fingerprintsJson } : {}),
+								...(fingerprintsJson !== undefined ? { fingerprintsJson } : undefined),
 							}
 					const updated = yield* dbExecute((db) =>
 						db
@@ -1686,10 +1824,10 @@ const make = Effect.gen(function* () {
 									lastObservedValue: evaluation.value,
 									lastSampleCount: evaluation.sampleCount,
 								}
-							: {}),
+							: undefined),
 						...(runtime !== undefined && runtime.entries.length > 0
 							? { fingerprintsJson: runtime.entries }
-							: {}),
+							: undefined),
 					}
 					const updated = yield* dbExecute((db) =>
 						db
@@ -1735,11 +1873,23 @@ const make = Effect.gen(function* () {
 						runtime === undefined || runtime.row.detectorKey === evaluation.detectorKey
 					// Refcount: a consolidated incident only resolves once no other
 					// series still points at it.
-					const otherStates = yield* dbExecute((db) =>
+					//
+					// These rows are pre-tick truth. Detector-state writes are buffered
+					// until `flushDetectorStates` runs after this loop, so a sibling that
+					// already recovered earlier in this same pass still reads as pointing
+					// here — and two siblings recovering in one tick would each see the
+					// other and neither would close the incident. `effectiveOtherStates`
+					// overlays the buffered writes to fix that, which is also why there is
+					// no `LIMIT 1`: the one row it returned could be the very row the
+					// overlay removes, hiding a genuinely live sibling behind it.
+					const persistedOtherStates = yield* dbExecute((db) =>
 						db
 							.select({
 								detectorKey: anomalyDetectorStates.detectorKey,
 								fingerprintHash: anomalyDetectorStates.fingerprintHash,
+								// Carried so the promotion below can write the incident's
+								// `last_sample_count` from the promoted series' own count.
+								lastSampleCount: anomalyDetectorStates.lastSampleCount,
 							})
 							.from(anomalyDetectorStates)
 							.where(
@@ -1748,9 +1898,14 @@ const make = Effect.gen(function* () {
 									eq(anomalyDetectorStates.openIncidentId, incidentId),
 									ne(anomalyDetectorStates.detectorKey, evaluation.detectorKey),
 								),
-							)
-							.limit(1),
+							),
 					)
+					const otherStates = effectiveOtherStates({
+						persisted: persistedOtherStates,
+						pending: Arr.map(Arr.fromIterable(detectorStateWrites), ([, row]) => row),
+						currentDetectorKey: evaluation.detectorKey,
+						incidentId,
+					})
 					if (otherStates.length === 0) {
 						yield* dbExecute((db) =>
 							db
@@ -1764,11 +1919,11 @@ const make = Effect.gen(function* () {
 												lastObservedValue: evaluation.value,
 												lastSampleCount: evaluation.sampleCount,
 											}
-										: {}),
+										: undefined),
 									updatedAt: new Date(nowMs),
 									...(runtime !== undefined && runtime.entries.length > 0
 										? { fingerprintsJson: runtime.entries }
-										: {}),
+										: undefined),
 								})
 								.where(
 									and(
@@ -1804,7 +1959,7 @@ const make = Effect.gen(function* () {
 										fingerprintsJson: runtime.entries,
 										severity: headlineSeverity(runtime.entries, runtime.row.severity),
 									}
-								: {}),
+								: undefined),
 							...(isPrimary
 								? {
 										detectorKey: next.detectorKey,
@@ -1812,11 +1967,17 @@ const make = Effect.gen(function* () {
 										...(nextEntry !== undefined
 											? {
 													lastObservedValue: nextEntry.lastValue,
-													lastSampleCount: nextEntry.lastValue,
+													// The count comes from the promoted series' state row, not
+													// from the fingerprint entry — entries carry only a value.
+													// This previously read `nextEntry.lastValue`, i.e. the
+													// metric reading (a p95 in ms) into an `integer` column,
+													// so every detach failed with `invalid input syntax for
+													// type integer: "4729.711321330495"`.
+													lastSampleCount: next.lastSampleCount ?? 0,
 												}
-											: {}),
+											: undefined),
 									}
-								: {}),
+								: undefined),
 						}
 						yield* dbExecute((db) =>
 							db
@@ -1838,48 +1999,30 @@ const make = Effect.gen(function* () {
 					lastIncidentId = incidentId
 				}
 
-				yield* dbExecute((db) =>
-					db
-						.insert(anomalyDetectorStates)
-						.values({
-							orgId,
-							detectorKey: evaluation.detectorKey,
-							signalType: evaluation.signalType,
-							serviceName: evaluation.serviceName,
-							deploymentEnv: evaluation.deploymentEnv,
-							fingerprintHash: evaluation.fingerprintHash,
-							consecutiveBreaches: decision.consecutiveBreaches,
-							consecutiveHealthy: decision.consecutiveHealthy,
-							lastStatus: evaluation.status,
-							lastValue: evaluation.value,
-							baselineMedian: evaluation.baselineMedian,
-							lastSampleCount: evaluation.sampleCount,
-							lastEvaluatedAt: new Date(nowMs),
-							openIncidentId,
-							lastResolvedAt: msToDate(lastResolvedAt),
-							lastIncidentId,
-							updatedAt: new Date(nowMs),
-						})
-						.onConflictDoUpdate({
-							target: [anomalyDetectorStates.orgId, anomalyDetectorStates.detectorKey],
-							set: {
-								consecutiveBreaches: decision.consecutiveBreaches,
-								consecutiveHealthy: decision.consecutiveHealthy,
-								lastStatus: evaluation.status,
-								lastValue: evaluation.value,
-								baselineMedian: evaluation.baselineMedian,
-								lastSampleCount: evaluation.sampleCount,
-								lastEvaluatedAt: new Date(nowMs),
-								openIncidentId,
-								lastResolvedAt: msToDate(lastResolvedAt),
-								lastIncidentId,
-								updatedAt: new Date(nowMs),
-							},
-						}),
-				)
+				MutableHashMap.set(detectorStateWrites, evaluation.detectorKey, {
+					orgId,
+					detectorKey: evaluation.detectorKey,
+					signalType: evaluation.signalType,
+					serviceName: evaluation.serviceName,
+					deploymentEnv: evaluation.deploymentEnv,
+					fingerprintHash: evaluation.fingerprintHash,
+					consecutiveBreaches: decision.consecutiveBreaches,
+					consecutiveHealthy: decision.consecutiveHealthy,
+					lastStatus: evaluation.status,
+					lastValue: evaluation.value,
+					baselineMedian: evaluation.baselineMedian,
+					lastSampleCount: evaluation.sampleCount,
+					lastEvaluatedAt: new Date(nowMs),
+					openIncidentId,
+					lastResolvedAt: msToDate(lastResolvedAt),
+					lastIncidentId,
+					updatedAt: new Date(nowMs),
+				})
 			}),
 			{ discard: true },
 		)
+
+		yield* flushDetectorStates(detectorStateWrites)
 
 		// No-data sweep: open incidents whose series stopped reporting entirely
 		// resolve after an hour of silence (mirrors ErrorsService auto-resolve).
@@ -1950,7 +2093,7 @@ const make = Effect.gen(function* () {
 		return stats
 	})
 
-	const runTick: AnomalyDetectionServiceShape["runTick"] = Effect.fn("AnomalyDetectionService.runTick")(
+	const runTick: AnomalyDetectionServiceApi["runTick"] = Effect.fn("AnomalyDetectionService.runTick")(
 		function* () {
 			const nowMs = yield* Clock.currentTimeMillis
 			const runRetention = Math.floor(nowMs / TICK_CADENCE_MS) % RETENTION_PHASE_EVERY_N_TICKS === 0
@@ -2023,14 +2166,14 @@ const make = Effect.gen(function* () {
 											).pipe(
 												Effect.annotateLogs({
 													orgId: org,
-													error: Cause.pretty(cause),
+													error: summarizeCause(cause),
 												}),
 											)
 										} else {
 											yield* Effect.logError("Anomaly tick failed for org").pipe(
 												Effect.annotateLogs({
 													orgId: org,
-													error: Cause.pretty(cause),
+													error: summarizeCause(cause),
 												}),
 											)
 										}
@@ -2069,6 +2212,7 @@ const make = Effect.gen(function* () {
 	return AnomalyDetectionService.of({
 		runTick,
 		listIncidents,
+		countIncidentsByService,
 		getIncident,
 		resolveIncidentManually,
 		setIncidentIssue,
@@ -2080,7 +2224,7 @@ const make = Effect.gen(function* () {
 
 export class AnomalyDetectionService extends Context.Service<
 	AnomalyDetectionService,
-	AnomalyDetectionServiceShape
+	AnomalyDetectionServiceApi
 >()("@maple/api/services/AnomalyDetectionService") {
 	static readonly layer = Layer.effect(this, make)
 }

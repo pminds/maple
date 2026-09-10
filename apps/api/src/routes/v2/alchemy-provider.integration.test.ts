@@ -14,6 +14,8 @@ import { MapleApiV2 } from "@maple/domain/http/v2"
 import { BucketCacheService } from "@maple/query-engine/caching"
 import { EdgeCacheService } from "@maple/cache"
 import type { ScopedPlanStatusSession } from "alchemy/Cli/Cli"
+import { Stack } from "alchemy/Stack"
+import { Stage } from "alchemy/Stage"
 import {
 	AlertDestination,
 	AlertDestinationProvider,
@@ -27,25 +29,34 @@ import { CacheBackendLive } from "@/platform/CacheBackendLive"
 import { EmailService } from "@/platform/EmailService"
 import { Env } from "@/platform/Env"
 import { cleanupTestDbs, createTestDb, type TestDb } from "@/platform/test-pglite"
-import type { WarehouseQueryServiceShape } from "@/services/warehouse/WarehouseQueryService"
+import type { WarehouseQueryServiceApi } from "@/services/warehouse/WarehouseQueryService"
 import { WarehouseQueryService } from "@/services/warehouse/WarehouseQueryService"
 import { ApiAuthorizationV2Layer } from "@/services/auth/ApiAuthorizationV2Layer"
+import { AuditLogService } from "@/services/audit/AuditLogService"
 import { ApiKeysService } from "@/services/org/ApiKeysService"
 import { AuthService } from "@/services/auth/AuthService"
 import { DashboardPersistenceService } from "@/services/dashboards/DashboardPersistenceService"
+import { SharedDashboardService } from "@/services/dashboards/SharedDashboardService"
 import { AlertRuntime, AlertsService } from "@/services/alerts/AlertsService"
+import { AlertDestinationsService } from "@/services/alerts/AlertDestinationsService"
+import { AlertReadModelsService } from "@/services/alerts/AlertReadModelsService"
+import { AlertRulesService } from "@/services/alerts/AlertRulesService"
 import { HazelOAuthService } from "@/services/auth/HazelOAuthService"
+import { OrgClickHouseSettingsService } from "@/services/org/OrgClickHouseSettingsService"
 import { OrgMembersService } from "@/services/org/OrgMembersService"
 import { QueryEngineService } from "@/services/warehouse/QueryEngineService"
-import { V2SchemaErrorsLive } from "./error-envelope"
+import { V2TransportErrorBoundaryLive } from "./error-envelope"
 import {
 	AllV2GroupLayersLive,
 	ApiV2RateLimiterAllowAllLayer,
 	ConfigResourceServiceStubsLayer,
+	makeWarehouseServiceStub,
+	PlanetScaleServiceStubsLayer,
 	SlackIntegrationServiceStubLayer,
 	TelemetryServiceStubsLayer,
 } from "./v2-test-support"
 import { InvestigationService } from "@/services/errors/InvestigationService"
+import { compiledQueryOf } from "@maple/query-engine/execution"
 
 const createdDbs: TestDb[] = []
 afterEach(() => cleanupTestDbs(createdDbs))
@@ -64,22 +75,17 @@ const testConfig = () =>
 			MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY: "maple-test-lookup-secret",
 			MAPLE_APP_BASE_URL: "http://127.0.0.1:3471",
 			INTERNAL_SERVICE_TOKEN: "test-internal-token",
-			QE_EVAL_BUCKET_CACHE_ENABLED: "false",
 		}),
 	)
 
 /** The v2 CRUD endpoints exercised here never reach the warehouse. */
-const warehouseStub: WarehouseQueryServiceShape = {
+const warehouseStub = makeWarehouseServiceStub({
 	query: () => Effect.die(new Error("unexpected warehouse pipe query")),
-	sqlQuery: () => Effect.succeed([]),
 	rawSqlQuery: () => Effect.succeed([]),
-	compiledQuery: (_tenant, compiled) => compiled.decodeRows([]).pipe(Effect.orDie),
+	compiledQuery: (_tenant, compiled) => compiledQueryOf(compiled).decodeRows([]).pipe(Effect.orDie),
 	compiledQueryFirst: () => Effect.die(new Error("unexpected compiled query")),
 	ingest: () => Effect.void,
-	asExecutor: () => {
-		throw new Error("asExecutor is not supported by this test stub")
-	},
-}
+})
 
 const session: ScopedPlanStatusSession = {
 	emit: () => Effect.void,
@@ -119,6 +125,20 @@ const makeHarness = () => {
 	const investigationsLive = InvestigationService.layer.pipe(
 		Layer.provide(Layer.mergeAll(envLive, testDb.layer)),
 	)
+	const orgChSettingsLive = OrgClickHouseSettingsService.layer.pipe(
+		Layer.provide(Layer.mergeAll(envLive, testDb.layer, edgeCacheLive)),
+	)
+	const alertDestinationsLive = AlertDestinationsService.layer.pipe(
+		Layer.provide(
+			Layer.mergeAll(envLive, testDb.layer, runtimeLive, hazelOAuthLive, emailLive, orgMembersLive),
+		),
+	)
+	const alertReadModelsLive = AlertReadModelsService.layer.pipe(
+		Layer.provide(Layer.mergeAll(testDb.layer, warehouseLive)),
+	)
+	const alertRulesLive = AlertRulesService.layer.pipe(
+		Layer.provide(Layer.mergeAll(testDb.layer, runtimeLive)),
+	)
 	const alertsLive = AlertsService.layer.pipe(
 		Layer.provide(
 			Layer.mergeAll(
@@ -130,7 +150,11 @@ const makeHarness = () => {
 				hazelOAuthLive,
 				emailLive,
 				orgMembersLive,
+				orgChSettingsLive,
 				investigationsLive,
+				alertDestinationsLive,
+				alertReadModelsLive,
+				alertRulesLive,
 			),
 		),
 	)
@@ -138,6 +162,10 @@ const makeHarness = () => {
 		ApiKeysService.layer,
 		AuthService.layer,
 		DashboardPersistenceService.layer,
+		SharedDashboardService.layer,
+		alertDestinationsLive,
+		alertReadModelsLive,
+		alertRulesLive,
 		alertsLive,
 	).pipe(Layer.provideMerge(Layer.mergeAll(envLive, testDb.layer)))
 
@@ -145,9 +173,11 @@ const makeHarness = () => {
 		Layer.provide(AllV2GroupLayersLive),
 		Layer.provide(ConfigResourceServiceStubsLayer),
 		Layer.provide(TelemetryServiceStubsLayer),
-		Layer.provide(V2SchemaErrorsLive),
+		Layer.provide(V2TransportErrorBoundaryLive),
 		Layer.provide(SlackIntegrationServiceStubLayer),
+		Layer.provide(PlanetScaleServiceStubsLayer),
 		Layer.provideMerge(ApiAuthorizationV2Layer),
+		Layer.provideMerge(AuditLogService.layerMemory),
 		Layer.provideMerge(ApiV2RateLimiterAllowAllLayer),
 		Layer.provideMerge(servicesLive),
 	)
@@ -186,7 +216,21 @@ const makeHarness = () => {
 			AlertDestinationProvider(),
 			AlertRuleProvider(),
 			ApiKeyProvider(),
-		).pipe(Layer.provideMerge(clientLive))
+		).pipe(
+			Layer.provideMerge(clientLive),
+			Layer.provideMerge(
+				Layer.mergeAll(
+					Layer.succeed(Stack, {
+						name: "api-integration",
+						stage: "test",
+						resources: {},
+						bindings: {},
+						actions: {},
+					}),
+					Layer.succeed(Stage, "test"),
+				),
+			),
+		)
 	}
 
 	return {
@@ -209,9 +253,9 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 			Effect.gen(function* () {
 				const provider = yield* Dashboard.Provider
 
-				// Create.
 				const created = yield* provider.reconcile({
 					id: "ops",
+					fqn: "ops",
 					instanceId: "i-1",
 					news: { name: "Operations", tags: ["production"] },
 					olds: undefined,
@@ -224,6 +268,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				// Steady state: no drift, no mutation (updated name unchanged).
 				const steady = yield* provider.reconcile({
 					id: "ops",
+					fqn: "ops",
 					instanceId: "i-1",
 					news: { name: "Operations", tags: ["production"] },
 					olds: { name: "Operations", tags: ["production"] },
@@ -236,6 +281,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				// Drift: rename via PATCH, id stable.
 				const renamed = yield* provider.reconcile({
 					id: "ops",
+					fqn: "ops",
 					instanceId: "i-1",
 					news: { name: "Operations v2", tags: ["production"] },
 					olds: { name: "Operations", tags: ["production"] },
@@ -246,9 +292,9 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				expect(renamed.dashboardId).toBe(created.dashboardId)
 				expect(renamed.name).toBe("Operations v2")
 
-				// Read observes the renamed dashboard.
 				const observed = yield* provider.read!({
 					id: "ops",
+					fqn: "ops",
 					instanceId: "i-1",
 					olds: { name: "Operations v2" },
 					output: renamed,
@@ -258,6 +304,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				// Delete, then read sees nothing; second delete tolerates the 404.
 				yield* provider.delete({
 					id: "ops",
+					fqn: "ops",
 					instanceId: "i-1",
 					olds: { name: "Operations v2" },
 					output: renamed,
@@ -266,6 +313,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				})
 				const gone = yield* provider.read!({
 					id: "ops",
+					fqn: "ops",
 					instanceId: "i-1",
 					olds: { name: "Operations v2" },
 					output: renamed,
@@ -273,6 +321,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				expect(gone).toBeUndefined()
 				yield* provider.delete({
 					id: "ops",
+					fqn: "ops",
 					instanceId: "i-1",
 					olds: { name: "Operations v2" },
 					output: renamed,
@@ -284,7 +333,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 		await harness.dispose()
 	})
 
-	it("wires destination → rule, adopts rules by unique name, and deletes cleanly", async () => {
+	it("wires destination → rule, recovers owned rules, and deletes cleanly", async () => {
 		const harness = makeHarness()
 		const key = await harness.bootstrapKey()
 		const layers = harness.providerLayers(key.secret)
@@ -296,6 +345,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 
 				const dest = yield* destinations.reconcile({
 					id: "hook",
+					fqn: "hook",
 					instanceId: "i-1",
 					news: { type: "webhook", name: "Ops hook", url: "https://example.com/hooks/maple" },
 					olds: undefined,
@@ -304,6 +354,33 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 					bindings: [],
 				})
 				expect(dest.destinationId).toMatch(/^dest_/)
+				const destinationProps = {
+					type: "webhook" as const,
+					name: "Ops hook",
+					url: "https://example.com/hooks/maple",
+				}
+				const disabled = yield* destinations.reconcile({
+					id: "hook",
+					fqn: "hook",
+					instanceId: "i-1",
+					session,
+					bindings: [],
+					news: { ...destinationProps, enabled: false },
+					olds: destinationProps,
+					output: dest,
+				})
+				expect(disabled.enabled).toBe(false)
+				const restored = yield* destinations.reconcile({
+					id: "hook",
+					fqn: "hook",
+					instanceId: "i-1",
+					session,
+					bindings: [],
+					news: destinationProps,
+					olds: { ...destinationProps, enabled: false },
+					output: disabled,
+				})
+				expect(restored.enabled).toBe(true)
 
 				const ruleProps = {
 					name: "Checkout error rate",
@@ -316,6 +393,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				}
 				const rule = yield* rules.reconcile({
 					id: "checkout-errors",
+					fqn: "checkout-errors",
 					instanceId: "i-1",
 					news: ruleProps,
 					olds: undefined,
@@ -324,10 +402,27 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 					bindings: [],
 				})
 				expect(rule.ruleId).toMatch(/^alrt_/)
+				expect(rule.configuration?.tags).toEqual([expect.stringMatching(/^alchemy:[a-f0-9]{24}$/)])
+				expect(rule.configuration?.threshold).toBe(0.05)
+				// A matching name alone does not authorize a different logical resource.
+				const collision = yield* Effect.flip(
+					rules.reconcile({
+						id: "foreign",
+						fqn: "foreign",
+						instanceId: "i-2",
+						session,
+						bindings: [],
+						news: { ...ruleProps, threshold: 0.9 },
+						olds: undefined,
+						output: undefined,
+					}),
+				)
+				expect(collision._tag).toBe("@maple/alchemy/errors/AlertRuleOwnershipError")
 
-				// Lost state (output undefined) → adopted by org-unique name, not duplicated.
+				// Lost state is recovered using the matching stack/stage/resource ownership tag.
 				const adopted = yield* rules.reconcile({
 					id: "checkout-errors",
+					fqn: "checkout-errors",
 					instanceId: "i-1",
 					news: ruleProps,
 					olds: undefined,
@@ -337,9 +432,9 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				})
 				expect(adopted.ruleId).toBe(rule.ruleId)
 
-				// Update threshold via PATCH.
 				const updated = yield* rules.reconcile({
 					id: "checkout-errors",
+					fqn: "checkout-errors",
 					instanceId: "i-1",
 					news: { ...ruleProps, threshold: 0.1 },
 					olds: ruleProps,
@@ -348,10 +443,12 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 					bindings: [],
 				})
 				expect(updated.ruleId).toBe(rule.ruleId)
+				expect(updated.configuration?.threshold).toBe(0.1)
 
 				// Delete rule first (destination delete conflicts while referenced).
 				yield* rules.delete({
 					id: "checkout-errors",
+					fqn: "checkout-errors",
 					instanceId: "i-1",
 					olds: ruleProps,
 					output: updated,
@@ -360,6 +457,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				})
 				yield* destinations.delete({
 					id: "hook",
+					fqn: "hook",
 					instanceId: "i-1",
 					news: undefined,
 					olds: { type: "webhook", name: "Ops hook", url: "https://example.com/hooks/maple" },
@@ -385,6 +483,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 
 				const created = yield* provider.reconcile({
 					id: "ci",
+					fqn: "ci",
 					instanceId: "i-1",
 					news: { name: "ci-pipeline", scopes: ["dashboards:write"] },
 					olds: undefined,
@@ -398,6 +497,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				// Steady state preserves the secret (the API never returns it again).
 				const steady = yield* provider.reconcile({
 					id: "ci",
+					fqn: "ci",
 					instanceId: "i-1",
 					news: { name: "ci-pipeline", scopes: ["dashboards:write"] },
 					olds: { name: "ci-pipeline", scopes: ["dashboards:write"] },
@@ -411,6 +511,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				// Rotate bump → roll: new id + secret, same name.
 				const rolled = yield* provider.reconcile({
 					id: "ci",
+					fqn: "ci",
 					instanceId: "i-1",
 					news: { name: "ci-pipeline", scopes: ["dashboards:write"], rotate: 1 },
 					olds: { name: "ci-pipeline", scopes: ["dashboards:write"] },
@@ -425,6 +526,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				// Revoke; read reports it gone.
 				yield* provider.delete({
 					id: "ci",
+					fqn: "ci",
 					instanceId: "i-1",
 					olds: { name: "ci-pipeline", scopes: ["dashboards:write"], rotate: 1 },
 					output: rolled,
@@ -433,6 +535,7 @@ describe("@maple-dev/alchemy providers against the real v2 handlers", () => {
 				})
 				const gone = yield* provider.read!({
 					id: "ci",
+					fqn: "ci",
 					instanceId: "i-1",
 					olds: { name: "ci-pipeline", scopes: ["dashboards:write"], rotate: 1 },
 					output: rolled,

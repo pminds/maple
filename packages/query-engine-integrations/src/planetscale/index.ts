@@ -2,15 +2,11 @@
 // and the service-map overlay.
 
 export {
-	planetscaleBranchConnectionsRowSchema,
 	planetscaleBranchConnectionsSQL,
 	planetscaleBranchGaugesSQL,
-	planetscaleBranchStatsRowSchema,
 	planetscaleBranchStorageRowSchema,
 	planetscaleBranchStorageSQL,
-	planetscaleConnectionsRowSchema,
 	planetscaleConnectionsSQL,
-	planetscaleDatabaseStatsRowSchema,
 	planetscaleGaugesSQL,
 	planetscaleStorageRowSchema,
 	planetscaleStorageSQL,
@@ -24,7 +20,8 @@ export {
 
 export {
 	planetscaleBranchInfraTimeseriesSQL,
-	planetscaleInfraTimeseriesRowSchema,
 	planetscaleInfraTimeseriesSQL,
 	type PlanetScaleInfraTimeseriesOutput,
 } from "./planetscale-infra"
+
+export { PLANETSCALE_STORAGE_RUNWAY_SQL, PLANETSCALE_STORAGE_USED_SQL } from "./planetscale-alerts"

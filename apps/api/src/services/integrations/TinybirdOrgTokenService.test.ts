@@ -1,9 +1,10 @@
+// SAFETY-FILE: JSON in this test is emitted by the fixture or unit under test before its fields are asserted.
 import { assert, describe, it } from "@effect/vitest"
-import { ConfigProvider, Effect, Layer } from "effect"
+import { Cause, ConfigProvider, Effect, Exit, Layer } from "effect"
 import { OrgId } from "@maple/domain"
 import { Schema } from "effect"
 import { TestClock } from "effect/testing"
-import { TinybirdOrgTokenService } from "./TinybirdOrgTokenService"
+import { JWT_CACHE_MAX_ENTRIES, TinybirdOrgTokenService } from "./TinybirdOrgTokenService"
 import { Env } from "@/platform/Env"
 
 const SIGNING_KEY = "explicit-test-signing-key"
@@ -20,7 +21,7 @@ const testConfig = (extra: Record<string, string> = {}, includeSigning = true) =
 						TINYBIRD_SIGNING_KEY: SIGNING_KEY,
 						TINYBIRD_WORKSPACE_ID: "ws-uuid-abc",
 					}
-				: {}),
+				: undefined),
 			MAPLE_AUTH_MODE: "self_hosted",
 			MAPLE_ROOT_PASSWORD: "test-root-password",
 			MAPLE_DEFAULT_ORG_ID: "default",
@@ -36,7 +37,9 @@ const decodePayload = (jwt: string) =>
 	JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString("utf8")) as {
 		workspace_id: string
 		exp: number
+		name: string
 		scopes: ReadonlyArray<{ resource: string; filter: string }>
+		limits?: { rps: number }
 	}
 
 describe("TinybirdOrgTokenService", () => {
@@ -84,6 +87,35 @@ describe("TinybirdOrgTokenService", () => {
 		}).pipe(Effect.provide(layer)),
 	)
 
+	it.effect("applies the configured per-org Tinybird RPS limit", () => {
+		const limitedLayer = TinybirdOrgTokenService.layer.pipe(
+			Layer.provide(Env.layer),
+			Layer.provide(testConfig({ TINYBIRD_RAW_SQL_JWT_RPS_LIMIT: "25" })),
+		)
+		return Effect.gen(function* () {
+			const svc = yield* TinybirdOrgTokenService
+			const a = decodePayload(yield* svc.getOrgReadToken(asOrgId("org_a")))
+			const b = decodePayload(yield* svc.getOrgReadToken(asOrgId("org_b")))
+			assert.deepStrictEqual(a.limits, { rps: 25 })
+			assert.deepStrictEqual(b.limits, { rps: 25 })
+			assert.notStrictEqual(a.name, b.name)
+		}).pipe(Effect.provide(limitedLayer))
+	})
+
+	it.effect("bounds the per-isolate token cache with LRU eviction", () =>
+		Effect.gen(function* () {
+			const svc = yield* TinybirdOrgTokenService
+			const first = yield* svc.getOrgReadToken(asOrgId("org_0"))
+			for (let i = 1; i <= JWT_CACHE_MAX_ENTRIES; i++) {
+				yield* svc.getOrgReadToken(asOrgId(`org_${i}`))
+			}
+			yield* TestClock.setTime(1_000)
+			const reminted = yield* svc.getOrgReadToken(asOrgId("org_0"))
+			assert.notStrictEqual(reminted, first)
+			assert.isAbove(decodePayload(reminted).exp, decodePayload(first).exp)
+		}).pipe(Effect.provide(layer)),
+	)
+
 	it.effect("returns a typed error when signing configuration is missing", () => {
 		const missingLayer = TinybirdOrgTokenService.layer.pipe(
 			Layer.provide(Env.layer),
@@ -92,20 +124,43 @@ describe("TinybirdOrgTokenService", () => {
 		return Effect.gen(function* () {
 			const svc = yield* TinybirdOrgTokenService
 			const error = yield* Effect.flip(svc.getOrgReadToken(asOrgId("org_a")))
-			assert.strictEqual(error.reason, "MissingSigningKey")
+			assert.strictEqual(error._tag, "@maple/http/errors/TinybirdOrgTokenConfigError")
+			assert.strictEqual(error.setting, "SigningKey")
 			assert.notInclude(error.message, "api-token-is-not-the-signing-key")
 		}).pipe(Effect.provide(missingLayer))
 	})
 
-	it.effect("returns a typed error for an empty workspace id", () => {
+	it.effect("fails startup when only one Tinybird JWT setting is configured", () => {
 		const malformedLayer = TinybirdOrgTokenService.layer.pipe(
 			Layer.provide(Env.layer),
 			Layer.provide(testConfig({ TINYBIRD_WORKSPACE_ID: "" })),
 		)
-		return Effect.gen(function* () {
-			const svc = yield* TinybirdOrgTokenService
-			const error = yield* Effect.flip(svc.getOrgReadToken(asOrgId("org_a")))
-			assert.strictEqual(error.reason, "MissingWorkspaceId")
-		}).pipe(Effect.provide(malformedLayer))
+		return Effect.asVoid(TinybirdOrgTokenService).pipe(
+			Effect.provide(malformedLayer),
+			Effect.exit,
+			Effect.map((exit) => {
+				assert.isTrue(Exit.isFailure(exit))
+				if (Exit.isFailure(exit)) {
+					assert.match(String(Cause.squash(exit.cause)), /must be configured together/)
+				}
+			}),
+		)
+	})
+
+	it.effect("fails startup for a non-positive JWT RPS limit", () => {
+		const malformedLayer = TinybirdOrgTokenService.layer.pipe(
+			Layer.provide(Env.layer),
+			Layer.provide(testConfig({ TINYBIRD_RAW_SQL_JWT_RPS_LIMIT: "0" })),
+		)
+		return Effect.asVoid(TinybirdOrgTokenService).pipe(
+			Effect.provide(malformedLayer),
+			Effect.exit,
+			Effect.map((exit) => {
+				assert.isTrue(Exit.isFailure(exit))
+				if (Exit.isFailure(exit)) {
+					assert.match(String(Cause.squash(exit.cause)), /must be a positive integer/)
+				}
+			}),
+		)
 	})
 })

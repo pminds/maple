@@ -1,41 +1,27 @@
+// BOUNDARY: This module owns unparsed external values and narrows them before domain use.
 import { InternalRpcToolNotFoundError, type InternalMcpToolDescriptor } from "@maple/domain/internal-rpc"
-import { Effect, Schema } from "effect"
-import { mapleToolDefinitions, toInputSchema, type MapleToolDefinition } from "./tools/registry"
+import { Context, Effect, Layer } from "effect"
+import { executeRegisteredMcpToolUnscoped, mapleToolCatalog, toInputSchema } from "./tools/registry"
 import type { McpToolResult } from "./tools/types"
-
-class McpDecodeError extends Schema.TaggedErrorClass<McpDecodeError>()("@maple/mcp/decode-error", {
-	errorMessage: Schema.String,
-}) {}
-
-const toErrorMessage = (error: unknown): string => {
-	if (error instanceof Error && "error" in error && error.error != null) {
-		const inner = error.error
-		return inner instanceof Error ? inner.message : String(inner)
-	}
-	if (error instanceof Error) return error.message
-	return String(error)
-}
-
-const toDecodeErrorMessage = (definition: MapleToolDefinition, error: unknown): string => {
-	if (Schema.isSchemaError(error)) {
-		return `${String(error)}. Check the "${definition.name}" tool schema for valid parameter names and types.`
-	}
-	return String(error)
-}
+import type { McpToolRuntimeRequirements } from "./tools/runtime-requirements"
+import { CurrentMcpTenant } from "./lib/query-warehouse"
+import { recordExpectedMcpFailure } from "./expected-failures"
+import type { TenantContext } from "@/services/auth/tenant-context"
+import { recordMcpToolAudit } from "@/services/audit/audit-access"
 
 /**
  * Built on first use, not at module scope.
  *
- * `apps/api/src/chat/agent.ts` imports this module and is itself reachable from the tool registry's
- * own import graph (registry -> a tool -> issue-hub/ai-triage-enqueue -> chat/session -> chat/agent
+ * `apps/api/src/chat/tools.ts` imports this module and is itself reachable from the tool registry's
+ * own import graph (registry -> a tool -> issue-hub/ai-triage-enqueue -> chat/session -> chat/tools
  * -> here). Computing the descriptors eagerly meant that whichever module the bundler happened to
- * evaluate first could observe `mapleToolDefinitions` as `undefined`. Deferring removes the
+ * evaluate first could observe the tool catalog as `undefined`. Deferring removes the
  * ordering dependency entirely rather than papering over one edge of the cycle.
  */
 let toolDescriptors: ReadonlyArray<InternalMcpToolDescriptor> | undefined
 
 const listToolDescriptors = (): ReadonlyArray<InternalMcpToolDescriptor> =>
-	(toolDescriptors ??= mapleToolDefinitions.map((definition) => ({
+	(toolDescriptors ??= mapleToolCatalog.map((definition) => ({
 		name: definition.name,
 		description: definition.description,
 		inputSchema: toInputSchema(definition.schema),
@@ -43,37 +29,15 @@ const listToolDescriptors = (): ReadonlyArray<InternalMcpToolDescriptor> =>
 
 export const listMcpTools = Effect.sync(listToolDescriptors)
 
-/** Shared tool dispatcher for public MCP-over-HTTP and internal Worker RPC. */
-export const callMcpTool = Effect.fn("McpToolDispatcher.call")(function* (name: string, input: unknown) {
-	const definition = mapleToolDefinitions.find((candidate) => candidate.name === name)
-	if (!definition) {
-		return yield* new InternalRpcToolNotFoundError({
-			name,
-			message: `Unknown MCP tool: ${name}`,
-		})
-	}
-
-	const execute = Effect.gen(function* () {
-		yield* Effect.annotateCurrentSpan({ tool: definition.name })
-		const decoded = yield* Effect.try({
-			try: () => Schema.decodeUnknownSync(definition.schema)(input),
-			catch: (error) => error,
-		}).pipe(
-			Effect.mapError(
-				(error) =>
-					new McpDecodeError({
-						errorMessage: toDecodeErrorMessage(definition, error),
-					}),
-			),
-		)
-
-		return yield* definition.handler(decoded).pipe(Effect.tap(() => Effect.logInfo("Tool completed")))
-	})
-
-	return yield* execute.pipe(
+/** Raw dispatcher. Executable handlers stay private so callers cannot omit the request tenant. */
+const callMcpToolUnscoped = Effect.fn("McpToolDispatcher.call")(function* (name: string, input: unknown) {
+	// The tool name was a log annotation only, so per-tool attribution worked
+	// solely because each handler happens to carry its own `McpTool.<name>` span
+	// — every usage query had to reconstruct it with `substring(SpanName, 9)`.
+	yield* Effect.annotateCurrentSpan("maple.mcp.tool", name)
+	return yield* executeRegisteredMcpToolUnscoped(name, input).pipe(
 		Effect.catchTag("@maple/mcp/decode-error", (error) =>
-			Effect.logWarning("Invalid parameters").pipe(
-				Effect.annotateLogs({ error: error.errorMessage }),
+			recordExpectedMcpFailure(error, "Invalid parameters").pipe(
 				Effect.as({
 					isError: true,
 					content: [
@@ -87,40 +51,57 @@ export const callMcpTool = Effect.fn("McpToolDispatcher.call")(function* (name: 
 		),
 		Effect.catchTags({
 			"@maple/mcp/errors/McpQueryError": (error) =>
-				Effect.logError(`Tool error: ${error.message}`).pipe(
-					Effect.annotateLogs({ errorTag: error._tag, pipe: error.pipeName }),
+				Effect.logError("MCP tool execution failed").pipe(
+					Effect.annotateLogs({
+						"error.message": error.message,
+						"error.type": error._tag,
+						"maple.mcp.pipe": error.pipeName,
+					}),
 					Effect.as({
 						isError: true,
 						content: [{ type: "text", text: `${error._tag}: ${error.message}` }],
 					} satisfies McpToolResult),
 				),
 			"@maple/mcp/errors/McpTenantError": (error) =>
-				Effect.logError(`Tool error: ${error.message}`).pipe(
-					Effect.annotateLogs({ errorTag: error._tag }),
+				Effect.logError("MCP tool execution failed").pipe(
+					Effect.annotateLogs({ "error.message": error.message, "error.type": error._tag }),
 					Effect.as({
 						isError: true,
 						content: [{ type: "text", text: `${error._tag}: ${error.message}` }],
 					} satisfies McpToolResult),
 				),
+			// Missing/invalid credentials are expected 401s, not failures: they are
+			// recorded on the span as attributes + a Warn log (see
+			// `expected-failures.ts`), never as an Error status or exception event.
 			"@maple/mcp/errors/McpAuthMissingError": (error) =>
-				Effect.logError(`Auth error: ${error.message}`).pipe(
-					Effect.annotateLogs({ errorTag: error._tag }),
+				recordExpectedMcpFailure(error, "MCP authentication failed").pipe(
 					Effect.as({
 						isError: true,
 						content: [{ type: "text", text: `${error._tag}: ${error.message}` }],
 					} satisfies McpToolResult),
 				),
 			"@maple/mcp/errors/McpAuthInvalidError": (error) =>
-				Effect.logError(`Auth error: ${error.message}`).pipe(
-					Effect.annotateLogs({ errorTag: error._tag }),
+				recordExpectedMcpFailure(error, "MCP authentication failed").pipe(
 					Effect.as({
 						isError: true,
 						content: [{ type: "text", text: `${error._tag}: ${error.message}` }],
 					} satisfies McpToolResult),
 				),
+			"@maple/mcp/errors/McpAuthUnavailableError": (error) =>
+				Effect.logError("MCP authentication dependency failed").pipe(
+					Effect.annotateLogs({ "error.message": error.message, "error.type": error._tag }),
+					Effect.as({
+						isError: true,
+						content: [{ type: "text", text: "Authentication is temporarily unavailable." }],
+					} satisfies McpToolResult),
+				),
 			"@maple/mcp/errors/McpInvalidTenantError": (error) =>
-				Effect.logError(`Tenant validation error [${error.field}]: ${error.message}`).pipe(
-					Effect.annotateLogs({ errorTag: error._tag, field: error.field }),
+				Effect.logError("MCP tenant validation failed").pipe(
+					Effect.annotateLogs({
+						"error.message": error.message,
+						"error.type": error._tag,
+						"maple.mcp.field": error.field,
+					}),
 					Effect.as({
 						isError: true,
 						content: [
@@ -132,14 +113,85 @@ export const callMcpTool = Effect.fn("McpToolDispatcher.call")(function* (name: 
 					} satisfies McpToolResult),
 				),
 		}),
-		Effect.catchDefect((error) =>
-			Effect.logError(`Tool defect: ${toErrorMessage(error)}`).pipe(
-				Effect.as({
-					isError: true,
-					content: [{ type: "text", text: `Error: ${toErrorMessage(error)}` }],
-				} satisfies McpToolResult),
-			),
-		),
-		Effect.annotateLogs({ tool: definition.name }),
+		// After the catchTags above, so a failure they converted into an in-band
+		// `isError` result is still counted. Tool handlers report failure in the
+		// result rather than the error channel, so span status alone never
+		// reflected a failed tool call.
+		Effect.tap((result) => Effect.annotateCurrentSpan("result.isError", result.isError === true)),
+		Effect.annotateLogs({ "maple.mcp.tool": name }),
 	)
 })
+
+/**
+ * Which entry point drove this tool call.
+ *
+ * Four surfaces share one dispatcher, and until this existed none of them were
+ * distinguishable in telemetry: the public-vs-internal traffic split had to be
+ * inferred from the ratio of `tools/call` spans to executor spans. Required
+ * rather than defaulted, for the same reason `tenant` is — a caller that forgets
+ * it should not silently be counted as somebody else.
+ */
+export type McpToolSurface =
+	/** The public MCP transport (`mcp/server.ts`). */
+	| "mcp"
+	/** The in-process AI chat agent (`chat/turn-runner.ts`). */
+	| "chat"
+	/** Agent workflow passes (`workflows/agent-pass.ts`). */
+	| "workflow"
+	/** Worker-to-worker internal RPC (`internal-rpc.ts`). */
+	| "rpc"
+
+export interface McpToolExecutorApi {
+	readonly execute: (
+		tenant: TenantContext,
+		name: string,
+		input: unknown,
+		surface: McpToolSurface,
+	) => Effect.Effect<McpToolResult, InternalRpcToolNotFoundError>
+}
+
+/**
+ * Closed execution boundary for every MCP surface.
+ *
+ * The layer captures the finite application-service context once. Each call
+ * must then supply its authenticated tenant explicitly, so no transport can
+ * accidentally execute a raw handler without CurrentMcpTenant.
+ */
+export class McpToolExecutor extends Context.Service<McpToolExecutor, McpToolExecutorApi>()(
+	"@maple/api/mcp/McpToolExecutor",
+	{
+		make: Effect.gen(function* () {
+			const runtimeServices = yield* Effect.context<McpToolRuntimeRequirements>()
+
+			const execute = Effect.fn("McpToolExecutor.execute")(function* (
+				tenant: TenantContext,
+				name: string,
+				input: unknown,
+				surface: McpToolSurface,
+			) {
+				yield* Effect.annotateCurrentSpan({
+					"maple.mcp.tool": name,
+					"maple.mcp.surface": surface,
+				})
+				const result = yield* callMcpToolUnscoped(name, input).pipe(
+					Effect.provideService(CurrentMcpTenant, tenant),
+					Effect.provide(runtimeServices),
+				)
+				// Every tool call is a read of (or change to) org data; the entry
+				// carries the tool, its parameters, and whether it failed in-band.
+				yield* recordMcpToolAudit({
+					tenant,
+					name,
+					input,
+					surface,
+					isError: result.isError === true,
+				}).pipe(Effect.provide(runtimeServices))
+				return result
+			})
+
+			return { execute }
+		}),
+	},
+) {
+	static readonly layer = Layer.effect(this, this.make)
+}

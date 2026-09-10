@@ -1,8 +1,8 @@
 import * as React from "react"
 import { Result, useAtomValue } from "@/lib/effect-atom"
 import { useAutocompleteValuesContext } from "@/hooks/use-autocomplete-values"
-import { type QueryBuilderMetricType } from "@/lib/query-builder/model"
-import { resetAggregationForMetricType } from "@/lib/query-builder/model"
+import { type QueryBuilderMetricType } from "@maple/query-engine/query-builder"
+import { resetAggregationForMetricType } from "@maple/query-engine/query-builder"
 import { listMetricsResultAtom } from "@/lib/services/atoms/warehouse-query-atoms"
 import { disabledResultAtom } from "@/lib/services/atoms/disabled-result-atom"
 import { useWidgetBuilder } from "@/hooks/use-widget-builder"
@@ -92,7 +92,6 @@ export function useWidgetBuilderData() {
 		}
 	}, [baseAutocompleteValues, metricRows, variableNames])
 
-	// Apply default metric selection when metric options first become available
 	const [appliedMetricDefault, setAppliedMetricDefault] = React.useState(false)
 	if (metricSelectionOptions.length > 0 && !appliedMetricDefault) {
 		const [defaultMetricName, defaultMetricTypeRaw] = metricSelectionOptions[0].value.split("::")

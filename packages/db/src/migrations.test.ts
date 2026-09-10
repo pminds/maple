@@ -1,3 +1,4 @@
+// SAFETY-FILE: JSON in this test is emitted by the fixture or unit under test before its fields are asserted.
 import { readdirSync, readFileSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -44,6 +45,30 @@ describe("drizzle migrations", () => {
 			).toBeGreaterThan(entries[i - 1]!.when)
 		}
 	})
+
+	/**
+	 * A migration is only recorded in `drizzle.__drizzle_migrations` after the
+	 * whole file succeeds, so one that dies halfway leaves the branch with some of
+	 * its DDL applied and no record of it — and every retry replays from the top
+	 * and fails on what it already created. `0035` hit exactly that on `main`
+	 * (`42701 duplicate_column` on `lens_name`), and the only fixes that do not
+	 * involve hand-writing production state are idempotent DDL.
+	 *
+	 * Asserted by re-applying, not by grepping for `IF NOT EXISTS`: what matters
+	 * is that a half-applied branch converges on a re-run, and a string match
+	 * would pass for a file that says the words and still is not re-runnable.
+	 */
+	it("re-applies the idempotent migrations without error", async () => {
+		const idempotent = ["0035_planned_investigations"]
+		const pg = new PGlite()
+		await pg.exec(readBundledMigrationsSql())
+
+		for (const tag of idempotent) {
+			const sql = readFileSync(resolve(migrationsDir(), `${tag}.sql`), "utf8")
+			await expect(pg.exec(sql), `${tag} must be re-runnable`).resolves.toBeDefined()
+		}
+		await pg.close()
+	}, 30_000)
 })
 
 // The bundled migrations are applied to a fresh PGlite instance via a single
@@ -66,6 +91,9 @@ describe("bundled migrations", () => {
 		"alert_destinations",
 		// API-key live reads (0014_electric_publication_api_keys)
 		"api_keys",
+		// Investigation detail page (0037_electric_publication_investigations)
+		"investigations",
+		"investigation_lens_runs",
 	]
 
 	// Published by 0009/0011, then pruned by 0022 once their client collections were

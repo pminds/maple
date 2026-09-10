@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { buildRawSqlDataSource, validateRawSqlMacro, visualizationToDisplayType } from "./raw-sql-widget"
+import { buildRawSqlDataSource, validateRawSql, visualizationToDisplayType } from "./raw-sql-widget"
 
 describe("visualizationToDisplayType", () => {
 	it("maps direct visualization kinds 1:1", () => {
@@ -25,18 +25,19 @@ describe("visualizationToDisplayType", () => {
 })
 
 describe("buildRawSqlDataSource", () => {
-	it("returns a raw_sql_chart dataSource with required params", () => {
+	it("returns a raw_sql data source with its fields hoisted", () => {
 		const result = buildRawSqlDataSource({
 			visualization: "chart",
 			sql: "SELECT 1 WHERE $__orgFilter",
 			displayType: "line",
 		})
-		expect(result.endpoint).toBe("raw_sql_chart")
-		expect(result.params).toEqual({
+		// v3: no endpoint string, and the payload sits on the arm itself rather
+		// than inside an opaque `params` bag.
+		expect(result).toEqual({
+			kind: "raw_sql",
 			sql: "SELECT 1 WHERE $__orgFilter",
 			displayType: "line",
 		})
-		expect(result.transform).toBeUndefined()
 	})
 
 	it("includes granularitySeconds when provided", () => {
@@ -46,7 +47,7 @@ describe("buildRawSqlDataSource", () => {
 			displayType: "line",
 			granularitySeconds: 60,
 		})
-		expect(result.params?.granularitySeconds).toBe(60)
+		expect(result.granularitySeconds).toBe(60)
 	})
 
 	it("omits granularitySeconds when null/undefined", () => {
@@ -55,7 +56,7 @@ describe("buildRawSqlDataSource", () => {
 			sql: "SELECT 1 WHERE $__orgFilter",
 			displayType: "line",
 		})
-		expect(result.params).not.toHaveProperty("granularitySeconds")
+		expect(result).not.toHaveProperty("granularitySeconds")
 	})
 
 	it("auto-injects reduceToValue transform for stat widgets", () => {
@@ -80,15 +81,43 @@ describe("buildRawSqlDataSource", () => {
 	})
 })
 
-describe("validateRawSqlMacro", () => {
+describe("validateRawSql", () => {
 	it("returns null when $__orgFilter is present", () => {
-		expect(validateRawSqlMacro("SELECT 1 WHERE $__orgFilter")).toBeNull()
-		expect(validateRawSqlMacro("SELECT 1 WHERE foo = 1 AND $__orgFilter")).toBeNull()
+		expect(validateRawSql("SELECT 1 WHERE $__orgFilter")).toBeNull()
+		expect(validateRawSql("SELECT 1 WHERE foo = 1 AND $__orgFilter")).toBeNull()
 	})
 
 	it("returns an error message when $__orgFilter is missing", () => {
-		const err = validateRawSqlMacro("SELECT 1")
+		const err = validateRawSql("SELECT 1")
 		expect(err).not.toBeNull()
 		expect(err).toContain("$__orgFilter")
+	})
+
+	// Everything below was accepted at write time before this delegated to the
+	// shared validator, and failed only when the dashboard was opened.
+	it("rejects a deny-listed statement", () => {
+		expect(validateRawSql("DROP TABLE logs WHERE $__orgFilter")).toContain("not allowed")
+	})
+
+	it("rejects an author-supplied SETTINGS clause", () => {
+		expect(validateRawSql("SELECT 1 WHERE $__orgFilter SETTINGS max_execution_time=3000")).toContain(
+			"SETTINGS is managed by Maple",
+		)
+	})
+
+	it("rejects multiple statements", () => {
+		expect(validateRawSql("SELECT 1 WHERE $__orgFilter; SELECT 2")).toContain("Multiple SQL statements")
+	})
+
+	it("rejects a non-SELECT query", () => {
+		expect(validateRawSql("EXPLAIN SELECT 1 WHERE $__orgFilter")).toContain("must be a SELECT query")
+	})
+
+	it("rejects an unknown macro", () => {
+		expect(validateRawSql("SELECT $__nope FROM logs WHERE $__orgFilter")).toContain("Unknown macro")
+	})
+
+	it("accepts a query that ends with FORMAT — the driver owns the wire format", () => {
+		expect(validateRawSql("SELECT 1 WHERE $__orgFilter FORMAT JSONEachRow")).toBeNull()
 	})
 })

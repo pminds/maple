@@ -9,10 +9,12 @@ import {
 } from "@maple/domain/primitives"
 import { actors, alertIncidents, errorIssues, errorIssueEvents, type ErrorIssueRow } from "@maple/db"
 import { and, eq, sql } from "drizzle-orm"
-import { Cause, Clock, Effect, Option, Redacted, Schema } from "effect"
+import { Clock, Effect, Option, Redacted, Schema } from "effect"
 import { Database } from "@/platform/DatabaseLive"
 import { maybeEnqueueTriage } from "./ai-triage-enqueue"
+import { issueSeverityFromAlert } from "./severity-map"
 import { SYSTEM_ALERTS_AGENT_NAME } from "@/services/auth/system-actors"
+import { summarizeCause } from "@/platform/describe-cause"
 
 /**
  * Issue-hub glue: alert incidents create/refresh `error_issues` rows
@@ -52,8 +54,8 @@ export interface UpsertAlertIssueInput {
 	readonly incidentId: AlertIncidentId
 	readonly serviceName: string
 	readonly timestamp: number
-	/** Raw CHAT_SESSION Durable Object namespace off the worker env (may be undefined). */
-	readonly agentBinding: unknown
+	/** `InvestigationFanoutWorkflow`, for incidents whose severity earns a fan-out. */
+	readonly fanoutBinding?: unknown
 }
 
 export interface UpsertAlertIssueResult {
@@ -68,6 +70,17 @@ const describeIncident = (input: UpsertAlertIssueInput): string => {
 	const group = input.groupKey === "__total__" ? "" : ` (group ${input.groupKey})`
 	return `${input.signalType} ${input.comparator} ${bound} — ${observed}${group}`
 }
+
+/**
+ * The system-alerts actor row is upserted immediately above, so a follow-up
+ * select that finds nothing means the write and the read disagreed — a defect,
+ * not something the alert tick could handle. The org and agent name are what
+ * make it reproducible.
+ */
+class SystemActorMissingError extends Schema.TaggedError<SystemActorMissingError>()(
+	"@maple/api/errors/SystemActorMissingError",
+	{ orgId: Schema.String, agentName: Schema.String, message: Schema.String },
+) {}
 
 const ensureSystemAlertsActor = Effect.fn("issueHub.ensureSystemAlertsActor")(function* (orgId: OrgId) {
 	const database = yield* Database
@@ -108,7 +121,18 @@ const ensureSystemAlertsActor = Effect.fn("issueHub.ensureSystemAlertsActor")(fu
 	)
 	const after = yield* select()
 	const row = after[0]
-	if (!row) return yield* Effect.die(new Error("Failed to ensure system-alerts actor row"))
+	if (!row) {
+		// The row was upserted two statements above; a select that then finds nothing
+		// means the write and the read disagree, which the alert tick cannot act on.
+		// oxlint-disable-next-line maple/no-effect-die
+		return yield* Effect.die(
+			new SystemActorMissingError({
+				orgId,
+				agentName: SYSTEM_ALERTS_AGENT_NAME,
+				message: "Failed to ensure the system-alerts actor row",
+			}),
+		)
+	}
 	return row.id
 })
 
@@ -146,52 +170,83 @@ export const upsertAlertIssue: (
 		let action: UpsertAlertIssueResult["action"]
 
 		if (prior === undefined) {
-			issueId = decodeIssueId(randomUUID())
-			action = "created"
-			yield* database.execute((db) =>
-				db.insert(errorIssues).values({
-					id: issueId,
-					orgId: input.orgId,
-					kind: "alert",
-					sourceRefJson,
-					fingerprintHash,
-					serviceName: input.serviceName,
-					exceptionType: input.ruleName,
-					exceptionMessage: describeIncident(input),
-					errorLabel: input.ruleName,
-					topFrame: "",
-					workflowState: "triage",
-					priority: 3,
-					severity: detectorSeverityFor(input.severity),
-					severitySource: "detector",
-					assignedActorId: null,
-					leaseHolderActorId: null,
-					leaseExpiresAt: null,
-					claimedAt: null,
-					notes: null,
-					firstSeenAt: new Date(input.timestamp),
-					lastSeenAt: new Date(input.timestamp),
-					occurrenceCount: 1,
-					resolvedAt: null,
-					resolvedByActorId: null,
-					snoozeUntil: null,
-					archivedAt: null,
-					createdAt: new Date(input.timestamp),
-					updatedAt: new Date(input.timestamp),
-				}),
+			const candidateId = decodeIssueId(randomUUID())
+			// The select above and this insert are separate statements, so two
+			// scheduler ticks can both miss the fingerprint and both insert. Without
+			// the conflict clause the loser raises `error_issues_org_fp_idx`.
+			const claimed = yield* database.execute((db) =>
+				db
+					.insert(errorIssues)
+					.values({
+						id: candidateId,
+						orgId: input.orgId,
+						kind: "alert",
+						sourceRefJson,
+						fingerprintHash,
+						serviceName: input.serviceName,
+						exceptionType: input.ruleName,
+						exceptionMessage: describeIncident(input),
+						errorLabel: input.ruleName,
+						topFrame: "",
+						workflowState: "triage",
+						priority: 3,
+						severity: detectorSeverityFor(input.severity),
+						severitySource: "detector",
+						assignedActorId: null,
+						leaseHolderActorId: null,
+						leaseExpiresAt: null,
+						claimedAt: null,
+						notes: null,
+						firstSeenAt: new Date(input.timestamp),
+						lastSeenAt: new Date(input.timestamp),
+						occurrenceCount: 1,
+						resolvedAt: null,
+						resolvedByActorId: null,
+						snoozeUntil: null,
+						archivedAt: null,
+						createdAt: new Date(input.timestamp),
+						updatedAt: new Date(input.timestamp),
+					})
+					.onConflictDoNothing({
+						target: [errorIssues.orgId, errorIssues.fingerprintHash],
+					})
+					.returning({ id: errorIssues.id }),
 			)
-			const actorId = yield* ensureSystemAlertsActor(input.orgId)
-			yield* recordIssueEvent(input.orgId, issueId, actorId, "created", {
-				toState: "triage",
-				payload: {
-					ruleId: input.ruleId,
-					ruleName: input.ruleName,
-					groupKey: input.groupKey,
-					signalType: input.signalType,
-					incidentId: input.incidentId,
-				},
-				timestamp: input.timestamp,
-			})
+
+			const insertedId = claimed[0]?.id
+			if (insertedId === undefined) {
+				// A concurrent tick created it. Adopt their row and report it as an
+				// update — emitting a second `created` event would double the history.
+				const winner = yield* database.execute((db) =>
+					db
+						.select({ id: errorIssues.id })
+						.from(errorIssues)
+						.where(
+							and(
+								eq(errorIssues.orgId, input.orgId),
+								eq(errorIssues.fingerprintHash, fingerprintHash),
+							),
+						)
+						.limit(1),
+				)
+				issueId = winner[0]?.id ?? candidateId
+				action = "refreshed"
+			} else {
+				issueId = insertedId
+				action = "created"
+				const actorId = yield* ensureSystemAlertsActor(input.orgId)
+				yield* recordIssueEvent(input.orgId, issueId, actorId, "created", {
+					toState: "triage",
+					payload: {
+						ruleId: input.ruleId,
+						ruleName: input.ruleName,
+						groupKey: input.groupKey,
+						signalType: input.signalType,
+						incidentId: input.incidentId,
+					},
+					timestamp: input.timestamp,
+				})
+			}
 		} else {
 			issueId = prior.id
 			const snoozeActive =
@@ -283,7 +338,10 @@ export const upsertAlertIssue: (
 				kind: "alert",
 				ruleName: input.ruleName,
 				signalType: input.signalType,
-				severity: input.severity,
+				// `AlertSeverity` is a two-value scale and the snapshot decodes a
+				// four-value one, so passing it through unmapped meant every `warning`
+				// alert failed the decode and arrived as an unclassified incident.
+				severity: issueSeverityFromAlert(input.severity),
 				comparator: input.comparator,
 				threshold: input.threshold,
 				thresholdUpper: input.thresholdUpper,
@@ -293,9 +351,10 @@ export const upsertAlertIssue: (
 				observedValue: input.observedValue,
 				sampleCount: input.sampleCount,
 				firstTriggeredAt: new Date(input.timestamp).toISOString(),
+				lastTriggeredAt: new Date(input.timestamp).toISOString(),
 				issueId,
 			},
-			agentBinding: input.agentBinding,
+			fanoutBinding: input.fanoutBinding,
 		})
 
 		return { issueId, action }
@@ -308,7 +367,7 @@ export const upsertAlertIssue: (
 						orgId: input.orgId,
 						ruleId: input.ruleId,
 						incidentId: input.incidentId,
-						error: Cause.pretty(cause),
+						error: summarizeCause(cause),
 					}),
 				)
 				return { issueId: null, action: "error" as const }

@@ -204,6 +204,181 @@
       "when": 1785514557099,
       "tag": "0029_purge_orphan_metric_incidents",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1785800580058,
+      "tag": "0030_planetscale_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1785975725201,
+      "tag": "0031_investigation_lens_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1786007865396,
+      "tag": "0032_fanout_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1786016554101,
+      "tag": "0033_lens_run_attempt",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1786016873783,
+      "tag": "0034_lens_mechanism",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1786059358436,
+      "tag": "0035_planned_investigations",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1786231852176,
+      "tag": "0036_remove_org_spend_limits",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1786269900000,
+      "tag": "0037_electric_publication_investigations",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1786292037508,
+      "tag": "0038_error_tick_cursor_outbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1786300000000,
+      "tag": "0039_investigation_inconclusive_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1786793464889,
+      "tag": "0040_dashboard_shares",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1786832731147,
+      "tag": "0041_dashboard_share_id_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1786963071458,
+      "tag": "0042_mobile_devices",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1787089609659,
+      "tag": "0043_alert_destination_auto_disable",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1787093253575,
+      "tag": "0044_error_fingerprint_v2",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1787131754667,
+      "tag": "0045_error_regression_tracking",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1787136812507,
+      "tag": "0046_live_activities",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1787524332738,
+      "tag": "0047_issue_pull_requests_verification",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1787744924452,
+      "tag": "0048_anomaly_index_tightening",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1787920777688,
+      "tag": "0049_home_list_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1788008344968,
+      "tag": "0050_cloudflare_grant_accounts",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1788201331961,
+      "tag": "0051_digest_subscription_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1788253667237,
+      "tag": "0052_mcp_refresh_family_expiry",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1788259897779,
+      "tag": "0053_digest_opt_out",
+      "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1788285534887,
+      "tag": "0054_alert_incident_open_uniqueness",
+      "breakpoints": true
     }
   ]
 }

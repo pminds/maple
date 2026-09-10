@@ -1,3 +1,4 @@
+// SAFETY-FILE: JSON rows here come from fixed internal formats and are validated before domain use.
 // Embedded chDB (in-process ClickHouse) via `bun:ffi` → `libchdb`.
 //
 // Replaces the Rust `apps/ingest/src/chdb.rs`. chDB allows exactly one
@@ -12,13 +13,15 @@
 import { CString, dlopen, FFIType, type Pointer, ptr, read, toArrayBuffer } from "bun:ffi"
 import { Effect, Schema, type Scope } from "effect"
 import { existsSync } from "node:fs"
+import { lstatSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
+import { durableJson } from "./durable-files"
 import { markStoreClosed, markStoreOpen, storeHasData } from "./store-version"
 
 /** A chDB failure — locating libchdb, opening the connection, or bootstrapping
  *  the schema. Carries the underlying message verbatim. */
-export class ChdbError extends Schema.TaggedErrorClass<ChdbError>()("@maple/cli/ChdbError", {
+export class ChdbError extends Schema.TaggedError<ChdbError>()("@maple/cli/ChdbError", {
 	message: Schema.String,
 }) {}
 
@@ -85,6 +88,116 @@ export interface ChdbOptions {
 	readonly configFile?: string
 	/** Apply the Maple schema after connect. Defaults to true. */
 	readonly bootstrapSchema?: boolean
+	/** Loaded persistent floor; not a transient launch-only setting. */
+	readonly rawTelemetryRetentionDays?: number
+}
+
+export const RAW_TELEMETRY_TTL_COLUMNS = [
+	["logs", "TimestampTime"],
+	["traces", "Timestamp"],
+	["metrics_sum", "TimeUnix"],
+	["metrics_gauge", "TimeUnix"],
+	["metrics_histogram", "TimeUnix"],
+	["metrics_exponential_histogram", "TimeUnix"],
+] as const
+
+export const MINIMUM_RAW_TELEMETRY_RETENTION_DAYS = 90
+export const MAXIMUM_RAW_TELEMETRY_RETENTION_DAYS = 3_650
+
+/**
+ * The retention floor an operator has pinned for this store.
+ *
+ * Unknown fields are rejected rather than ignored: a config carrying a field
+ * this build does not understand was written by a different build, and reading
+ * only the half we recognise would silently apply a policy nobody chose.
+ */
+const RawTelemetryRetentionConfigSchema = Schema.Struct({
+	formatVersion: Schema.Literal(1),
+	minimumDays: Schema.Int.check(
+		Schema.makeFilter((days: number) =>
+			days >= MINIMUM_RAW_TELEMETRY_RETENTION_DAYS && days <= MAXIMUM_RAW_TELEMETRY_RETENTION_DAYS
+				? undefined
+				: `raw telemetry retention minimum must be an integer from ${MINIMUM_RAW_TELEMETRY_RETENTION_DAYS} through ${MAXIMUM_RAW_TELEMETRY_RETENTION_DAYS} days`,
+		),
+	),
+})
+
+type RawTelemetryRetentionConfig = typeof RawTelemetryRetentionConfigSchema.Type
+
+export const rawTelemetryRetentionConfigPath = (dataDir: string): string =>
+	`${resolve(dataDir)}.raw-telemetry-retention.json`
+
+const decodeRetentionConfig = Schema.decodeUnknownSync(RawTelemetryRetentionConfigSchema, {
+	onExcessProperty: "error",
+})
+
+const parseRawTelemetryRetentionDays = (value: unknown): number => decodeRetentionConfig(value).minimumDays
+
+export const readRawTelemetryRetentionDays = (dataDir: string): number | undefined => {
+	const path = rawTelemetryRetentionConfigPath(dataDir)
+	if (!existsSync(path)) return undefined
+	const stat = lstatSync(path)
+	if (stat.isSymbolicLink() || !stat.isFile())
+		throw new Error(`raw telemetry retention config is not a real file: ${path}`)
+	return parseRawTelemetryRetentionDays(JSON.parse(readFileSync(path, "utf8")) as unknown)
+}
+
+export const configureRawTelemetryRetentionDays = async (
+	dataDir: string,
+	minimumDays: number,
+): Promise<void> => {
+	const days = parseRawTelemetryRetentionDays({ formatVersion: 1, minimumDays })
+	const existing = readRawTelemetryRetentionDays(dataDir)
+	if (existing !== undefined && days < existing)
+		throw new Error(
+			`refusing to shorten persistent raw telemetry retention from ${existing} to ${days} days`,
+		)
+	const config: RawTelemetryRetentionConfig = { formatVersion: 1, minimumDays: days }
+	await durableJson(rawTelemetryRetentionConfigPath(dataDir), config)
+}
+
+export const rawTelemetryTtlStatements = (days: number): ReadonlyArray<string> => {
+	const validated = parseRawTelemetryRetentionDays({ formatVersion: 1, minimumDays: days })
+	return RAW_TELEMETRY_TTL_COLUMNS.map(
+		([table, column]) => `ALTER TABLE ${table} MODIFY TTL toDate(${column}) + INTERVAL ${validated} DAY`,
+	)
+}
+
+const existingTtlDays = (createTableQuery: string, table: string): number => {
+	const match = /\bTTL\s+toDate\([^)]*\)\s*\+\s*(?:toIntervalDay\((\d+)\)|INTERVAL\s+(\d+)\s+DAY)/i.exec(
+		createTableQuery,
+	)
+	const value = Number(match?.[1] ?? match?.[2])
+	if (!Number.isSafeInteger(value) || value < 1)
+		throw new Error(`cannot determine existing raw telemetry TTL for ${table}`)
+	return value
+}
+
+/** Apply a floor without shortening a higher TTL already present in the schema. */
+export const applyRawTelemetryRetentionFloor = (db: Pick<Chdb, "query" | "exec">, days: number): void => {
+	const validated = parseRawTelemetryRetentionDays({ formatVersion: 1, minimumDays: days })
+	const names = RAW_TELEMETRY_TTL_COLUMNS.map(([table]) => `'${table}'`).join(", ")
+	const rows = db
+		.query(
+			`SELECT name, create_table_query FROM system.tables WHERE database = 'default' AND name IN (${names}) ORDER BY name`,
+			"JSONEachRow",
+		)
+		.split("\n")
+		.filter((line) => line.trim().length > 0)
+		.map((line) => JSON.parse(line) as { name?: unknown; create_table_query?: unknown })
+	const definitions = new Map(
+		rows.map((row) => {
+			if (typeof row.name !== "string" || typeof row.create_table_query !== "string")
+				throw new Error("invalid system.tables TTL metadata")
+			return [row.name, row.create_table_query] as const
+		}),
+	)
+	for (const [table, column] of RAW_TELEMETRY_TTL_COLUMNS) {
+		const definition = definitions.get(table)
+		if (!definition) throw new Error(`raw telemetry table is missing: ${table}`)
+		if (existingTtlDays(definition, table) >= validated) continue
+		db.exec(`ALTER TABLE ${table} MODIFY TTL toDate(${column}) + INTERVAL ${validated} DAY`)
+	}
 }
 
 /** Build the embedded ClickHouse argv. Keep table metadata loading and restore
@@ -95,6 +208,25 @@ export interface ChdbOptions {
  * does not make the loader pools single-threaded. RESTORE uses a separate
  * 16-thread pool by default and can trip the same invalid recursive-mutex state
  * while restoring that dependency graph. */
+/**
+ * Parser limit for one statement, applied as a session setting at open.
+ *
+ * The C API has no separate data stream: every INSERT inlines its NDJSON as a
+ * string literal, and the parser reads the whole statement against
+ * `max_query_size` (default 256 KiB). `buildInsertStatements` chunks batches
+ * under that, but it cannot split a single row — a span carrying a large
+ * attribute (a request body, a stack, a prompt) still arrives as one line and
+ * was rejected with "Code: 62 … Max query size exceeded" at the literal. The
+ * limit is a parser guard, not a buffer allocation, so raising it well past any
+ * single OTLP row costs nothing.
+ *
+ * A `SET`, not an argv flag: `chdb_connect` accepts `--<setting>=` for some
+ * settings but `--max_query_size` measurably does not take (system.settings
+ * still reports 262144), while the session `SET` — the same path
+ * `session_timezone` uses — does, and holds for the connection's lifetime.
+ */
+export const MAX_QUERY_SIZE_BYTES = 64 * 1024 * 1024
+
 export const chdbArgv = (options: Pick<ChdbOptions, "dataDir" | "configFile">): string[] => [
 	"clickhouse",
 	"--async_load_databases=0",
@@ -109,6 +241,58 @@ export const chdbArgv = (options: Pick<ChdbOptions, "dataDir" | "configFile">): 
 	`--path=${options.dataDir}`,
 	...(options.configFile ? [`--config-file=${options.configFile}`] : []),
 ]
+
+/** libc, for `setenv`. Bun keeps `process.env` in its own map and never calls
+ *  through to libc, so an assignment there is invisible to a dlopened library. */
+const LIBC_CANDIDATES =
+	process.platform === "darwin" ? ["libSystem.B.dylib"] : ["libc.so.6", "libc.so", "libc.musl-x86_64.so.1"]
+
+let timezonePinned = false
+
+/**
+ * Force the embedded engine's SERVER timezone to UTC, before libchdb loads.
+ *
+ * `SET session_timezone = 'UTC'` (in `Chdb.open`) is not enough: every
+ * `DateTime64(n)` column in the local schema is declared without an explicit
+ * zone, and ClickHouse resolves *those* against the server timezone, which
+ * libchdb reads from the host environment when it initialises. On a machine in,
+ * say, `Europe/Berlin` that meant stored timestamps rendered in local time
+ * and — the part that actually broke — every datetime **string literal** in a
+ * `WHERE` clause parsed as local time, while the UI and CLI build their window
+ * bounds as UTC strings (`toClickHouseDateTime`). Every window landed one UTC
+ * offset in the past: freshly ingested traces were invisible while hours-old
+ * ones looked current, and the hourly service-map rollups bucketed into shifted
+ * hours, so recent edges went missing.
+ *
+ * The stored instants were always correct and the column type carries no baked
+ * timezone — it is resolved per query — so pinning the zone repairs existing
+ * stores as well as new ones.
+ *
+ * Hosts already on UTC see no change, which is exactly why CI never caught it.
+ */
+export const pinProcessTimezoneToUtc = (): void => {
+	if (timezonePinned) return
+	timezonePinned = true
+	// Keep Bun's own view in sync, so JS `Date` formatting in this process
+	// matches what the engine reports.
+	process.env.TZ = "UTC"
+	const key = cstr("TZ")
+	const value = cstr("UTC")
+	for (const lib of LIBC_CANDIDATES) {
+		try {
+			const libc = dlopen(lib, {
+				setenv: { args: [FFIType.ptr, FFIType.ptr, FFIType.int], returns: FFIType.int },
+				tzset: { args: [], returns: FFIType.void },
+			})
+			libc.symbols.setenv(ptr(key), ptr(value), 1)
+			libc.symbols.tzset()
+			return
+		} catch {
+			// Try the next candidate; a host we cannot reach libc on simply keeps
+			// its previous behaviour rather than failing to start.
+		}
+	}
+}
 
 /**
  * A live chDB connection. `query` runs read SQL and returns the raw result
@@ -127,6 +311,7 @@ export class Chdb {
 	}
 
 	static open(options: ChdbOptions): Chdb {
+		pinProcessTimezoneToUtc()
 		const sym = symbols()
 		const args = chdbArgv(options)
 		const argBufs = args.map(cstr)
@@ -153,7 +338,15 @@ export class Chdb {
 			)
 
 		const db = new Chdb(sym, connPtrPtr, conn)
-		if (options.bootstrapSchema !== false) db.#bootstrap(options.schemaSql)
+		// Partition expressions, ingest conversions, and retention predicates must
+		// never inherit a host-specific timezone.
+		db.exec("SET session_timezone = 'UTC'")
+		db.exec(`SET max_query_size = ${MAX_QUERY_SIZE_BYTES}`)
+		if (options.bootstrapSchema !== false) {
+			db.#bootstrap(options.schemaSql)
+			if (options.rawTelemetryRetentionDays !== undefined)
+				applyRawTelemetryRetentionFloor(db, options.rawTelemetryRetentionDays)
+		}
 		return db
 	}
 

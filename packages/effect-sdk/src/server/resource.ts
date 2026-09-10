@@ -1,5 +1,6 @@
 import { Effect, Option, Redacted } from "effect"
 import * as EnvConfig from "./config.js"
+import { getContainerAttributes } from "./container.js"
 import { getAutoPlatformAttributes } from "./platform.js"
 
 /**
@@ -8,7 +9,7 @@ import { getAutoPlatformAttributes } from "./platform.js"
  * `OTEL_EXPORTER_OTLP_ENDPOINT` — so end users only need to supply an ingest
  * key, not an URL.
  */
-const DEFAULT_MAPLE_ENDPOINT = "https://ingest.maple.dev"
+export const DEFAULT_MAPLE_ENDPOINT = "https://ingest.maple.dev"
 
 const stringOrUndefined = (value: unknown): string | undefined =>
 	typeof value === "string" && value.length > 0 ? value : undefined
@@ -66,7 +67,12 @@ const isCommitSha = (value: string | undefined): value is string =>
 	value !== undefined && /^[0-9a-f]{7,40}$/i.test(value)
 
 export interface ResolvedResource {
-	readonly endpoint: string | undefined
+	/**
+	 * Always resolves — `DEFAULT_MAPLE_ENDPOINT` is the final fallback, so this
+	 * is deliberately NOT optional. Presets disable themselves on a missing
+	 * ingest key, never on a missing endpoint.
+	 */
+	readonly endpoint: string
 	readonly ingestKey: Redacted.Redacted<string> | undefined
 	readonly resource: {
 		readonly serviceName: string
@@ -120,6 +126,10 @@ export const resolveResource = Effect.fn("resolveResource")(function* (config: R
 
 	const attributes: Record<string, unknown> = {}
 	Object.assign(attributes, getAutoPlatformAttributes())
+	// Best-effort Docker identity (container.runtime / container.id) so app
+	// telemetry correlates with docker_stats metrics. Lowest precedence — an
+	// explicit OTEL_RESOURCE_ATTRIBUTES container.id overrides it below.
+	Object.assign(attributes, getContainerAttributes())
 	attributes["maple.sdk.type"] = config.sdkType ?? "server"
 	attributes["service.instance.id"] = getServiceInstanceId()
 	if (environment) {
@@ -131,7 +141,6 @@ export const resolveResource = Effect.fn("resolveResource")(function* (config: R
 		attributes["deployment.environment"] = environment
 		attributes["deployment.environment.name"] = environment
 	}
-	if (serviceVersion) attributes["deployment.commit_sha"] = serviceVersion
 	if (repositoryUrl) attributes["vcs.repository.url.full"] = repositoryUrl
 	if (headRevision) attributes["vcs.ref.head.revision"] = headRevision
 	if (config.serviceNamespace) attributes["service.namespace"] = config.serviceNamespace
@@ -211,7 +220,6 @@ export const resolveResourceFromEnv = (
 		attributes["deployment.environment"] = environment
 		attributes["deployment.environment.name"] = environment
 	}
-	if (serviceVersion) attributes["deployment.commit_sha"] = serviceVersion
 	if (repositoryUrl) attributes["vcs.repository.url.full"] = repositoryUrl
 	if (headRevision) attributes["vcs.ref.head.revision"] = headRevision
 	if (config.serviceNamespace) attributes["service.namespace"] = config.serviceNamespace

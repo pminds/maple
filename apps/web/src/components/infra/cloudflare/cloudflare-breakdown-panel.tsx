@@ -15,7 +15,7 @@
 //     can see paths the stored top-N never kept. The chart hides there, because
 //     live mode has no history. Live is an action, never a side effect of
 //     typing — every keystroke used to be a Cloudflare GraphQL round trip.
-//   - Rank. Rows carry a share-proportional tint, so a hundred keys read as a
+//   - Rank. Rows carry a share-proportional bar, so a hundred keys read as a
 //     decaying shape instead of a flat wall of names.
 
 import { useDeferredValue, useMemo, useState, type ReactNode } from "react"
@@ -33,10 +33,11 @@ import {
 	cloudflareTopTrafficResultAtom,
 	cloudflareZoneBreakdownResultAtom,
 } from "@/lib/services/atoms/warehouse-query-atoms"
-import { useRetainedRefreshableResultValue } from "@/hooks/use-retained-refreshable-result-value"
+import { useRefreshableAtomValue } from "@/hooks/use-refreshable-atom-value"
 import { formatNumber } from "@maple/ui/lib/format"
 import { MagnifierIcon, XmarkIcon } from "@/components/icons"
 import { ColumnHead, DataTable, useTableSort } from "../primitives/data-table"
+import { shareBar } from "../primitives/share-bar"
 import { formatBytes, formatPercent } from "@maple/ui/lib/format"
 import { StackedBreakdownChart } from "./cloudflare-zone-detail-charts"
 import {
@@ -116,22 +117,6 @@ const ROW_CLASS =
 const CHIP_CLASS =
 	"inline-flex items-center rounded-sm border border-border/70 bg-background/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
 
-/**
- * Rank made visible: a tint filling the row to its share of listed requests. The scale is linear —
- * a path at 40% is twice the block of one at 20% — so scrolling the list traces the decay curve.
- *
- * It fades out over its last fifth rather than stopping on a hard edge: a crisp rectangle in the
- * primary hue reads as a selected row, which is a state this table also has. Below half a percent
- * the bar would be a sliver of noise, so it doesn't render at all.
- */
-const shareTint = (share: number): string | undefined => {
-	const pct = Math.min(100, share * 100)
-	if (!Number.isFinite(pct) || pct < 0.5) return undefined
-	const solid = pct * 0.8
-	const tint = "color-mix(in oklab, var(--primary) 8%, transparent)"
-	return `linear-gradient(to right, ${tint} 0%, ${tint} ${solid}%, transparent ${pct}%)`
-}
-
 /** ISO-8601 UTC → "Jul 28". */
 const formatCollectedFrom = (iso: string) => {
 	const date = new Date(iso)
@@ -170,7 +155,7 @@ export function CloudflareBreakdownPanel({
 
 	// Read here rather than inside StoredBreakdown so the header's scope marker can report the
 	// filters the server actually applied instead of guessing at them.
-	const storedResult = useRetainedRefreshableResultValue(
+	const storedResult = useRefreshableAtomValue(
 		cloudflareZoneBreakdownResultAtom({
 			data: {
 				serviceName,
@@ -361,7 +346,7 @@ function BreakdownTable({
 			stickySurfaceClass="bg-card"
 		>
 			<DataTable.Head>
-				{head(dimension.column, "key", "flex-1 min-w-[220px]")}
+				{head(dimension.column, "key", "w-0 flex-1 min-w-[220px]")}
 				{head("Requests", "requests", "w-[110px]")}
 				{head("Error rate", "errorRate", "w-[90px]")}
 				{head("Bandwidth", "bytes", "w-[90px]", "hidden md:flex")}
@@ -371,12 +356,8 @@ function BreakdownTable({
 			{sorted.map((row) => {
 				const selected = selectedValues.includes(row.key)
 				return (
-					<div
-						key={row.key}
-						className={ROW_CLASS}
-						style={{ backgroundImage: shareTint(row.share) }}
-					>
-						<div className="min-w-[220px] flex-1 truncate">
+					<div key={row.key} className={ROW_CLASS} style={shareBar(row.share)}>
+						<div className="w-0 min-w-[220px] flex-1 truncate">
 							{interactive && onToggleFilter ? (
 								<button
 									type="button"

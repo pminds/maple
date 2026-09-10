@@ -1,3 +1,4 @@
+// BOUNDARY: This module owns unparsed external values and narrows them before domain use.
 import { useAtom } from "@/lib/effect-atom"
 import { useCallback, useMemo } from "react"
 import { Cause, Exit, Option, Schema } from "effect"
@@ -12,6 +13,7 @@ import {
 import type { DashboardRefreshIntervalSeconds } from "@maple/domain/http"
 import type { V2DashboardMutation } from "@maple/domain/http/v2"
 import { useLiveQuery } from "@tanstack/react-db"
+import { toastManager } from "@maple/ui/components/ui/toast"
 import { trackProduct } from "@/lib/analytics"
 import { runMapleApiV2 } from "@/lib/collections/api-runner"
 import { rowToDashboard, v2DashboardToDashboard } from "@/lib/collections/dashboards"
@@ -27,6 +29,7 @@ import {
 import type { PortableDashboard } from "@/components/dashboard-builder/portable-dashboard"
 import type {
 	Dashboard,
+	DashboardSection,
 	DashboardVariable,
 	DashboardWidget,
 	TimeRange,
@@ -35,7 +38,15 @@ import type {
 	WidgetDisplayConfig,
 } from "@/components/dashboard-builder/types"
 import { persistenceErrorAtom } from "@/atoms/dashboard-store-atoms"
-import { CANONICAL_COLS } from "@/components/dashboard-builder/canvas/grid-breakpoints"
+import {
+	autoLayoutPerContainer,
+	findNextPosition,
+	sortWidgetsForLayout,
+	ungroupSectionWidgets,
+	widgetsInContainer,
+	withSectionTarget,
+	type SectionTarget,
+} from "@/components/dashboard-builder/sections/section-layout"
 
 const asDashboardId = Schema.decodeUnknownSync(DashboardId)
 const asIsoDateTimeString = Schema.decodeUnknownSync(IsoDateTimeString)
@@ -57,23 +68,6 @@ function messageFromError(error: unknown): string | null {
 	}
 
 	return null
-}
-
-function findNextPosition(widgets: DashboardWidget[], newWidth: number): { x: number; y: number } {
-	if (widgets.length === 0) {
-		return { x: 0, y: 0 }
-	}
-
-	const maxY = Math.max(...widgets.map((w) => w.layout.y))
-	const bottomRowWidgets = widgets.filter((w) => w.layout.y === maxY)
-	const rightEdge = Math.max(...bottomRowWidgets.map((w) => w.layout.x + w.layout.w))
-
-	if (rightEdge + newWidth <= CANONICAL_COLS) {
-		return { x: rightEdge, y: maxY }
-	}
-
-	const maxBottom = Math.max(...widgets.map((w) => w.layout.y + w.layout.h))
-	return { x: 0, y: maxBottom }
 }
 
 // Walk the `cause` chain for the most specific message. The Electric write
@@ -110,7 +104,7 @@ function getErrorMessage(error: unknown): string {
 // txid never appears and TanStack DB rolls the optimistic state back. Latching
 // the read-only banner here would punish a *successful* write; instead the
 // caller triggers the stuck-collection self-heal so a fresh stream re-syncs the
-// saved row.
+// saved row, and tells the user why their change just disappeared from view.
 function isTxidAwaitTimeout(error: unknown): boolean {
 	if (typeof error !== "object" || error === null) return false
 	const named = error as { name?: unknown; message?: unknown }
@@ -150,20 +144,22 @@ const toDocumentWidgets = (widgets: Dashboard["widgets"]): DashboardDocument["wi
 	})
 
 function toDashboardDocument(dashboard: Dashboard): DashboardDocument {
-	// `description`/`tags`/`variables` are `Schema.optionalKey` on `DashboardDocument`;
-	// the Schema.Class constructor rejects a present `undefined`. The web `Dashboard`
-	// carries them as optional and `ensureDashboard` stamps an explicit
-	// `tags: undefined`, so destructure them out of the spread and re-add only when set.
-	const { description, tags, variables, refreshIntervalSeconds, ...rest } = dashboard
+	// `description`/`tags`/`sections`/`variables` are `Schema.optionalKey` on
+	// `DashboardDocument`; the Schema.Class constructor rejects a present
+	// `undefined`. The web `Dashboard` carries them as optional and
+	// `ensureDashboard` stamps an explicit `tags: undefined`, so destructure them
+	// out of the spread and re-add only when set.
+	const { description, tags, sections, variables, refreshIntervalSeconds, ...rest } = dashboard
 	return new DashboardDocument({
 		...rest,
 		id: asDashboardId(dashboard.id),
 		createdAt: asIsoDateTimeString(dashboard.createdAt),
 		updatedAt: asIsoDateTimeString(dashboard.updatedAt),
-		...(description !== undefined && { description }),
-		...(tags !== undefined && { tags }),
-		...(variables !== undefined && { variables }),
-		...(refreshIntervalSeconds !== undefined && { refreshIntervalSeconds }),
+		...(description !== undefined ? { description } : undefined),
+		...(tags !== undefined ? { tags } : undefined),
+		...(sections !== undefined ? { sections } : undefined),
+		...(variables !== undefined ? { variables } : undefined),
+		...(refreshIntervalSeconds !== undefined ? { refreshIntervalSeconds } : undefined),
 		widgets: toDocumentWidgets(dashboard.widgets),
 		timeRange: toDocumentTimeRange(dashboard.timeRange),
 	})
@@ -172,18 +168,21 @@ function toDashboardDocument(dashboard: Dashboard): DashboardDocument {
 // Deep-clone via JSON so present-`undefined` keys are dropped, not preserved
 // (structuredClone keeps them, and the v2 `optionalKey` encode rejects them —
 // see the note in `mutateDashboard`).
+// SAFETY: Callers pass JSON-domain dashboard documents; the round-trip only removes undefined keys.
 const jsonClone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 function toPortableDashboardDocument(dashboard: PortableDashboard): PortableDashboardDocument {
-	// See `toDashboardDocument`: omit the optionalKey `description`/`tags`/`variables`
-	// rather than forwarding a present `undefined`, which the Schema.Class constructor rejects.
-	const { description, tags, variables, refreshIntervalSeconds, ...rest } = dashboard
+	// See `toDashboardDocument`: omit the optionalKey `description`/`tags`/`sections`/
+	// `variables` rather than forwarding a present `undefined`, which the
+	// Schema.Class constructor rejects.
+	const { description, tags, sections, variables, refreshIntervalSeconds, ...rest } = dashboard
 	return new PortableDashboardDocument({
 		...rest,
-		...(description !== undefined && { description }),
-		...(tags !== undefined && { tags: [...tags] }),
-		...(variables !== undefined && { variables: jsonClone(variables) }),
-		...(refreshIntervalSeconds !== undefined && { refreshIntervalSeconds }),
+		...(description !== undefined ? { description } : undefined),
+		...(tags !== undefined ? { tags: [...tags] } : undefined),
+		...(sections !== undefined ? { sections: jsonClone(sections) } : undefined),
+		...(variables !== undefined ? { variables: jsonClone(variables) } : undefined),
+		...(refreshIntervalSeconds !== undefined ? { refreshIntervalSeconds } : undefined),
 		widgets: toDocumentWidgets(jsonClone(dashboard.widgets)),
 		timeRange: toDocumentTimeRange(dashboard.timeRange),
 	})
@@ -193,18 +192,30 @@ function toPortableDashboardDocument(dashboard: PortableDashboard): PortableDash
 // transform pushed through the injected `mutateDashboard`. `readDashboard`
 // supplies the current dashboard (from the collection) for the two mutators
 // that read it.
+//
+// Every fire-and-forget call routes its rejection through `onMutationFailed`.
+// These used to be bare `void mutateDashboard(...)`, which turned a synchronous
+// encode throw (a Schema.Class constructor rejecting a widget, a bad ISO
+// timestamp) into an unhandled promise rejection: the edit vanished and the UI
+// said nothing.
 function makeWidgetMutators(deps: {
 	mutateDashboard: (id: string, updater: (dashboard: Dashboard) => Dashboard) => Promise<void>
 	readOnly: boolean
 	readDashboard: (id: string) => Dashboard | undefined
+	onMutationFailed: (error: unknown) => void
 }) {
-	const { mutateDashboard, readOnly, readDashboard } = deps
+	const { mutateDashboard, readOnly, readDashboard, onMutationFailed } = deps
+
+	/** Fire-and-forget, but never silent: a rejection reaches the persistence banner. */
+	const push = (id: string, updater: (dashboard: Dashboard) => Dashboard): void => {
+		void mutateDashboard(id, updater).catch(onMutationFailed)
+	}
 
 	const updateDashboard = (
 		id: string,
 		updates: Partial<Pick<Dashboard, "name" | "description" | "tags">>,
 	) => {
-		void mutateDashboard(id, (dashboard) => ({
+		push(id, (dashboard) => ({
 			...dashboard,
 			...updates,
 			updatedAt: new Date().toISOString(),
@@ -212,7 +223,7 @@ function makeWidgetMutators(deps: {
 	}
 
 	const updateDashboardTimeRange = (id: string, timeRange: TimeRange) => {
-		void mutateDashboard(id, (dashboard) => ({
+		push(id, (dashboard) => ({
 			...dashboard,
 			timeRange,
 			updatedAt: new Date().toISOString(),
@@ -220,7 +231,7 @@ function makeWidgetMutators(deps: {
 	}
 
 	const updateDashboardVariables = (id: string, variables: DashboardVariable[]) => {
-		void mutateDashboard(id, (dashboard) => ({
+		push(id, (dashboard) => ({
 			...dashboard,
 			variables,
 			updatedAt: new Date().toISOString(),
@@ -234,7 +245,7 @@ function makeWidgetMutators(deps: {
 		id: string,
 		refreshIntervalSeconds: DashboardRefreshIntervalSeconds,
 	) => {
-		void mutateDashboard(id, (dashboard) => ({
+		push(id, (dashboard) => ({
 			...dashboard,
 			refreshIntervalSeconds,
 			updatedAt: new Date().toISOString(),
@@ -246,6 +257,8 @@ function makeWidgetMutators(deps: {
 		visualization: VisualizationType,
 		dataSource: WidgetDataSource,
 		display: WidgetDisplayConfig,
+		/** Which grid to drop it into. `null` (the default) is the root canvas. */
+		target: SectionTarget = null,
 	): DashboardWidget => {
 		if (readOnly) {
 			throw new Error("Dashboards are read-only")
@@ -259,16 +272,32 @@ function makeWidgetMutators(deps: {
 		// inside it would still be null at return — the old `widgetRef!` masked a
 		// runtime null. `readDashboard` reads the current dashboard in both paths;
 		// the grid compactor resolves any position drift between build and apply.
-		const position = findNextPosition(readDashboard(dashboardId)?.widgets ?? [], layoutDefaults.w)
-		const widget: DashboardWidget = {
+		//
+		// Fail here rather than defaulting to an empty widget list: `mutateDashboard`
+		// can only write a dashboard the collection holds, so building a widget for
+		// one it doesn't would return a widget to the caller that is never persisted
+		// and never rendered — the "the picker just closed and nothing happened" bug.
+		// `readDashboard` returns undefined both for a row this tab hasn't synced
+		// yet and for one whose payload won't decode, so the message covers both.
+		const current = readDashboard(dashboardId)
+		if (!current) {
+			throw new Error("Couldn’t read this dashboard — it may still be loading. Try again.")
+		}
+
+		// Scoped to the destination container: `layout.x/y` are container-relative,
+		// so placing against the whole board would drop a grouped widget below
+		// tiles it will never share a grid with.
+		const position = findNextPosition(widgetsInContainer(current.widgets, target), layoutDefaults.w)
+		const placed: DashboardWidget = {
 			id: generateId(),
 			visualization,
 			dataSource,
 			display,
 			layout: { ...position, ...layoutDefaults },
 		}
+		const widget = withSectionTarget(placed, target)
 
-		void mutateDashboard(dashboardId, (dashboard) => ({
+		push(dashboardId, (dashboard) => ({
 			...dashboard,
 			widgets: [...dashboard.widgets, widget],
 			updatedAt: new Date().toISOString(),
@@ -279,7 +308,7 @@ function makeWidgetMutators(deps: {
 
 	const cloneWidget = (dashboardId: string, widgetId: string) => {
 		if (readOnly) return
-		void mutateDashboard(dashboardId, (dashboard) => {
+		push(dashboardId, (dashboard) => {
 			const source = dashboard.widgets.find((w) => w.id === widgetId)
 			if (!source) return dashboard
 
@@ -290,14 +319,20 @@ function makeWidgetMutators(deps: {
 				minH: source.layout.minH ?? 2,
 			}
 
-			const position = findNextPosition(dashboard.widgets, layoutDefaults.w)
-			const clone: DashboardWidget = {
+			// A clone lands beside its source, in the same container.
+			const target: SectionTarget =
+				source.sectionId !== undefined && source.tabId !== undefined
+					? { sectionId: source.sectionId, tabId: source.tabId }
+					: null
+			const position = findNextPosition(widgetsInContainer(dashboard.widgets, target), layoutDefaults.w)
+			const placed: DashboardWidget = {
 				id: generateId(),
 				visualization: source.visualization,
 				dataSource: structuredClone(source.dataSource),
 				display: structuredClone(source.display),
 				layout: { ...position, ...layoutDefaults },
 			}
+			const clone = withSectionTarget(placed, target)
 
 			return {
 				...dashboard,
@@ -313,7 +348,7 @@ function makeWidgetMutators(deps: {
 		// here matches what the async write will actually delete.
 		const removed = readDashboard(dashboardId)?.widgets.find((w) => w.id === widgetId)
 
-		void mutateDashboard(dashboardId, (dashboard) => ({
+		push(dashboardId, (dashboard) => ({
 			...dashboard,
 			widgets: dashboard.widgets.filter((widget) => widget.id !== widgetId),
 			updatedAt: new Date().toISOString(),
@@ -324,7 +359,7 @@ function makeWidgetMutators(deps: {
 
 	const restoreWidget = (dashboardId: string, widget: DashboardWidget) => {
 		if (readOnly) return
-		void mutateDashboard(dashboardId, (dashboard) => {
+		push(dashboardId, (dashboard) => {
 			// Idempotent: a server refetch may have already reinstated the widget.
 			if (dashboard.widgets.some((w) => w.id === widget.id)) return dashboard
 			return {
@@ -340,7 +375,7 @@ function makeWidgetMutators(deps: {
 		widgetId: string,
 		display: Partial<WidgetDisplayConfig>,
 	) => {
-		void mutateDashboard(dashboardId, (dashboard) => ({
+		push(dashboardId, (dashboard) => ({
 			...dashboard,
 			widgets: dashboard.widgets.map((widget) =>
 				widget.id === widgetId ? { ...widget, display: { ...widget.display, ...display } } : widget,
@@ -353,7 +388,7 @@ function makeWidgetMutators(deps: {
 		dashboardId: string,
 		layouts: Array<{ i: string; x: number; y: number; w: number; h: number }>,
 	) => {
-		void mutateDashboard(dashboardId, (dashboard) => {
+		push(dashboardId, (dashboard) => {
 			let changed = false
 			const widgets = dashboard.widgets.map((widget) => {
 				const layout = layouts.find((item) => item.i === widget.id)
@@ -376,13 +411,12 @@ function makeWidgetMutators(deps: {
 			// Return same reference if nothing changed — mutateDashboard skips no-ops
 			if (!changed) return dashboard
 
-			// Sort by (y, x) so the array order matches visual order. The grid
-			// compactor uses array order as a tiebreaker when items share a row,
-			// so a stale order causes drag-to-swap to snap back.
-			const sorted = widgets.toSorted((a, b) => {
-				if (a.layout.y !== b.layout.y) return a.layout.y - b.layout.y
-				return a.layout.x - b.layout.x
-			})
+			// Sort by (container, y, x) so the array order matches visual order. The
+			// grid compactor uses array order as a tiebreaker when items share a
+			// row, so a stale order causes drag-to-swap to snap back. Container rank
+			// leads because every container restarts at `y: 0` — a bare (y, x) sort
+			// would interleave section 2's top row with section 1's.
+			const sorted = sortWidgetsForLayout(widgets, dashboard.sections ?? [])
 
 			return { ...dashboard, widgets: sorted, updatedAt: new Date().toISOString() }
 		})
@@ -410,37 +444,250 @@ function makeWidgetMutators(deps: {
 		}))
 	}
 
+	// Re-flows every container independently, each restarting at (0, 0) — one
+	// section tidying up must not push another section's tiles around.
 	const autoLayoutWidgets = (dashboardId: string) => {
-		void mutateDashboard(dashboardId, (dashboard) => {
+		push(dashboardId, (dashboard) => {
 			if (dashboard.widgets.length === 0) return dashboard
+			return {
+				...dashboard,
+				widgets: autoLayoutPerContainer(dashboard.widgets, dashboard.sections ?? []),
+				updatedAt: new Date().toISOString(),
+			}
+		})
+	}
 
-			const sorted = dashboard.widgets.toSorted((a, b) => {
-				if (a.layout.y !== b.layout.y) return a.layout.y - b.layout.y
-				return a.layout.x - b.layout.x
-			})
+	// Sections
+	//
+	// Every mutator goes through `push`, so a failed write reaches the persistence
+	// banner rather than vanishing. The "always >= 1 tab" invariant is maintained
+	// here and repaired server-side by `sanitizeDashboardSections`.
 
-			let currentX = 0
-			let currentY = 0
-			let rowHeight = 0
+	const touch = (dashboard: Dashboard, sections: DashboardSection[]): Dashboard => ({
+		...dashboard,
+		sections,
+		updatedAt: new Date().toISOString(),
+	})
 
-			const relaid = sorted.map((widget) => {
-				const w = widget.layout.w
-				const h = widget.layout.h
+	const mapSection = (
+		dashboardId: string,
+		sectionId: string,
+		update: (section: DashboardSection) => DashboardSection,
+	) => {
+		if (readOnly) return
+		push(dashboardId, (dashboard) => {
+			const sections = dashboard.sections ?? []
+			if (!sections.some((section) => section.id === sectionId)) return dashboard
+			return touch(
+				dashboard,
+				sections.map((section) => (section.id === sectionId ? update(section) : section)),
+			)
+		})
+	}
 
-				if (currentX + w > CANONICAL_COLS) {
-					currentX = 0
-					currentY += rowHeight
-					rowHeight = 0
-				}
+	/** Returns the new section id synchronously so the caller can focus its rename input. */
+	const addSection = (dashboardId: string, title = "New group"): string | undefined => {
+		if (readOnly) return undefined
+		const sectionId = generateId()
+		push(dashboardId, (dashboard) =>
+			touch(dashboard, [
+				...(dashboard.sections ?? []),
+				// One tab, so it renders as a plain header until the user asks for tabs.
+				{ id: sectionId, title, tabs: [{ id: generateId(), title }] },
+			]),
+		)
+		return sectionId
+	}
 
-				const newLayout = { ...widget.layout, x: currentX, y: currentY }
-				currentX += w
-				rowHeight = Math.max(rowHeight, h)
+	const renameSection = (dashboardId: string, sectionId: string, title: string) => {
+		mapSection(dashboardId, sectionId, (section) =>
+			// With a single tab the header *is* the tab label, so they must not drift.
+			section.tabs.length === 1
+				? { ...section, title, tabs: [{ ...section.tabs[0]!, title }] }
+				: { ...section, title },
+		)
+	}
 
-				return { ...widget, layout: newLayout }
-			})
+	/** The persisted default, distinct from a viewer's own URL-level collapse. */
+	const setSectionCollapsedDefault = (dashboardId: string, sectionId: string, collapsed: boolean) => {
+		mapSection(dashboardId, sectionId, (section) => ({ ...section, collapsed }))
+	}
 
-			return { ...dashboard, widgets: relaid, updatedAt: new Date().toISOString() }
+	/**
+	 * Pin a group open, or hand its chevron back.
+	 *
+	 * Pinning clears `collapsed`: "collapsed by default" and "can never be
+	 * collapsed" would leave the group folded with nothing to unfold it. The
+	 * server sanitizer enforces the same rule, so a document written by any other
+	 * client can't reintroduce the contradiction.
+	 */
+	const setSectionCollapsible = (dashboardId: string, sectionId: string, collapsible: boolean) => {
+		mapSection(dashboardId, sectionId, (section) => {
+			const next = { ...section, collapsible }
+			if (!collapsible) delete next.collapsed
+			return next
+		})
+	}
+
+	const reorderSections = (dashboardId: string, fromIndex: number, toIndex: number) => {
+		if (readOnly) return
+		push(dashboardId, (dashboard) => {
+			const sections = dashboard.sections ?? []
+			if (
+				fromIndex === toIndex ||
+				fromIndex < 0 ||
+				toIndex < 0 ||
+				fromIndex >= sections.length ||
+				toIndex >= sections.length
+			) {
+				return dashboard
+			}
+			const next = [...sections]
+			const [moved] = next.splice(fromIndex, 1)
+			next.splice(toIndex, 0, moved!)
+			return touch(dashboard, next)
+		})
+	}
+
+	/**
+	 * Delete a group, either keeping its widgets (re-flowed onto the root canvas
+	 * below whatever is already there) or removing them with it.
+	 *
+	 * Returns the widgets that were deleted so the caller can offer an undo,
+	 * snapshotted synchronously the way `removeWidget` does.
+	 */
+	const deleteSection = (
+		dashboardId: string,
+		sectionId: string,
+		action: "ungroup" | "delete",
+	): DashboardWidget[] | undefined => {
+		if (readOnly) return undefined
+		const removed =
+			action === "delete"
+				? readDashboard(dashboardId)?.widgets.filter((w) => w.sectionId === sectionId)
+				: []
+
+		push(dashboardId, (dashboard) => {
+			const sections = dashboard.sections ?? []
+			if (!sections.some((section) => section.id === sectionId)) return dashboard
+			const widgets =
+				action === "ungroup"
+					? ungroupSectionWidgets(dashboard.widgets, sectionId)
+					: dashboard.widgets.filter((widget) => widget.sectionId !== sectionId)
+			return {
+				...touch(
+					dashboard,
+					sections.filter((section) => section.id !== sectionId),
+				),
+				widgets,
+			}
+		})
+
+		return removed
+	}
+
+	const addTab = (dashboardId: string, sectionId: string, title = "New tab"): string | undefined => {
+		if (readOnly) return undefined
+		const tabId = generateId()
+		mapSection(dashboardId, sectionId, (section) => ({
+			...section,
+			tabs: [...section.tabs, { id: tabId, title }],
+		}))
+		return tabId
+	}
+
+	const renameTab = (dashboardId: string, sectionId: string, tabId: string, title: string) => {
+		mapSection(dashboardId, sectionId, (section) => {
+			const tabs = section.tabs.map((tab) => (tab.id === tabId ? { ...tab, title } : tab))
+			// Renaming the only tab renames the group with it — see `renameSection`.
+			return tabs.length === 1 ? { ...section, title, tabs } : { ...section, tabs }
+		})
+	}
+
+	/**
+	 * Delete a tab, either moving its widgets to the first remaining tab or
+	 * deleting them too. A no-op on the last tab: deleting that is deleting the
+	 * group, which has its own action and its own confirmation.
+	 */
+	const deleteTab = (dashboardId: string, sectionId: string, tabId: string, action: "move" | "delete") => {
+		if (readOnly) return
+		push(dashboardId, (dashboard) => {
+			const sections = dashboard.sections ?? []
+			const section = sections.find((candidate) => candidate.id === sectionId)
+			if (!section || section.tabs.length <= 1) return dashboard
+			if (!section.tabs.some((tab) => tab.id === tabId)) return dashboard
+
+			const remaining = section.tabs.filter((tab) => tab.id !== tabId)
+			const destination = remaining[0]!
+			const isDoomed = (widget: DashboardWidget) =>
+				widget.sectionId === sectionId && widget.tabId === tabId
+
+			const widgets =
+				action === "delete"
+					? dashboard.widgets.filter((widget) => !isDoomed(widget))
+					: (() => {
+							// Land the arrivals below whatever the destination tab already
+							// holds, rather than stacking them on top of it.
+							const offsetBase = widgetsInContainer(dashboard.widgets, {
+								sectionId,
+								tabId: destination.id,
+							})
+							const offset =
+								offsetBase.length === 0
+									? 0
+									: Math.max(...offsetBase.map((w) => w.layout.y + w.layout.h))
+							return dashboard.widgets.map((widget) =>
+								isDoomed(widget)
+									? {
+											...widget,
+											tabId: destination.id,
+											layout: { ...widget.layout, y: widget.layout.y + offset },
+										}
+									: widget,
+							)
+						})()
+
+			return {
+				...touch(
+					dashboard,
+					sections.map((candidate) =>
+						candidate.id === sectionId
+							? {
+									...candidate,
+									tabs: remaining,
+									// Falling back to one tab makes the header the label again.
+									...(remaining.length === 1 ? { title: destination.title } : undefined),
+								}
+							: candidate,
+					),
+				),
+				widgets,
+			}
+		})
+	}
+
+	const moveWidgetToSection = (dashboardId: string, widgetId: string, target: SectionTarget) => {
+		if (readOnly) return
+		push(dashboardId, (dashboard) => {
+			const widget = dashboard.widgets.find((candidate) => candidate.id === widgetId)
+			if (!widget) return dashboard
+
+			// Rebase onto the destination's coordinate space; keeping the old x/y
+			// would drop the tile on top of whatever already sits there.
+			const position = findNextPosition(
+				widgetsInContainer(dashboard.widgets, target).filter((w) => w.id !== widgetId),
+				widget.layout.w,
+			)
+			const moved = withSectionTarget({ ...widget, layout: { ...widget.layout, ...position } }, target)
+
+			return {
+				...dashboard,
+				widgets: sortWidgetsForLayout(
+					dashboard.widgets.map((candidate) => (candidate.id === widgetId ? moved : candidate)),
+					dashboard.sections ?? [],
+				),
+				updatedAt: new Date().toISOString(),
+			}
 		})
 	}
 
@@ -457,6 +704,16 @@ function makeWidgetMutators(deps: {
 		updateWidgetLayouts,
 		updateWidget,
 		autoLayoutWidgets,
+		addSection,
+		renameSection,
+		setSectionCollapsedDefault,
+		setSectionCollapsible,
+		reorderSections,
+		deleteSection,
+		addTab,
+		renameTab,
+		deleteTab,
+		moveWidgetToSection,
 	}
 }
 
@@ -514,7 +771,7 @@ export function useDashboardsRead(): DashboardsRead {
 		data: rows,
 		isLoading: liveLoading,
 		isError,
-	} = useLiveQuery((q) => q.from({ d: collection }).orderBy(({ d }) => d.updated_at, "desc"), [collection])
+	} = useLiveQuery({ query: (q) => q.from({ d: collection }).orderBy(({ d }) => d.updated_at, "desc") })
 
 	const synced = useMemo(
 		() => (rows ?? []).map(rowToDashboard).filter((d): d is Dashboard => d !== null),
@@ -529,14 +786,26 @@ export function useDashboardsRead(): DashboardsRead {
 	const syncFailed = useCollectionLoadFailed(collection.id, stillLoading)
 	const fallback = useDashboardsFallback(syncFailed)
 
+	// Whether the live query has produced a real answer. Gate the fallback on
+	// THIS rather than on the row count: `useDashboardsFallback` is a module-level
+	// store that latches at `ready` for the rest of the session, so keying off
+	// `synced.length === 0` marked a perfectly healthy org that simply has no
+	// dashboards yet (or has just deleted its last one) as degraded — which
+	// consumers turn into `readOnly`, disabling "New dashboard" and forcing the
+	// dashboard page out of edit mode with nothing on screen to explain it.
+	const liveResolved = !liveLoading && !isError
+
 	// Live rows always win. The HTTP snapshot only stands in while sync is down,
 	// and once it has loaded it keeps standing in across heal attempts rather than
 	// blinking back to a skeleton every time a retry re-enters `loading`.
-	const degraded = synced.length === 0 && fallback.status === "ready"
+	const degraded = !liveResolved && fallback.status === "ready"
 	// `idle` counts as pending for one commit: `useSyncExternalStore` fires the
 	// fetch from `subscribe`, i.e. after the render that first saw the failure.
 	const fallbackPending = fallback.status === "loading" || (syncFailed && fallback.status === "idle")
-	const failed = isError || fallback.status === "failed" || (syncFailed && !fallbackPending)
+	// A resolved live query is the answer even when a stale stuck-verdict lingers
+	// in `syncFailed`; only an unresolved one can be a failure.
+	const failed =
+		!liveResolved && (isError || fallback.status === "failed" || (syncFailed && !fallbackPending))
 
 	return {
 		dashboards: degraded ? fallback.dashboards : synced,
@@ -573,8 +842,21 @@ export function useDashboardMutations() {
 			if (isTxidAwaitTimeout(error)) {
 				// The write reached the server (the handler returned a txid) — only the
 				// sync-back timed out because this tab's shape stream is dead. Heal the
-				// stream instead of disabling editing; the refetch restores the saved row.
+				// stream instead of disabling editing, since editing still works.
+				//
+				// Say so, though: TanStack DB has already rolled the optimistic edit off
+				// the screen, and `handleCollectionStuck` is a *bounded* heal that is a
+				// no-op once its budget is spent — so staying quiet here left the user
+				// watching a change they made get undone for no stated reason.
 				handleCollectionStuck()
+				toastManager.add({
+					title: "Saved, but this tab is behind",
+					description:
+						"The change reached the server; this tab’s live sync didn’t catch up, so it isn’t shown yet.",
+					type: "warning",
+					actionProps: { children: "Reconnect", onClick: retryOrgCollections },
+					timeout: 10000,
+				})
 				return
 			}
 			const concurrency =
@@ -602,10 +884,17 @@ export function useDashboardMutations() {
 		// next render, which reading the collection directly avoids.
 		async (dashboardId: string, updater: (dashboard: Dashboard) => Dashboard): Promise<void> => {
 			const active = collection
+			// Both misses used to `return` silently, which is how an edit could
+			// disappear with nothing on screen to explain it. They are real failures:
+			// the caller asked to write a dashboard this tab cannot read.
 			const row = active.get(dashboardId)
-			if (!row) return
+			if (!row) {
+				throw new Error("This dashboard hasn’t finished loading — try again in a moment")
+			}
 			const current = rowToDashboard(row)
-			if (!current) return
+			if (!current) {
+				throw new Error("This dashboard’s saved layout couldn’t be read, so it can’t be edited")
+			}
 
 			const updated = updater(current)
 			if (updated === current) return // no-op
@@ -646,11 +935,13 @@ export function useDashboardMutations() {
 				client.dashboards.create({
 					payload: {
 						name: portable.name,
-						...(portable.description !== undefined ? { description: portable.description } : {}),
-						...(portable.tags !== undefined ? { tags: portable.tags } : {}),
+						...(portable.description !== undefined
+							? { description: portable.description }
+							: undefined),
+						...(portable.tags !== undefined ? { tags: portable.tags } : undefined),
 						timeRange: portable.timeRange,
 						widgets: portable.widgets,
-						...(portable.variables !== undefined ? { variables: portable.variables } : {}),
+						...(portable.variables !== undefined ? { variables: portable.variables } : undefined),
 					},
 				}),
 			).catch((error) => {
@@ -714,8 +1005,14 @@ export function useDashboardMutations() {
 	)
 
 	const widgetMutators = useMemo(
-		() => makeWidgetMutators({ mutateDashboard, readOnly, readDashboard }),
-		[mutateDashboard, readOnly, readDashboard],
+		() =>
+			makeWidgetMutators({
+				mutateDashboard,
+				readOnly,
+				readDashboard,
+				onMutationFailed: applyMutationError,
+			}),
+		[mutateDashboard, readOnly, readDashboard, applyMutationError],
 	)
 
 	const deleteDashboard = useCallback(

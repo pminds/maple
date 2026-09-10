@@ -1,5 +1,6 @@
 import type { OrgId } from "@maple/domain"
 import type { TimeseriesPoint } from "@maple/domain/query-engine"
+import { canonicalJSON } from "../canonical-json"
 import { parseWarehouseDateTime } from "../datetime"
 import { Clock, Config, Context, Effect, Layer, Option } from "effect"
 import { EdgeCacheService } from "@maple/cache"
@@ -55,6 +56,14 @@ export interface BucketCacheOutcome {
 	readonly segmentsHit: number
 	readonly segmentsMissed: number
 	readonly segmentsTimedOut: number
+	/**
+	 * Segments whose read the edge cache declined to issue because that bucket's
+	 * reads were already timing out. Distinct from `segmentsTimedOut`: the read
+	 * never went out, so it cost nothing and held no connection slot. A non-zero
+	 * value means the breaker is doing its job — treat it as a signal about
+	 * connection pressure, not as a cache failure.
+	 */
+	readonly segmentsSkipped: number
 	readonly segmentsErrored: number
 }
 
@@ -70,45 +79,13 @@ const BUCKET_CACHE_NAMESPACE = "qe-ts-buckets"
 const CACHE_VERSION = 2 as const
 const EMPTY_BUCKETS: ReadonlyArray<CachedBucket> = []
 
-// --- Fingerprint helpers -------------------------------------------------
-
-/**
- * Deterministically stringify `value` by recursively sorting object keys and
- * dropping `undefined`. Arrays preserve order. Non-serializable values are
- * coerced to `String(...)`.
- */
-const canonicalJSON = (value: unknown): string => {
-	const seen = new WeakSet<object>()
-	const walk = (v: unknown): unknown => {
-		if (v === null) return null
-		if (v === undefined) return undefined
-		const t = typeof v
-		if (t === "string" || t === "number" || t === "boolean") return v
-		if (t === "bigint") return v.toString()
-		if (Array.isArray(v)) {
-			return v.map((item) => walk(item))
-		}
-		if (t === "object") {
-			if (seen.has(v as object)) return null
-			seen.add(v as object)
-			const entries = Object.entries(v as Record<string, unknown>)
-				.filter(([, nested]) => nested !== undefined)
-				.map(([key, nested]) => [key, walk(nested)] as const)
-				.sort(([a], [b]) => a.localeCompare(b))
-			return Object.fromEntries(entries)
-		}
-		return String(v)
-	}
-	return JSON.stringify(walk(value))
-}
-
 const sha256Hex = async (input: string): Promise<string> => {
 	const bytes = new TextEncoder().encode(input)
 	const digest = await crypto.subtle.digest("SHA-256", bytes)
 	const view = new Uint8Array(digest)
 	let out = ""
-	for (let i = 0; i < view.length; i++) {
-		out += view[i]!.toString(16).padStart(2, "0")
+	for (const byte of view) {
+		out += byte.toString(16).padStart(2, "0")
 	}
 	return out
 }
@@ -121,8 +98,6 @@ export const generateFingerprint = async (
 	const canonical = canonicalJSON({ orgId, query, bucketSeconds })
 	return sha256Hex(canonical)
 }
-
-// --- Miss-range algorithm ------------------------------------------------
 
 /**
  * Walk sorted cached buckets and emit the gaps that must be fetched from
@@ -236,8 +211,6 @@ export const coalesceMissingRanges = (missing: ReadonlyArray<MissingRange>): Rea
 		return span ? [{ range: { startMs: span.startMs, endMs: span.endMs }, cachable }] : []
 	})
 }
-
-// --- Bucket merging ------------------------------------------------------
 
 /**
  * Group a flat point array by bucket window and emit cachable buckets only.
@@ -404,13 +377,30 @@ const isBucketCacheSegmentData = (
 	})
 }
 
-// --- Service -------------------------------------------------------------
-
-export interface BucketCacheServiceShape {
+export interface BucketCacheServiceApi {
 	readonly enabled: boolean
 	readonly getOrComputeBuckets: <E, R>(
 		request: BucketCacheRequest,
 		computeRange: (range: TimeRange) => Effect.Effect<ReadonlyArray<TimeseriesPoint>, E, R>,
+		/**
+		 * Optional warm-up run once before a multi-range fill fans out.
+		 *
+		 * Each `computeRange` branch resolves the tenant's warehouse route on its
+		 * own, and that resolution reads per-org config from Postgres (~2.9s
+		 * cold). Started together, every branch misses the in-isolate memo and
+		 * pays it: one prod trace resolved the identical config twice
+		 * concurrently at 2.90s each while the queries being prepared for took
+		 * 428ms and 1179ms. Running this first collapses that to one lookup.
+		 *
+		 * Deliberately NOT part of `BucketCacheRequest` — that object is
+		 * canonicalized into the cache-key fingerprint, and an Effect in it would
+		 * poison the key.
+		 *
+		 * Skipped when the fill is 0 or 1 ranges: with none there is nothing to
+		 * prepare, and with one the warm-up would move the same cost rather than
+		 * remove it, while adding a sequential step to a pure cache hit.
+		 */
+		prepare?: Effect.Effect<void>,
 	) => Effect.Effect<BucketCacheOutcome, E, R>
 }
 
@@ -419,16 +409,30 @@ const ttlSecondsConfig = Config.number("QE_BUCKET_CACHE_TTL_SECONDS").pipe(Confi
 const fluxSecondsConfig = Config.number("QE_BUCKET_CACHE_FLUX_SECONDS").pipe(Config.withDefault(60))
 const segmentBucketsConfig = Config.number("QE_BUCKET_CACHE_SEGMENT_BUCKETS").pipe(Config.withDefault(120))
 // A validated query contains at most 1,500 points, so 120-bucket segments
-// produce at most 13 reads. Sixteen keeps the normal path within one shared
-// edge-read deadline while still bounding malformed/internal callers.
-const readConcurrencyConfig = Config.number("QE_BUCKET_CACHE_READ_CONCURRENCY").pipe(Config.withDefault(16))
+// produce at most 13 reads. In practice 98% of prod requests read one or two
+// segments (measured 2026-08-04: 1 segment 70.2%, 2 segments 27.8%), so this
+// cap is a guard against malformed/internal callers, not a tuning knob for the
+// normal path.
+//
+// Do not raise it. Cloudflare counts `cache.match()` against the Worker's
+// six-simultaneous-connection limit for as long as it is waiting for response
+// headers, and queues the seventh until a slot frees. Anything above ~6 here
+// self-queues, and the wait is charged to `EDGE_CACHE_READ_TIMEOUT_MS` — the
+// read gets abandoned before it ever reaches the cache.
+// https://developers.cloudflare.com/workers/platform/limits/
+//
+// The same limit bounds this knob, not just the segment count: 13 segment reads
+// issued at concurrency 16 are still 13 simultaneous `cache.match()` calls. Six
+// is the ceiling that keeps every read in a connection slot instead of queueing
+// behind its own siblings and being abandoned at `EDGE_CACHE_READ_TIMEOUT_MS`.
+const readConcurrencyConfig = Config.number("QE_BUCKET_CACHE_READ_CONCURRENCY").pipe(Config.withDefault(6))
 // Cap how many missing sub-ranges fan out to the warehouse per cache miss. A
 // single cold dashboard request only ever splits into a few ranges, but
 // "unbounded" let a burst of concurrent misses multiply into a warehouse
 // stampede (the mechanism behind the eval-bucket-cache regression). Bound it.
 const fillConcurrencyConfig = Config.number("QE_BUCKET_CACHE_FILL_CONCURRENCY").pipe(Config.withDefault(4))
 
-export class BucketCacheService extends Context.Service<BucketCacheService, BucketCacheServiceShape>()(
+export class BucketCacheService extends Context.Service<BucketCacheService, BucketCacheServiceApi>()(
 	"@maple/api/lib/BucketCacheService",
 	{
 		make: Effect.gen(function* () {
@@ -446,6 +450,7 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 			const getOrComputeBuckets = Effect.fn("BucketCacheService.getOrComputeBuckets")(function* <E, R>(
 				request: BucketCacheRequest,
 				computeRange: (range: TimeRange) => Effect.Effect<ReadonlyArray<TimeseriesPoint>, E, R>,
+				prepare?: Effect.Effect<void>,
 			) {
 				const bucketMs = request.bucketSeconds * 1000
 				const segmentMs = bucketMs * segmentBucketCount
@@ -477,7 +482,7 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 					const segmentStarts = segmentStartsForRange(request.startMs, request.endMs, segmentMs)
 					type SegmentRead = {
 						readonly segmentStartMs: number
-						readonly status: "hit" | "miss" | "timeout" | "error"
+						readonly status: "hit" | "miss" | "timeout" | "skipped" | "error"
 						readonly buckets: ReadonlyArray<CachedBucket>
 					}
 
@@ -551,6 +556,12 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 						fluxBoundaryMs,
 					)
 					const fillRanges = coalesceMissingRanges(missing)
+					// One warm-up before the fan-out, not one route resolution per
+					// branch. See `prepare` on BucketCacheServiceApi for the trace
+					// this came from. Only worth it above one range — see the doc there.
+					if (prepare !== undefined && fillRanges.length > 1) {
+						yield* prepare
+					}
 					const freshByRange = yield* Effect.forEach(
 						fillRanges,
 						(item) => computeRange(item.range),
@@ -558,9 +569,11 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 							concurrency: fillConcurrency,
 						},
 					)
+					// `freshByRange` is the result of the same `fillRanges` fan-out, so the
+					// indexes line up; an empty range is the honest value if one ever does not.
 					const rangeResults = fillRanges.map((item, index) => ({
 						item,
-						points: freshByRange[index]!,
+						points: freshByRange[index] ?? [],
 					}))
 					const freshCachableBuckets = rangeResults.flatMap(({ item, points }) =>
 						item.cachable
@@ -579,11 +592,28 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 						[...freshBySegment.entries()],
 						([segmentStartMs, freshBuckets]) => {
 							const readStatus = readStatusBySegment.get(segmentStartMs) ?? "miss"
-							if (readStatus === "timeout" || readStatus === "error") return Effect.void
-							const merged = mergeAndDeduplicateBuckets(
-								existingBySegment.get(segmentStartMs) ?? EMPTY_BUCKETS,
-								freshBuckets,
-							)
+							// A read we never got an answer from — timed out, errored, or
+							// skipped by the edge cache's breaker — tells us nothing about
+							// what is stored, so we must not merge against `existingBySegment`
+							// (empty, but only because we never saw it) and present the
+							// result as the whole segment. Skipping the write entirely is
+							// the wrong correction though: under sustained connection
+							// pressure every read for a hot segment times out, so the
+							// segment is never repopulated and every subsequent request
+							// times out too — the cache holds itself cold.
+							//
+							// Write the fresh buckets alone instead. Every bucket here is
+							// fully settled (past the flux boundary) and therefore
+							// immutable, so overwriting an unread entry with them cannot
+							// lose correct data — at worst it drops buckets we couldn't see,
+							// which the next request refetches and merges back.
+							const merged =
+								readStatus === "timeout" || readStatus === "skipped" || readStatus === "error"
+									? [...freshBuckets].sort((a, b) => a.startMs - b.startMs)
+									: mergeAndDeduplicateBuckets(
+											existingBySegment.get(segmentStartMs) ?? EMPTY_BUCKETS,
+											freshBuckets,
+										)
 							const key = `v${CACHE_VERSION}:${request.orgId}:${fingerprint}:${segmentStartMs}`
 							const payload: BucketCacheSegmentData = {
 								version: CACHE_VERSION,
@@ -646,6 +676,7 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 						segmentsHit: countStatus("hit"),
 						segmentsMissed: countStatus("miss"),
 						segmentsTimedOut: countStatus("timeout"),
+						segmentsSkipped: countStatus("skipped"),
 						segmentsErrored: countStatus("error"),
 					} satisfies BucketCacheOutcome
 					const coverageRatio =
@@ -661,6 +692,7 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 						"cache.segments_hit": outcome.segmentsHit,
 						"cache.segments_missed": outcome.segmentsMissed,
 						"cache.segments_timed_out": outcome.segmentsTimedOut,
+						"cache.segments_skipped": outcome.segmentsSkipped,
 						"cache.segments_errored": outcome.segmentsErrored,
 					})
 					return outcome
@@ -673,7 +705,7 @@ export class BucketCacheService extends Context.Service<BucketCacheService, Buck
 				return yield* readOrCompute
 			})
 
-			return { enabled, getOrComputeBuckets } satisfies BucketCacheServiceShape
+			return { enabled, getOrComputeBuckets } satisfies BucketCacheServiceApi
 		}),
 	},
 ) {

@@ -1,19 +1,38 @@
 import {
+	IntegrationsRevokedError,
 	OrgId,
 	ScrapeTargetAuthError,
 	ScrapeTargetEncryptionError,
 	ScrapeTargetPersistenceError,
 	ScrapeTargetUpstreamError,
 } from "@maple/domain/http"
+import { globToRegExp } from "@maple/domain/glob"
 import type { scrapeTargets } from "@maple/db"
-import { Clock, Context, Deferred, Duration, Effect, Layer, Redacted, Ref, Schema } from "effect"
+import {
+	Clock,
+	Context,
+	Deferred,
+	Duration,
+	Effect,
+	HashMap,
+	Layer,
+	Option,
+	Redacted,
+	Ref,
+	Result,
+	Schema,
+} from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { parseBase64Aes256GcmKey } from "@/platform/Crypto"
 import { Env } from "@/platform/Env"
-import { buildScrapeAuthHeaders, catchOAuthTokenFailure } from "@/services/auth/scrape-auth"
-import { validateExternalUrlSync } from "@/http/url-validator"
+import { buildScrapeAuthHeaders } from "@/services/auth/scrape-auth"
+import { validateExternalUrlSync } from "@maple/safe-fetch"
 import { decodeDiscoveryConfig } from "./planetscale/discovery-config"
-import { PlanetScaleOAuthService, planetScaleBearerHeader } from "@/services/auth/PlanetScaleOAuthService"
+import {
+	PlanetScaleOAuthService,
+	planetScaleBearerHeader,
+	type PlanetScaleAccessTokenError,
+} from "@/services/auth/PlanetScaleOAuthService"
 
 type ScrapeTargetRow = typeof scrapeTargets.$inferSelect
 
@@ -80,6 +99,7 @@ type DiscoveryError =
 	| ScrapeTargetEncryptionError
 	| ScrapeTargetAuthError
 	| ScrapeTargetUpstreamError
+	| PlanetScaleAccessTokenError
 
 const toPersistenceError = (message: string) => new ScrapeTargetPersistenceError({ message })
 
@@ -87,7 +107,7 @@ const toPersistenceError = (message: string) => new ScrapeTargetPersistenceError
 // undecodable payload. Kept distinct from persistence (our DB) so the class —
 // not a regex over the message — carries the failure kind downstream.
 const toUpstreamError = (message: string, status?: number) =>
-	new ScrapeTargetUpstreamError({ message, ...(status === undefined ? {} : { status }) })
+	new ScrapeTargetUpstreamError({ message, ...(!(status === undefined) ? { status } : undefined) })
 
 /** Convert one http_sd group into sub-targets, dropping SSRF-invalid hosts. */
 export const subTargetsFromGroup = (group: {
@@ -173,15 +193,6 @@ const branchNameForFilter = (entry: PlanetScaleSubTarget): string =>
 	entry.labels.planetscale_database_branch_id ??
 	entry.subTargetKey
 
-/** Glob → anchored RegExp supporting `*` (any run) and `?` (one char). */
-const globToRegExp = (pattern: string): RegExp => {
-	const escaped = pattern
-		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-		.replace(/\*/g, ".*")
-		.replace(/\?/g, ".")
-	return new RegExp(`^${escaped}$`)
-}
-
 interface BranchFilters {
 	readonly include: ReadonlyArray<string>
 	readonly exclude: ReadonlyArray<string>
@@ -201,7 +212,7 @@ const branchPassesFilters = (name: string, filters: BranchFilters): boolean => {
 	return true
 }
 
-export interface PlanetScaleDiscoveryServiceShape {
+export interface PlanetScaleDiscoveryServiceApi {
 	/**
 	 * Resolve a planetscale target row into its discovered sub-targets,
 	 * refreshing the cache when older than the TTL. Fails only when discovery
@@ -215,6 +226,7 @@ export interface PlanetScaleDiscoveryServiceShape {
 		| ScrapeTargetEncryptionError
 		| ScrapeTargetAuthError
 		| ScrapeTargetUpstreamError
+		| PlanetScaleAccessTokenError
 	>
 	/** Last discovery error for a target (null when the last refresh succeeded). */
 	readonly lastError: (targetId: string) => Effect.Effect<string | null>
@@ -224,7 +236,7 @@ export interface PlanetScaleDiscoveryServiceShape {
 
 export class PlanetScaleDiscoveryService extends Context.Service<
 	PlanetScaleDiscoveryService,
-	PlanetScaleDiscoveryServiceShape
+	PlanetScaleDiscoveryServiceApi
 >()("@maple/api/services/PlanetScaleDiscoveryService", {
 	make: Effect.gen(function* () {
 		const env = yield* Env
@@ -235,7 +247,7 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 			(message) => new ScrapeTargetEncryptionError({ message }),
 		)
 
-		const cache = yield* Ref.make(new Map<string, CacheEntry>())
+		const cache = yield* Ref.make(HashMap.empty<string, CacheEntry>())
 
 		// In-flight refresh dedup keyed by target id (the bucket-cache/edge-cache
 		// idiom): N per-branch scrapes that miss the TTL together must share one
@@ -254,9 +266,8 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 			if (row.authType !== "planetscale_oauth") {
 				return yield* buildScrapeAuthHeaders(row, encryptionKey)
 			}
-			const { accessToken } = yield* psOAuth
-				.getValidAccessToken(Schema.decodeUnknownSync(OrgId)(row.orgId))
-				.pipe(Effect.catchTags(catchOAuthTokenFailure))
+			const orgId = yield* Schema.decodeEffect(OrgId)(row.orgId).pipe(Effect.orDie)
+			const { accessToken } = yield* psOAuth.getValidAccessToken(orgId)
 			return { Authorization: planetScaleBearerHeader(accessToken) }
 		})
 
@@ -280,14 +291,12 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 				}),
 			)
 
-			// A rejected credential is an auth failure, not a persistence one — keep
-			// the taxonomy so the org-picker/status surfaces can key on the reason
-			// instead of regex-sniffing the status out of the message.
+			// Preserve the OAuth grant's exact public failure. A manual service token
+			// has no integration grant, so it keeps the scrape-target auth tag.
 			if (response.status === 401 || response.status === 403) {
 				return yield* Effect.fail(
 					row.authType === "planetscale_oauth"
-						? new ScrapeTargetAuthError({
-								reason: "revoked",
+						? new IntegrationsRevokedError({
 								message: `PlanetScale discovery rejected the OAuth token (HTTP ${response.status}). Check the OAuth app's read_metrics_endpoints scope and reconnect.`,
 							})
 						: new ScrapeTargetAuthError({
@@ -302,7 +311,7 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 				)
 			}
 
-			const groups = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(HttpSdResponse))(
+			const groups = yield* Schema.decodeEffect(Schema.fromJsonString(HttpSdResponse))(
 				response.text,
 			).pipe(
 				Effect.mapError(() =>
@@ -377,7 +386,7 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 		const discover = Effect.fn("PlanetScaleDiscoveryService.discover")(function* (row: ScrapeTargetRow) {
 			yield* Effect.annotateCurrentSpan({ orgId: row.orgId })
 			const now = yield* Clock.currentTimeMillis
-			const cached = (yield* Ref.get(cache)).get(row.id)
+			const cached = Option.getOrUndefined(HashMap.get(yield* Ref.get(cache), row.id))
 			if (cached && now - cached.fetchedAt < DISCOVERY_TTL_MS) {
 				return cached.entries
 			}
@@ -394,18 +403,19 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 			inFlight.set(row.id, { await: Deferred.await(deferred) })
 
 			const refresh = Effect.gen(function* () {
-				const fresh = yield* fetchSubTargets(row).pipe(
-					Effect.map((entries) => ({ ok: true as const, entries })),
-					Effect.catch((error) => Effect.succeed({ ok: false as const, error })),
-				)
-				if (fresh.ok) {
-					yield* Ref.update(cache, (map) =>
-						new Map(map).set(row.id, { fetchedAt: now, entries: fresh.entries, lastError: null }),
+				const fresh = yield* Effect.result(fetchSubTargets(row))
+				if (Result.isSuccess(fresh)) {
+					yield* Ref.update(cache, (entries) =>
+						HashMap.set(entries, row.id, {
+							fetchedAt: now,
+							entries: fresh.success,
+							lastError: null,
+						}),
 					)
-					return fresh.entries
+					return fresh.success
 				}
 
-				const message = fresh.error.message
+				const message = fresh.failure.message
 
 				if (cached) {
 					// Serve stale entries through transient discovery failures; keep the
@@ -413,13 +423,13 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 					yield* Effect.logWarning("PlanetScale discovery failed; serving stale targets").pipe(
 						Effect.annotateLogs({ scrapeTargetId: row.id, error: message }),
 					)
-					yield* Ref.update(cache, (map) =>
-						new Map(map).set(row.id, { ...cached, lastError: message }),
+					yield* Ref.update(cache, (entries) =>
+						HashMap.set(entries, row.id, { ...cached, lastError: message }),
 					)
 					return cached.entries
 				}
 
-				return yield* Effect.fail(fresh.error)
+				return yield* Effect.fail(fresh.failure)
 			})
 
 			return yield* refresh.pipe(
@@ -435,20 +445,23 @@ export class PlanetScaleDiscoveryService extends Context.Service<
 		})
 
 		const lastError = (targetId: string) =>
-			Ref.get(cache).pipe(Effect.map((map) => map.get(targetId)?.lastError ?? null))
+			Ref.get(cache).pipe(
+				Effect.map((map) =>
+					Option.match(HashMap.get(map, targetId), {
+						onNone: () => null,
+						onSome: (entry) => entry.lastError,
+					}),
+				),
+			)
 
 		const invalidate = (targetId: string) =>
-			Ref.update(cache, (map) => {
-				const next = new Map(map)
-				next.delete(targetId)
-				return next
-			}).pipe(
+			Ref.update(cache, HashMap.remove(targetId)).pipe(
 				// Callers invalidate after credential/org changes — a later discover
 				// must start a fresh fetch, not join one issued with the old creds.
 				Effect.tap(Effect.sync(() => inFlight.delete(targetId))),
 			)
 
-		return { discover, lastError, invalidate } satisfies PlanetScaleDiscoveryServiceShape
+		return { discover, lastError, invalidate } satisfies PlanetScaleDiscoveryServiceApi
 	}),
 }) {
 	static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(FetchHttpClient.layer))

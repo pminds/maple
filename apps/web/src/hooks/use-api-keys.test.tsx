@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+// TEST-SEAM: This focused test replaces process-global modules that have no instance-level injection seam.
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { PostgresTransactionId } from "@maple/domain"
@@ -18,7 +19,11 @@ vi.mock("@/lib/collections/org-collections", () => ({
 }))
 vi.mock("@/lib/registry", async () => {
 	const { Layer } = await import("effect")
-	return { mapleRuntime: { runFork: mocks.runFork }, mapleApiClientLayer: Layer.empty }
+	return {
+		mapleRuntime: { runFork: mocks.runFork },
+		mapleApiClientLayer: Layer.empty,
+		appMemoMap: Layer.makeMemoMapUnsafe(),
+	}
 })
 
 import { useApiKeyMutationSync } from "./use-api-keys"

@@ -1,3 +1,4 @@
+import { isValidRawSql } from "@maple/domain/raw-sql"
 import {
 	AlertCheckDocument,
 	AlertDeliveryEventDocument,
@@ -31,13 +32,13 @@ import type {
 	V2AlertRuleTestParams,
 } from "@maple/domain/http/v2"
 import type { QueryEngineAlertReducer } from "@maple/query-engine"
-import { Cause, Exit, Option, Schema } from "effect"
-import { v2ErrorInfo } from "@/lib/error-messages"
+import { Exit, Schema } from "effect"
+import { errorMessage } from "@/lib/error-toast"
 import {
 	buildTimeseriesQuerySpec,
 	createQueryDraft,
 	type QueryBuilderQueryDraft,
-} from "@/lib/query-builder/model"
+} from "@maple/query-engine/query-builder"
 import { formatErrorRate, formatLatency, formatNumber } from "@maple/ui/lib/format"
 
 const asHazelOrganizationId = Schema.decodeUnknownSync(HazelOrganizationId)
@@ -106,7 +107,7 @@ export const signalLabels: Record<AlertSignalType, string> = {
 	throughput: "Throughput",
 	builder_query: "Query builder",
 	raw_query: "Raw SQL",
-}
+} satisfies Record<AlertSignalType, string>
 
 export const RAW_QUERY_REDUCER_LABELS: Record<QueryEngineAlertReducer, string> = {
 	identity: "Last bucket",
@@ -114,7 +115,7 @@ export const RAW_QUERY_REDUCER_LABELS: Record<QueryEngineAlertReducer, string> =
 	avg: "Average",
 	min: "Minimum",
 	max: "Maximum",
-}
+} satisfies Record<QueryEngineAlertReducer, string>
 
 /** Default ClickHouse SQL shown when a fresh raw_query alert is created. */
 const DEFAULT_RAW_QUERY_SQL = `SELECT
@@ -134,7 +135,7 @@ export const comparatorLabels: Record<AlertComparator, string> = {
 	neq: "!=",
 	between: "between",
 	not_between: "not between",
-}
+} satisfies Record<AlertComparator, string>
 
 /** Returns true for comparators that need a second (upper) threshold. */
 export const isRangeComparator = (c: AlertComparator): c is "between" | "not_between" =>
@@ -142,26 +143,9 @@ export const isRangeComparator = (c: AlertComparator): c is "between" | "not_bet
 
 export { destinationTypeLabels } from "@/components/alerts/destination-provider"
 
-export function getExitErrorMessage(exit: Exit.Exit<unknown, unknown>, fallback: string): string {
-	if (Exit.isSuccess(exit)) return fallback
-	const failure = Option.getOrUndefined(Exit.findErrorOption(exit))
-	// v2 error envelope ({ error: { type, code, message } }) — the message is the
-	// server's human-readable explanation (validation details included).
-	const v2 = v2ErrorInfo(failure)
-	if (v2 !== null && v2.message.trim().length > 0) return v2.message
-	if (failure instanceof Error && failure.message.trim().length > 0) return failure.message
-	if (
-		typeof failure === "object" &&
-		failure !== null &&
-		"message" in failure &&
-		typeof failure.message === "string" &&
-		failure.message.trim().length > 0
-	) {
-		return failure.message
-	}
-	const defect = Cause.squash(exit.cause)
-	if (defect instanceof Error && defect.message.trim().length > 0) return defect.message
-	return fallback
+export function getExitErrorMessage(exit: unknown, fallback: string): string {
+	if (!Exit.isExit(exit) || Exit.isSuccess(exit)) return fallback
+	return errorMessage(exit, fallback)
 }
 
 export function formatSignalValue(signalType: AlertSignalType, value: number | null): string {
@@ -352,8 +336,8 @@ export function buildRuleCreateParamsV2(form: RuleFormState): V2AlertRuleCreateP
 	const notificationTemplate =
 		notificationTitle.length > 0 || notificationBody.length > 0
 			? {
-					...(notificationTitle.length > 0 ? { title: notificationTitle } : {}),
-					...(notificationBody.length > 0 ? { body: notificationBody } : {}),
+					...(notificationTitle.length > 0 ? { title: notificationTitle } : undefined),
+					...(notificationBody.length > 0 ? { body: notificationBody } : undefined),
 				}
 			: null
 	return {
@@ -411,11 +395,10 @@ export function isRulePreviewReady(form: RuleFormState): boolean {
 	}
 	if (form.signalType === "builder_query") return deriveRuleQueryIssues(form).length === 0
 	if (form.signalType === "raw_query") {
-		return (
-			form.rawQuerySql.trim().length > 0 &&
-			form.rawQuerySql.includes("$__orgFilter") &&
-			deriveRuleQueryIssues(form).length === 0
-		)
+		// The alert workload additionally requires $__timeFilter, and the shared
+		// validator covers the deny list, statement shape and terminal clauses that
+		// this used to leave for the server to discover.
+		return isValidRawSql(form.rawQuerySql.trim(), "alert") && deriveRuleQueryIssues(form).length === 0
 	}
 	return deriveRuleQueryIssues(form).length === 0
 }
@@ -441,6 +424,9 @@ export type DestinationFormState = {
 	integrationKey: string
 	url: string
 	signingSecret: string
+	/** Telegram bot token from @BotFather, and the chat it posts to. */
+	telegramBotToken: string
+	telegramChatId: string
 	hazelOrganizationId: string
 	hazelOrganizationName: string
 	hazelOrganizationLogoUrl: string | null
@@ -464,6 +450,8 @@ export function defaultDestinationForm(type: AlertDestinationType = "slack-bot")
 		integrationKey: "",
 		url: "",
 		signingSecret: "",
+		telegramBotToken: "",
+		telegramChatId: "",
 		hazelOrganizationId: "",
 		hazelOrganizationName: "",
 		hazelOrganizationLogoUrl: null,
@@ -487,6 +475,10 @@ export function destinationToFormState(destination: AlertDestinationDocument): D
 		integrationKey: "",
 		url: "",
 		signingSecret: "",
+		// The bot token is a secret and never returned; the chat id is not, and
+		// comes back as `channelLabel` so an edit doesn't demand retyping it.
+		telegramBotToken: "",
+		telegramChatId: destination.type === "telegram" ? (destination.channelLabel ?? "") : "",
 		hazelOrganizationId: "",
 		hazelOrganizationName: "",
 		hazelOrganizationLogoUrl: null,
@@ -505,7 +497,7 @@ export function buildDestinationCreateParamsV2(form: DestinationFormState): V2Al
 				name: form.name.trim(),
 				enabled: form.enabled,
 				channel_id: form.slackChannelId.trim(),
-				...(channelName ? { channel_name: channelName } : {}),
+				...(channelName ? { channel_name: channelName } : undefined),
 			}
 		}
 		case "pagerduty":
@@ -522,7 +514,7 @@ export function buildDestinationCreateParamsV2(form: DestinationFormState): V2Al
 				name: form.name.trim(),
 				enabled: form.enabled,
 				url: form.url.trim(),
-				...(signingSecret ? { signing_secret: signingSecret } : {}),
+				...(signingSecret ? { signing_secret: signingSecret } : undefined),
 			}
 		}
 		case "hazel-oauth": {
@@ -535,7 +527,7 @@ export function buildDestinationCreateParamsV2(form: DestinationFormState): V2Al
 				hazel_organization_name: form.hazelOrganizationName.trim(),
 				...(logoUrl !== null && logoUrl.trim().length > 0
 					? { hazel_organization_logo_url: logoUrl.trim() }
-					: {}),
+					: undefined),
 				hazel_channel_id: asHazelChannelId(form.hazelChannelId.trim()),
 				hazel_channel_name: form.hazelChannelName.trim(),
 			}
@@ -546,6 +538,14 @@ export function buildDestinationCreateParamsV2(form: DestinationFormState): V2Al
 				name: form.name.trim(),
 				enabled: form.enabled,
 				webhook_url: form.webhookUrl.trim(),
+			}
+		case "telegram":
+			return {
+				type: "telegram",
+				name: form.name.trim(),
+				enabled: form.enabled,
+				bot_token: form.telegramBotToken.trim(),
+				chat_id: form.telegramChatId.trim(),
 			}
 		case "email":
 			return {
@@ -570,9 +570,9 @@ export function buildDestinationUpdateParamsV2(form: DestinationFormState): V2Al
 			return {
 				type: "slack-bot",
 				enabled: form.enabled,
-				...(name ? { name } : {}),
-				...(channelId ? { channel_id: channelId } : {}),
-				...(channelName ? { channel_name: channelName } : {}),
+				...(name ? { name } : undefined),
+				...(channelId ? { channel_id: channelId } : undefined),
+				...(channelName ? { channel_name: channelName } : undefined),
 			}
 		}
 		case "pagerduty": {
@@ -580,8 +580,8 @@ export function buildDestinationUpdateParamsV2(form: DestinationFormState): V2Al
 			return {
 				type: "pagerduty",
 				enabled: form.enabled,
-				...(name ? { name } : {}),
-				...(integrationKey ? { integration_key: integrationKey } : {}),
+				...(name ? { name } : undefined),
+				...(integrationKey ? { integration_key: integrationKey } : undefined),
 			}
 		}
 		case "webhook": {
@@ -590,9 +590,9 @@ export function buildDestinationUpdateParamsV2(form: DestinationFormState): V2Al
 			return {
 				type: "webhook",
 				enabled: form.enabled,
-				...(name ? { name } : {}),
-				...(url ? { url } : {}),
-				...(signingSecret ? { signing_secret: signingSecret } : {}),
+				...(name ? { name } : undefined),
+				...(url ? { url } : undefined),
+				...(signingSecret ? { signing_secret: signingSecret } : undefined),
 			}
 		}
 		case "hazel-oauth": {
@@ -603,16 +603,18 @@ export function buildDestinationUpdateParamsV2(form: DestinationFormState): V2Al
 			return {
 				type: "hazel-oauth",
 				enabled: form.enabled,
-				...(name ? { name } : {}),
-				...(organizationId ? { hazel_organization_id: asHazelOrganizationId(organizationId) } : {}),
-				...(organizationName ? { hazel_organization_name: organizationName } : {}),
+				...(name ? { name } : undefined),
+				...(organizationId
+					? { hazel_organization_id: asHazelOrganizationId(organizationId) }
+					: undefined),
+				...(organizationName ? { hazel_organization_name: organizationName } : undefined),
 				...(form.hazelOrganizationLogoUrl === null
 					? { hazel_organization_logo_url: null }
 					: form.hazelOrganizationLogoUrl.trim()
 						? { hazel_organization_logo_url: form.hazelOrganizationLogoUrl.trim() }
 						: {}),
-				...(channelId ? { hazel_channel_id: asHazelChannelId(channelId) } : {}),
-				...(channelName ? { hazel_channel_name: channelName } : {}),
+				...(channelId ? { hazel_channel_id: asHazelChannelId(channelId) } : undefined),
+				...(channelName ? { hazel_channel_name: channelName } : undefined),
 			}
 		}
 		case "discord": {
@@ -620,18 +622,31 @@ export function buildDestinationUpdateParamsV2(form: DestinationFormState): V2Al
 			return {
 				type: "discord",
 				enabled: form.enabled,
-				...(name ? { name } : {}),
-				...(webhookUrl ? { webhook_url: webhookUrl } : {}),
+				...(name ? { name } : undefined),
+				...(webhookUrl ? { webhook_url: webhookUrl } : undefined),
+			}
+		}
+		case "telegram": {
+			const botToken = form.telegramBotToken.trim()
+			const chatId = form.telegramChatId.trim()
+			return {
+				type: "telegram",
+				enabled: form.enabled,
+				...(name ? { name } : undefined),
+				...(botToken ? { bot_token: botToken } : undefined),
+				...(chatId ? { chat_id: chatId } : undefined),
 			}
 		}
 		case "email":
 			return {
 				type: "email",
 				enabled: form.enabled,
-				...(name ? { name } : {}),
+				...(name ? { name } : undefined),
 				...(form.memberUserIds.length > 0
-					? { member_user_ids: form.memberUserIds.map((userId) => asUserId(userId)) }
-					: {}),
+					? {
+							member_user_ids: form.memberUserIds.map((userId) => asUserId(userId)),
+						}
+					: undefined),
 			}
 	}
 }
@@ -668,7 +683,7 @@ export function v2PreviewToResponse(result: V2AlertRulePreviewResult): AlertRule
 								status: point.status,
 								...(point.provisional !== undefined
 									? { provisional: point.provisional }
-									: {}),
+									: undefined),
 							}),
 					),
 				}),
@@ -828,7 +843,7 @@ export const eventTypeMeta: Record<AlertEventType, { label: string; dot: string;
 	resolve: { label: "Resolved", dot: "bg-success", text: "text-success" },
 	renotify: { label: "Re-notified", dot: "bg-warning", text: "text-warning" },
 	test: { label: "Test", dot: "bg-info", text: "text-info" },
-}
+} satisfies Record<AlertEventType, { label: string; dot: string; text: string }>
 
 export type DeliveryStatusVariant = "success" | "error" | "warning" | "outline"
 
@@ -841,7 +856,7 @@ export const deliveryStatusMeta: Record<
 	failed: { label: "Failed", variant: "error" },
 	processing: { label: "Sending", variant: "warning" },
 	queued: { label: "Queued", variant: "outline" },
-}
+} satisfies Record<AlertDeliveryStatus, { label: string; variant: DeliveryStatusVariant }>
 
 export interface DeliveryEventDayGroup {
 	key: string

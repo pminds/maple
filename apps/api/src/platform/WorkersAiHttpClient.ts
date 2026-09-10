@@ -2,12 +2,12 @@
  * `HttpClient` shim that routes Cloudflare Workers AI traffic through the Worker's `AI` binding
  * instead of the public REST endpoint.
  *
- * `@maple/llm`'s `CloudflareWorkersAI` provider posts an OpenAI-compatible chat body to
+ * `@opencode-ai/ai`'s `CloudflareWorkersAI` provider posts an OpenAI-compatible chat body to
  * `https://api.cloudflare.com/client/v4/accounts/{id}/ai/v1/chat/completions` with an API token.
  * That is a *different billing and rate-limit path* from `env.AI.run(...)`, which is keyless and
  * draws on the account's included neuron allocation — the path Maple's chat and triage run on.
  * The `Ai` binding exposes no `fetch`, so intercepting at the `HttpClient` seam
- * is the only way to keep the vendored provider *and* the binding.
+ * is the only way to keep the upstream provider *and* the binding.
  *
  * The translation is *almost* a pass-through. `env.AI.run(model, inputs, { returnRawResponse: true })`
  * takes the same OpenAI-compatible payload the provider already builds — `messages`, `tools`,
@@ -17,13 +17,13 @@
  * The exception, and the reason `stripNativeTrailer` exists: after the OpenAI-shaped deltas Workers
  * AI appends one frame of its *own* native accounting —
  * `{"response":"","usage":{...,"neurons":260.1}}` — which is not an OpenAI chunk and which the
- * vendored provider rejects with "Invalid ... stream event". Because it arrives last, the whole
+ * upstream provider rejects with "Invalid ... stream event". Because it arrives last, the whole
  * reply streams successfully and then the turn dies on the final frame. Filtering it here keeps the
- * fix at the Maple seam, where `lib/llm/MAPLE.md` says provider-specific behaviour belongs.
+ * fix at the Maple seam, which is where provider-specific behaviour belongs.
  *
  * Requests that are not Workers AI chat completions fall through to the wrapped client untouched.
  */
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Predicate } from "effect"
 import { HttpClient, HttpClientError, HttpClientResponse, type HttpClientRequest } from "effect/unstable/http"
 
 /** The subset of the Cloudflare `Ai` binding this shim uses. */
@@ -38,11 +38,11 @@ export interface WorkersAiBinding {
 /**
  * Whether `value` is an `Ai` binding this shim can drive.
  *
- * Worth being loud about, because the failure is silent: when this returns false the vendored
+ * Worth being loud about, because the failure is silent: when this returns false the upstream
  * provider falls through to the REST endpoint with `BINDING_PLACEHOLDER` credentials and 401s at
- * the *end* of a turn, which reads like a model outage rather than a misconfiguration. Local dev
- * declares a plain `ai` binding in `wrangler.jsonc` while deploys attach an AI Gateway resource
- * (`apps/api/alchemy.run.ts`), so the two shapes have to satisfy the same check.
+ * the *end* of a turn, which reads like a model outage rather than a misconfiguration. A plain
+ * `ai` binding and the AI Gateway resource deploys attach (`apps/api/src/worker.ts`) both
+ * surface as `env.AI`, so the two shapes have to satisfy the same check.
  */
 export const isWorkersAiBinding = (value: unknown): value is WorkersAiBinding =>
 	typeof value === "object" && value !== null && typeof (value as { run?: unknown }).run === "function"
@@ -86,7 +86,7 @@ const readJsonBody = (request: HttpClientRequest.HttpClientRequest) =>
 				throw new Error(`Workers AI request carries a ${body._tag} body, expected serialized JSON`)
 			}
 			const parsed: unknown = JSON.parse(text)
-			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			if (!Predicate.isObject(parsed)) {
 				throw new Error("Workers AI request body is not a JSON object")
 			}
 			return { ...(parsed as Record<string, unknown>) }
@@ -107,8 +107,8 @@ const isNativeWorkersAiTrailer = (payload: string): boolean => {
 	if (payload === "[DONE]") return false
 	try {
 		const value: unknown = JSON.parse(payload)
-		if (typeof value !== "object" || value === null) return false
-		const frame = value as Record<string, unknown>
+		if (!Predicate.isObject(value)) return false
+		const frame = value
 		if ("choices" in frame || "object" in frame) return false
 		if (typeof frame.response !== "string") return false
 		const usage = frame.usage

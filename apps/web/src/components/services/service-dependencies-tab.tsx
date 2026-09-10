@@ -1,7 +1,7 @@
 import { useMemo } from "react"
 import { cn } from "@maple/ui/lib/utils"
 import { Result } from "@/lib/effect-atom"
-import { useRetainedRefreshableResultValue } from "@/hooks/use-retained-refreshable-result-value"
+import { useRefreshableAtomValue } from "@/hooks/use-refreshable-atom-value"
 import { getServiceDependenciesBundleResultAtom } from "@/lib/services/atoms/warehouse-query-atoms"
 import { toSingleDeploymentEnv } from "@/lib/services/environments"
 import { latencyToneClass } from "@maple/ui/lib/latency-tone"
@@ -67,7 +67,7 @@ export function ServiceDependenciesTab({
 	// a single round-trip (was three separate atoms). The atom key (incl. the
 	// derived deploymentEnv) matches ServiceDependencyStrip's, so switching from
 	// the Overview strip to this tab is a cache hit.
-	const bundleResult = useRetainedRefreshableResultValue(
+	const bundleResult = useRefreshableAtomValue(
 		getServiceDependenciesBundleResultAtom({
 			data: {
 				serviceName,
@@ -364,6 +364,6 @@ function labelFor(kind: DependencyKind, count: number): string {
 		http: ["external HTTP", "external HTTP"],
 		messaging: ["queue", "queues"],
 		rpc: ["RPC target", "RPC targets"],
-	}
+	} satisfies Record<DependencyKind, [singular: string, plural: string]>
 	return count === 1 ? map[kind][0] : map[kind][1]
 }

@@ -1,24 +1,23 @@
-import { useEffect, useState } from "react"
+import { useState } from "react"
 import { Result } from "@/lib/effect-atom"
-import { useNavigate } from "@tanstack/react-router"
+import { getRouteApi } from "@tanstack/react-router"
 
 import {
 	FilterSection,
 	SearchableFilterSection,
-	SingleCheckboxFilter,
 	type FilterOption,
 } from "@/components/filters/filter-section"
 import { MagnifierIcon, XmarkIcon } from "@/components/icons"
 import { browserIconFor, deviceIconFor } from "@/components/replays/session-icons"
-import { Route } from "@/routes/replays"
 import {
 	InputGroup,
 	InputGroupAddon,
 	InputGroupButton,
 	InputGroupInput,
 } from "@maple/ui/components/ui/input-group"
-import { Label } from "@maple/ui/components/ui/label"
 import { FILTER_SECTION_LABEL } from "@maple/ui/components/filters/filter-styles"
+import { Separator } from "@maple/ui/components/ui/separator"
+import { cn } from "@maple/ui/lib/utils"
 import {
 	RangeFilterSection,
 	formatSeconds,
@@ -33,6 +32,8 @@ import {
 	FilterSidebarLoading,
 } from "@/components/filters/filter-sidebar"
 
+const routeApi = getRouteApi("/replays/")
+
 interface ReplaysFacetItem {
 	readonly name: string
 	readonly count: number
@@ -43,6 +44,9 @@ interface ReplaysFacets {
 	readonly browsers: ReadonlyArray<ReplaysFacetItem>
 	readonly countries: ReadonlyArray<ReplaysFacetItem>
 	readonly devices: ReadonlyArray<ReplaysFacetItem>
+	/** Identified groups (company / team). Empty for orgs that never call
+	 *  `identify()` with a group — the section hides itself then. */
+	readonly groups: ReadonlyArray<ReplaysFacetItem>
 	readonly errorCount: number
 	/** Session-length distribution: `name` is the bucket floor in ms. */
 	readonly durationBuckets: ReadonlyArray<ReplaysFacetItem>
@@ -143,25 +147,23 @@ interface ReplaysFilterSidebarProps {
 }
 
 export function ReplaysFilterSidebar({ facetsResult }: ReplaysFilterSidebarProps) {
-	const navigate = useNavigate({ from: Route.fullPath })
-	const search = Route.useSearch()
+	const navigate = routeApi.useNavigate()
+	const search = routeApi.useSearch()
 
 	// Single-value params: take the last toggled option (switching dimensions
 	// replaces the prior value; unchecking the only one clears it).
-	const setSingle = (key: "service" | "browser" | "country" | "deviceType", values: string[]) => {
+	const setSingle = (key: "service" | "browser" | "country" | "deviceType" | "group", values: string[]) => {
 		navigate({
 			search: (prev) => ({ ...prev, [key]: values.at(-1) ?? undefined }),
 		})
 	}
 
-	const toggleHasErrors = (checked: boolean) => {
-		navigate({
-			search: (prev) => ({ ...prev, hasErrors: checked || undefined }),
-		})
-	}
-
 	const setUserId = (value: string | undefined) => {
 		navigate({ search: (prev) => ({ ...prev, userId: value }) })
+	}
+
+	const setUserSearch = (value: string | undefined) => {
+		navigate({ search: (prev) => ({ ...prev, user: value }) })
 	}
 
 	// Session-time ranges (seconds in the URL; mapped to ms before the query).
@@ -190,6 +192,8 @@ export function ReplaysFilterSidebar({ facetsResult }: ReplaysFilterSidebarProps
 		!!search.country ||
 		!!search.deviceType ||
 		!!search.userId ||
+		!!search.user ||
+		!!search.group ||
 		search.hasErrors === true ||
 		search.durationMin != null ||
 		search.durationMax != null ||
@@ -204,27 +208,31 @@ export function ReplaysFilterSidebar({ facetsResult }: ReplaysFilterSidebarProps
 			const browsers = withSelected(facets.browsers, search.browser)
 			const countries = withSelected(facets.countries, search.country)
 			const devices = withSelected(facets.devices, search.deviceType)
+			const groups = withSelected(facets.groups, search.group)
 
 			const hasFacets =
 				services.length > 0 ||
 				browsers.length > 0 ||
 				countries.length > 0 ||
 				devices.length > 0 ||
+				groups.length > 0 ||
 				facets.errorCount > 0
 
 			return (
 				<FilterSidebarFrame waiting={result.waiting}>
 					<FilterSidebarHeader canClear={hasActiveFilters} onClear={clearAllFilters} />
 					<FilterSidebarBody>
-						<UserIdFilter value={search.userId} onApply={setUserId} />
+						{/* Browse before you type. The counted facets and the two range controls
+						    lead, because they answer "what is in here" without you knowing anything
+						    first; the identity fields are demoted to the foot of the rail, because
+						    they only pay off once you already have a name in mind. Leading with two
+						    empty text boxes spent the top third of the rail on controls that show
+						    nothing until typed into.
 
-						<SingleCheckboxFilter
-							title="Has errors"
-							checked={search.hasErrors === true}
-							onChange={toggleHasErrors}
-							count={facets.errorCount}
-						/>
-
+						    There is deliberately no "Has errors" checkbox here: the toolbar carries
+						    that exact filter, with the same facet count, as a one-click chip. Two
+						    controls for one boolean in the same viewport is not redundancy, it is a
+						    question about whether they agree. */}
 						<RangeFilterSection
 							title="Session length"
 							unit="s"
@@ -275,6 +283,40 @@ export function ReplaysFilterSidebar({ facetsResult }: ReplaysFilterSidebarProps
 							onChange={(vals) => setSingle("country", vals)}
 						/>
 
+						{/* Hidden entirely when nobody is grouped — an empty facet list here
+						    would just read as a broken section. */}
+						{groups.length > 0 && (
+							<SearchableFilterSection
+								title="Group"
+								options={groups}
+								selected={search.group ? [search.group] : []}
+								onChange={(vals) => setSingle("group", vals)}
+							/>
+						)}
+
+						{/* The rule is the separator's job: everything above is picked from a
+						    list the warehouse supplied, everything below is typed from memory. */}
+						<Separator className="my-2" />
+						<h4 className={cn(FILTER_SECTION_LABEL, "py-1 text-muted-foreground")}>Identity</h4>
+
+						<TextFilter
+							key={`user:${search.user ?? ""}`}
+							id="replays-user-search"
+							placeholder="Name or email…"
+							clearLabel="Clear name or email filter"
+							value={search.user}
+							onApply={setUserSearch}
+						/>
+
+						<TextFilter
+							key={`userId:${search.userId ?? ""}`}
+							id="replays-user-filter"
+							placeholder="User ID…"
+							clearLabel="Clear user ID filter"
+							value={search.userId}
+							onApply={setUserId}
+						/>
+
 						{!hasFacets && (
 							<p className="py-4 text-sm text-muted-foreground">
 								No sessions in the selected time range
@@ -287,22 +329,21 @@ export function ReplaysFilterSidebar({ facetsResult }: ReplaysFilterSidebarProps
 		.render()
 }
 
-// UserId is high-cardinality identity data, so it's a typed exact-match field
-// rather than a facet checklist. Exact match means partial input matches nothing,
-// so the filter commits on Enter (not per-keystroke) — mirrors the toolbar's
+// Identity is high-cardinality, so it's typed rather than picked from a facet
+// checklist. Both identity filters commit on Enter (not per-keystroke) — the
+// user-id one is an exact match, where partial input matches nothing, and the
+// name/email one would otherwise refetch on every letter. Mirrors the toolbar's
 // local-state-synced input. The × clears both the field and the applied filter.
-interface UserIdFilterProps {
+interface TextFilterProps {
+	id: string
+	placeholder: string
+	clearLabel: string
 	value: string | undefined
 	onApply: (value: string | undefined) => void
 }
 
-function UserIdFilter({ value, onApply }: UserIdFilterProps) {
+function TextFilter({ id, placeholder, clearLabel, value, onApply }: TextFilterProps) {
 	const [text, setText] = useState(value ?? "")
-
-	// Keep in sync when userId changes elsewhere (Clear all, the active-user chip's ×).
-	useEffect(() => {
-		setText(value ?? "")
-	}, [value])
 
 	const clear = () => {
 		setText("")
@@ -311,32 +352,27 @@ function UserIdFilter({ value, onApply }: UserIdFilterProps) {
 
 	return (
 		<form
-			className="py-2"
+			className="py-1"
 			onSubmit={(e) => {
 				e.preventDefault()
 				onApply(text.trim() || undefined)
 			}}
 		>
-			<Label
-				htmlFor="replays-user-filter"
-				className={`mb-2 block ${FILTER_SECTION_LABEL} text-muted-foreground`}
-			>
-				User
-			</Label>
 			<InputGroup>
 				<InputGroupAddon>
 					<MagnifierIcon />
 				</InputGroupAddon>
 				<InputGroupInput
-					id="replays-user-filter"
+					id={id}
+					aria-label={placeholder.replace("…", "")}
 					size="sm"
 					value={text}
 					onChange={(e) => setText(e.target.value)}
-					placeholder="Filter by user ID…"
+					placeholder={placeholder}
 				/>
 				{text && (
 					<InputGroupAddon align="inline-end">
-						<InputGroupButton aria-label="Clear user filter" onClick={clear}>
+						<InputGroupButton aria-label={clearLabel} onClick={clear}>
 							<XmarkIcon />
 						</InputGroupButton>
 					</InputGroupAddon>

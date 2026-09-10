@@ -39,7 +39,7 @@ export default class Api extends Cloudflare.Worker<Api>()(
 	{
 		main: import.meta.filename,
 		compatibility: { date: "2026-04-08", flags: ["nodejs_compat"] },
-		url: true,
+		workersDev: true,
 		env: {
 			// Alchemy resolves the resource, ships the value as a Worker secret, and
 			// orders the deploy behind it — it stays `Redacted` in the plan output.
@@ -83,6 +83,7 @@ export default class Api extends Cloudflare.Worker<Api>()(
 				// handler's requirements — and it is cheap: the layer is a few
 				// references over buffers that live in `telemetry`, so the per-event
 				// build keeps nothing of its own.
+				// oxlint-disable-next-line effecttsgo/strict-effect-provide
 				Effect.provide(telemetry.layer),
 			),
 		}

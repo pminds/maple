@@ -21,6 +21,21 @@ export const DO_DATASET = "do_invocations"
 /** Cloudflare caps zone-scoped GraphQL queries at 10 zones per call. */
 export const MAX_ZONES_PER_QUERY = 10
 
+/**
+ * Cloudflare bills a request as "the number of zone/account scopes, multiplied by the number of
+ * nodes to which they are applied" and rejects the whole document once the product is too large
+ * ("In combination, your request queries too many nodes, zones and accounts"). Batching N datasets
+ * into one zone document costs N nodes per zone, so the zone chunk has to shrink as datasets are
+ * added — {@link MAX_ZONES_PER_QUERY} is just this budget at one node.
+ *
+ * @see https://developers.cloudflare.com/analytics/graphql-api/limits/
+ */
+export const MAX_QUERIES_PER_REQUEST = 10
+
+/** Largest zone chunk that keeps `zones × nodes` within {@link MAX_QUERIES_PER_REQUEST}. */
+export const zoneChunkSizeFor = (nodeCount: number): number =>
+	Math.min(MAX_ZONES_PER_QUERY, Math.max(1, Math.floor(MAX_QUERIES_PER_REQUEST / Math.max(1, nodeCount))))
+
 /** Max rows Cloudflare returns per selection — window sizing must keep group counts below this. */
 const GROUP_LIMIT = 5000
 
@@ -30,9 +45,7 @@ const nullable = <S extends Schema.Top>(schema: S) => Schema.optionalKey(Schema.
 const nullableNumber = nullable(Schema.Number)
 const nullableString = nullable(Schema.String)
 
-// ---------------------------------------------------------------------------
 // Dataset settings (per-tenant limits discovery)
-// ---------------------------------------------------------------------------
 
 /**
  * The `settings` discovery node is the only authoritative source for a tenant's retention
@@ -76,7 +89,7 @@ export const DatasetSettings = Schema.Struct({
 	maxDuration: nullableNumber,
 	availableFields: nullable(Schema.Array(Schema.String)),
 })
-export type DatasetSettingsShape = typeof DatasetSettings.Type
+export type DatasetSettingsContract = typeof DatasetSettings.Type
 
 const SettingsResponse = Schema.Struct({
 	viewer: Schema.Struct({
@@ -110,13 +123,11 @@ const SettingsResponse = Schema.Struct({
 		),
 	}),
 })
-export type SettingsResponseShape = typeof SettingsResponse.Type
+export type SettingsResponseContract = typeof SettingsResponse.Type
 
 export const decodeSettingsResponse = Schema.decodeUnknownEffect(SettingsResponse)
 
-// ---------------------------------------------------------------------------
 // Shared analytics documents
-// ---------------------------------------------------------------------------
 //
 // One GraphQL document per (scope, window, zone-chunk): every dataset sharing that window
 // contributes aliased selections under the same `zones`/`accounts` node, so adding a dataset
@@ -157,9 +168,7 @@ export const decodeAccountAnalyticsEnvelope = Schema.decodeUnknownEffect(Account
 const ZoneTagNode = Schema.Struct({ zoneTag: Schema.String })
 export const decodeZoneTagOption = Schema.decodeUnknownOption(ZoneTagNode)
 
-// ---------------------------------------------------------------------------
 // HTTP edge analytics (zone-scoped httpRequestsAdaptiveGroups)
-// ---------------------------------------------------------------------------
 
 const HTTP_QUANTILES_SELECTION = `
         quantiles {
@@ -215,7 +224,7 @@ const HttpGroup = Schema.Struct({
 		clientRequestHTTPHost: nullableString,
 	}),
 })
-export type HttpGroupShape = typeof HttpGroup.Type
+export type HttpGroupDefinition = typeof HttpGroup.Type
 
 const HttpQuantiles = Schema.Struct({
 	edgeTimeToFirstByteMsP50: nullableNumber,
@@ -231,7 +240,7 @@ const HttpLatencyGroup = Schema.Struct({
 	quantiles: nullable(HttpQuantiles),
 	dimensions: Schema.Struct({ datetimeFiveMinutes: Schema.String }),
 })
-export type HttpLatencyGroupShape = typeof HttpLatencyGroup.Type
+export type HttpLatencyGroupDefinition = typeof HttpLatencyGroup.Type
 
 const HttpZoneNode = Schema.Struct({
 	groups: nullable(Schema.Array(HttpGroup)),
@@ -240,9 +249,7 @@ const HttpZoneNode = Schema.Struct({
 
 export const decodeHttpZoneNode = Schema.decodeUnknownEffect(HttpZoneNode)
 
-// ---------------------------------------------------------------------------
 // HTTP path breakdown (zone-scoped httpRequestsAdaptiveGroups, own dataset)
-// ---------------------------------------------------------------------------
 
 /**
  * Request paths for one zone, as their own selection pair rather than extra dimensions on
@@ -286,7 +293,7 @@ const HttpPathGroup = Schema.Struct({
 		clientRequestPath: nullableString,
 	}),
 })
-export type HttpPathGroupShape = typeof HttpPathGroup.Type
+export type HttpPathGroupDefinition = typeof HttpPathGroup.Type
 
 const HttpPathsZoneNode = Schema.Struct({
 	paths: nullable(Schema.Array(HttpPathGroup)),
@@ -295,9 +302,7 @@ const HttpPathsZoneNode = Schema.Struct({
 
 export const decodeHttpPathsZoneNode = Schema.decodeUnknownEffect(HttpPathsZoneNode)
 
-// ---------------------------------------------------------------------------
 // HTTP client/geo breakdown (zone-scoped httpRequestsAdaptiveGroups, own dataset)
-// ---------------------------------------------------------------------------
 
 /**
  * Two more single-purpose selections over the same dataset:
@@ -336,7 +341,7 @@ const HttpCountryGroup = Schema.Struct({
 		clientCountryName: nullableString,
 	}),
 })
-export type HttpCountryGroupShape = typeof HttpCountryGroup.Type
+export type HttpCountryGroupDefinition = typeof HttpCountryGroup.Type
 
 const HttpClientGroup = Schema.Struct({
 	count: Schema.Number,
@@ -348,7 +353,7 @@ const HttpClientGroup = Schema.Struct({
 		clientDeviceType: nullableString,
 	}),
 })
-export type HttpClientGroupShape = typeof HttpClientGroup.Type
+export type HttpClientGroupDefinition = typeof HttpClientGroup.Type
 
 const HttpDimensionsZoneNode = Schema.Struct({
 	countryAgg: nullable(Schema.Array(HttpCountryGroup)),
@@ -357,9 +362,7 @@ const HttpDimensionsZoneNode = Schema.Struct({
 
 export const decodeHttpDimensionsZoneNode = Schema.decodeUnknownEffect(HttpDimensionsZoneNode)
 
-// ---------------------------------------------------------------------------
 // Firewall/WAF events (zone-scoped firewallEventsAdaptiveGroups)
-// ---------------------------------------------------------------------------
 
 /**
  * Security events by action × source × rule × host. Attack traffic can push the group count past
@@ -389,14 +392,12 @@ const FirewallGroup = Schema.Struct({
 		clientRequestHTTPHost: nullableString,
 	}),
 })
-export type FirewallGroupShape = typeof FirewallGroup.Type
+export type FirewallGroupDefinition = typeof FirewallGroup.Type
 
 const FirewallZoneNode = Schema.Struct({ firewall: nullable(Schema.Array(FirewallGroup)) })
 export const decodeFirewallZoneNode = Schema.decodeUnknownEffect(FirewallZoneNode)
 
-// ---------------------------------------------------------------------------
 // DNS analytics (zone-scoped dnsAnalyticsAdaptiveGroups — Cloudflare-DNS zones only)
-// ---------------------------------------------------------------------------
 
 export const dnsSelection = (_options: { readonly withQuantiles: boolean }): string =>
 	`      dns: dnsAnalyticsAdaptiveGroups(
@@ -418,14 +419,12 @@ const DnsGroup = Schema.Struct({
 		responseCode: nullableString,
 	}),
 })
-export type DnsGroupShape = typeof DnsGroup.Type
+export type DnsGroupDefinition = typeof DnsGroup.Type
 
 const DnsZoneNode = Schema.Struct({ dns: nullable(Schema.Array(DnsGroup)) })
 export const decodeDnsZoneNode = Schema.decodeUnknownEffect(DnsZoneNode)
 
-// ---------------------------------------------------------------------------
 // Queues (account-scoped queueBacklogAdaptiveGroups / queueConsumerMetricsAdaptiveGroups)
-// ---------------------------------------------------------------------------
 
 /** Backlog depth is a point-in-time sample, so `avg` (not `sum`) → mapped to gauges. */
 export const queueBacklogSelection = (_options: { readonly withQuantiles: boolean }): string =>
@@ -450,7 +449,7 @@ const QueueBacklogGroup = Schema.Struct({
 		queueId: Schema.String,
 	}),
 })
-export type QueueBacklogGroupShape = typeof QueueBacklogGroup.Type
+export type QueueBacklogGroupDefinition = typeof QueueBacklogGroup.Type
 
 const QueueBacklogAccountNode = Schema.Struct({ queueBacklog: nullable(Schema.Array(QueueBacklogGroup)) })
 export const decodeQueueBacklogAccountNode = Schema.decodeUnknownEffect(QueueBacklogAccountNode)
@@ -471,16 +470,14 @@ const QueueConsumersGroup = Schema.Struct({
 		queueId: Schema.String,
 	}),
 })
-export type QueueConsumersGroupShape = typeof QueueConsumersGroup.Type
+export type QueueConsumersGroupDefinition = typeof QueueConsumersGroup.Type
 
 const QueueConsumersAccountNode = Schema.Struct({
 	queueConsumers: nullable(Schema.Array(QueueConsumersGroup)),
 })
 export const decodeQueueConsumersAccountNode = Schema.decodeUnknownEffect(QueueConsumersAccountNode)
 
-// ---------------------------------------------------------------------------
 // Durable Objects (account-scoped durableObjectsInvocationsAdaptiveGroups)
-// ---------------------------------------------------------------------------
 
 const DO_QUANTILES_SELECTION = `
         quantiles {
@@ -505,16 +502,14 @@ const DurableObjectsGroup = Schema.Struct({
 		scriptName: Schema.String,
 	}),
 })
-export type DurableObjectsGroupShape = typeof DurableObjectsGroup.Type
+export type DurableObjectsGroupDefinition = typeof DurableObjectsGroup.Type
 
 const DurableObjectsAccountNode = Schema.Struct({
 	durableObjects: nullable(Schema.Array(DurableObjectsGroup)),
 })
 export const decodeDurableObjectsAccountNode = Schema.decodeUnknownEffect(DurableObjectsAccountNode)
 
-// ---------------------------------------------------------------------------
 // Workers invocations (account-scoped workersInvocationsAdaptive)
-// ---------------------------------------------------------------------------
 
 const WORKERS_QUANTILES_SELECTION = `
         quantiles {
@@ -555,15 +550,13 @@ const WorkersGroup = Schema.Struct({
 		status: nullableString,
 	}),
 })
-export type WorkersGroupShape = typeof WorkersGroup.Type
+export type WorkersGroupDefinition = typeof WorkersGroup.Type
 
 const WorkersAccountNode = Schema.Struct({ invocations: nullable(Schema.Array(WorkersGroup)) })
 
 export const decodeWorkersAccountNode = Schema.decodeUnknownEffect(WorkersAccountNode)
 
-// ---------------------------------------------------------------------------
 // Live top-traffic lookup (host/path) — served on demand, never stored
-// ---------------------------------------------------------------------------
 
 /**
  * Top hosts or paths for ONE zone over a window, straight from Cloudflare. Path cardinality is
@@ -664,7 +657,7 @@ const TopTrafficGroup = Schema.Struct({
 		clientRequestPath: nullableString,
 	}),
 })
-export type TopTrafficGroupShape = typeof TopTrafficGroup.Type
+export type TopTrafficGroupDefinition = typeof TopTrafficGroup.Type
 
 const TopTrafficResponse = Schema.Struct({
 	viewer: Schema.Struct({
@@ -681,9 +674,7 @@ const TopTrafficResponse = Schema.Struct({
 
 export const decodeTopTrafficResponse = Schema.decodeUnknownEffect(TopTrafficResponse)
 
-// ---------------------------------------------------------------------------
 // Time formatting
-// ---------------------------------------------------------------------------
 
 /** Cloudflare's `Time` scalar accepts RFC 3339; second precision keeps documents stable. */
 export const toGraphqlTime = (epochMs: number): string =>

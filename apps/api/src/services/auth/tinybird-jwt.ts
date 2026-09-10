@@ -1,7 +1,6 @@
-import { createHmac } from "node:crypto"
-import { escapeClickHouseString } from "@maple/query-engine/sql"
+import { createHash, createHmac } from "node:crypto"
+import { escapeClickHouseString } from "@maple-dev/effect-clickhouse/sql"
 
-// ---------------------------------------------------------------------------
 // Tinybird per-org read JWT minting.
 //
 // Tinybird "Forward" enforces row-level security via self-signed JWTs: a token
@@ -14,7 +13,6 @@ import { escapeClickHouseString } from "@maple/query-engine/sql"
 //
 // We mint these locally (HMAC-SHA256 signed with the workspace admin token as the
 // secret) rather than via the SDK's `createJWT`, which is a network round-trip.
-// ---------------------------------------------------------------------------
 
 /** Standard Tinybird JWT scope entry. */
 export interface TinybirdJwtScope {
@@ -36,10 +34,20 @@ export interface MintOrgReadJwtInput {
 	readonly nowSeconds: number
 	/** Token lifetime in seconds. */
 	readonly ttlSeconds: number
+	/** Optional Tinybird-enforced request ceiling for this org's token bucket. */
+	readonly rpsLimit?: number
 }
 
 const base64url = (input: string | Buffer): string =>
 	(Buffer.isBuffer(input) ? input : Buffer.from(input, "utf8")).toString("base64url")
+
+/**
+ * Tinybird groups JWT rate limits by `name`. Keep the bucket stable per org so
+ * one noisy tenant cannot consume every org's allowance, while hashing the org
+ * id keeps customer identifiers out of Tinybird's token-name analytics.
+ */
+const tokenNameForOrg = (orgId: string): string =>
+	`maple-raw-sql-${createHash("sha256").update(orgId).digest("hex").slice(0, 16)}`
 
 /**
  * Mint a per-org Tinybird read JWT scoped to `datasourceNames`, each filtered to
@@ -57,9 +65,10 @@ export function mintOrgReadJwt(input: MintOrgReadJwtInput): string {
 	const payload = base64url(
 		JSON.stringify({
 			workspace_id: input.workspaceId,
-			name: "maple-raw-sql",
+			name: tokenNameForOrg(input.orgId),
 			exp: input.nowSeconds + input.ttlSeconds,
 			scopes,
+			...(!(input.rpsLimit === undefined) ? { limits: { rps: input.rpsLimit } } : undefined),
 		}),
 	)
 	const signingInput = `${header}.${payload}`

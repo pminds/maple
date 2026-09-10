@@ -14,9 +14,9 @@ class ReportableError extends Data.TaggedError("ReportableError")<{}> {}
 
 // An anticipated 4xx business error (e.g. unauthorized / not-found).
 class UnauthorizedError extends Data.TaggedError("UnauthorizedError")<{}> {}
-class V2InvalidRequestError extends Schema.ErrorClass<V2InvalidRequestError>(
-	"@maple/http/v2/InvalidRequestError",
-)({ error: Schema.Struct({ type: Schema.Literal("invalid_request_error") }) }) {}
+class V2InvalidRequestError extends Schema.Error<V2InvalidRequestError>("@maple/http/v2/InvalidRequestError")(
+	{ error: Schema.Struct({ type: Schema.Literal("invalid_request_error") }) },
+) {}
 
 const runSpan = (buffer: ReturnType<typeof makeSpanBuffer>, effect: Effect.Effect<unknown, unknown>) =>
 	effect.pipe(Effect.withSpan("http.server GET"), Effect.provide(buffer.tracerLayer), Effect.exit)
@@ -86,7 +86,7 @@ describe("makeSpanBuffer anticipated-error classification", () => {
 		}),
 	)
 
-	it.effect("classifies Schema.ErrorClass failures by Error.name", () =>
+	it.effect("classifies Schema.Error failures by Error.name", () =>
 		Effect.gen(function* () {
 			const buffer = makeSpanBuffer({
 				anticipatedErrorIdentifiers: new Set(["@maple/http/v2/InvalidRequestError"]),
@@ -102,6 +102,48 @@ describe("makeSpanBuffer anticipated-error classification", () => {
 				span!.events.some((event) => event.name === "exception"),
 				false,
 			)
+		}),
+	)
+
+	// The shape a decoded HTTP error body actually has on the client: an `{ error }`
+	// envelope, not a class. Without the unwrap an API using that convention
+	// matches *no* configured identifier at all, and every expected 4xx records
+	// `Error` with the stringified envelope as its whole message.
+	it.effect("classifies a decoded `{ error: { _tag } }` envelope by the body's tag", () =>
+		Effect.gen(function* () {
+			const buffer = makeSpanBuffer({
+				anticipatedErrorIdentifiers: new Set(["@maple/http/v2/SessionReplayRangeTooLargeError"]),
+			})
+			yield* runSpan(
+				buffer,
+				Effect.fail({
+					error: {
+						_tag: "@maple/http/v2/SessionReplayRangeTooLargeError",
+						type: "invalid_request_error",
+						code: "range_too_large",
+						message: "That part of the recording is too large to load in one request.",
+					},
+				}),
+			)
+			const [span] = buffer.drain()
+			assert.isDefined(span)
+			assert.strictEqual(span!.status.code, 1 /* Ok */)
+			assert.strictEqual(
+				span!.events.some((event) => event.name === "exception"),
+				false,
+			)
+		}),
+	)
+
+	it.effect("leaves an envelope whose tag is not anticipated an Error span", () =>
+		Effect.gen(function* () {
+			const buffer = makeSpanBuffer({
+				anticipatedErrorIdentifiers: new Set(["@maple/http/v2/SessionReplayRangeTooLargeError"]),
+			})
+			yield* runSpan(buffer, Effect.fail({ error: { _tag: "@maple/http/errors/PersistenceError" } }))
+			const [span] = buffer.drain()
+			assert.isDefined(span)
+			assert.strictEqual(span!.status.code, 2 /* Error */)
 		}),
 	)
 
@@ -163,6 +205,92 @@ describe("makeSpanBuffer anticipated-error classification", () => {
 	)
 })
 
+describe("makeSpanBuffer rendered 5xx responses", () => {
+	// A server span whose handler answered with a plain response — no failure in
+	// the Effect, only the status code the HTTP tracer stamps on the span.
+	const respond = (
+		buffer: ReturnType<typeof makeSpanBuffer>,
+		status: number,
+		kind: "server" | "internal",
+	) =>
+		Effect.annotateCurrentSpan({
+			"http.request.method": "GET",
+			"url.path": "/api/sync/shape",
+			"http.response.status_code": status,
+		}).pipe(Effect.withSpan("http.server GET", { kind }), Effect.provide(buffer.tracerLayer))
+
+	it.effect("records a 5xx on a server span as Error with an exception event", () =>
+		Effect.gen(function* () {
+			const buffer = makeSpanBuffer()
+			yield* respond(buffer, 500, "server")
+			const [span] = buffer.drain()
+			assert.isDefined(span)
+			assert.strictEqual(span!.status.code, 2 /* Error */)
+			assert.strictEqual(span!.status.message, "HTTP 500 (GET /api/sync/shape)")
+			const exception = span!.events.find((event) => event.name === "exception")
+			assert.isDefined(exception)
+			assert.deepStrictEqual(
+				exception!.attributes.find((attribute) => attribute.key === "exception.type")?.value,
+				{ stringValue: "HttpServerErrorResponse" },
+			)
+		}),
+	)
+
+	it.effect("keeps an exception the handler recorded itself instead of relabelling it", () =>
+		Effect.gen(function* () {
+			const buffer = makeSpanBuffer()
+			// A service that names the failure where it renders the response: the
+			// generic type would collapse every such 5xx into one bucket.
+			yield* Effect.currentSpan.pipe(
+				Effect.flatMap((span) =>
+					Effect.sync(() =>
+						span.event("exception", 1n, {
+							"exception.type": "WarehouseQueryError",
+							"exception.message": "Memory limit exceeded",
+						}),
+					),
+				),
+				Effect.andThen(
+					Effect.annotateCurrentSpan({
+						"http.request.method": "GET",
+						"url.path": "/api/sync/shape",
+						"http.response.status_code": 500,
+					}),
+				),
+				Effect.withSpan("http.server GET", { kind: "server" }),
+				Effect.provide(buffer.tracerLayer),
+			)
+			const [span] = buffer.drain()
+			assert.strictEqual(span!.status.code, 2 /* Error */)
+			const exceptions = span!.events.filter((event) => event.name === "exception")
+			assert.strictEqual(exceptions.length, 1)
+			assert.deepStrictEqual(
+				exceptions[0]!.attributes.find((attribute) => attribute.key === "exception.type")?.value,
+				{ stringValue: "WarehouseQueryError" },
+			)
+		}),
+	)
+
+	it.effect("leaves a 4xx server span Ok", () =>
+		Effect.gen(function* () {
+			const buffer = makeSpanBuffer()
+			yield* respond(buffer, 404, "server")
+			const [span] = buffer.drain()
+			assert.strictEqual(span?.status.code, 1 /* Ok */)
+			assert.strictEqual(span?.events.length, 0)
+		}),
+	)
+
+	it.effect("ignores the status code on non-server spans", () =>
+		Effect.gen(function* () {
+			const buffer = makeSpanBuffer()
+			yield* respond(buffer, 503, "internal")
+			const [span] = buffer.drain()
+			assert.strictEqual(span?.status.code, 1 /* Ok */)
+		}),
+	)
+})
+
 describe("makeSpanBuffer restore", () => {
 	it.effect("keeps older failed telemetry and discards newest overflow", () =>
 		Effect.gen(function* () {
@@ -184,4 +312,61 @@ describe("makeSpanBuffer restore", () => {
 			assert.strictEqual(restored.at(-1)?.name, "newest")
 		}),
 	)
+})
+
+const attributeOf = (span: { attributes: ReadonlyArray<{ key: string; value: unknown }> }, key: string) =>
+	span.attributes.find((attribute) => attribute.key === key)?.value
+
+describe("makeSpanBuffer captureException", () => {
+	it("records a thrown error as an Error span with an exception event", () => {
+		const buffer = makeSpanBuffer()
+		buffer.captureException(new TypeError("Cannot read properties of undefined (reading 'spans')"))
+
+		const [span] = buffer.drain()
+		assert.isDefined(span)
+		assert.strictEqual(span?.name, "exception")
+		// StatusCode 2 is Error — `error_events_mv` keys off exactly this.
+		assert.strictEqual(span?.status.code, 2)
+
+		const event = span?.events.find((candidate) => candidate.name === "exception")
+		assert.isDefined(event)
+		const attribute = (key: string) => event?.attributes.find((candidate) => candidate.key === key)?.value
+		assert.deepStrictEqual(attribute("exception.type"), { stringValue: "TypeError" })
+		assert.deepStrictEqual(attribute("exception.message"), {
+			stringValue: "Cannot read properties of undefined (reading 'spans')",
+		})
+	})
+
+	it("carries caller attributes and a custom span name", () => {
+		const buffer = makeSpanBuffer()
+		buffer.captureException(new Error("boom"), {
+			name: "browser.uncaught_error",
+			attributes: { "maple.exception.source": "window.onerror" },
+		})
+
+		const [span] = buffer.drain()
+		assert.strictEqual(span?.name, "browser.uncaught_error")
+		assert.deepStrictEqual(attributeOf(span!, "maple.exception.source"), {
+			stringValue: "window.onerror",
+		})
+	})
+
+	it("is not silenceable through anticipatedErrorIdentifiers", () => {
+		// An uncaught throw is never an anticipated 4xx. Recording it as a defect
+		// keeps it clear of that filter, so a caller cannot accidentally suppress
+		// real crashes by listing a tag.
+		const buffer = makeSpanBuffer({ anticipatedErrorIdentifiers: new Set(["Error", "TypeError"]) })
+		buffer.captureException(new TypeError("still an error"))
+
+		const [span] = buffer.drain()
+		assert.strictEqual(span?.status.code, 2)
+		assert.isDefined(span?.events.find((candidate) => candidate.name === "exception"))
+	})
+
+	it("stays silent while capture is disabled by consent", () => {
+		const buffer = makeSpanBuffer()
+		buffer.setDisabled(true)
+		buffer.captureException(new Error("boom"))
+		assert.strictEqual(buffer.size(), 0)
+	})
 })

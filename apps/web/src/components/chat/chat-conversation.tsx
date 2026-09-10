@@ -3,7 +3,7 @@ import { Exit } from "effect"
 import { useMountEffect } from "@/hooks/use-mount-effect"
 import { toastManager } from "@maple/ui/components/ui/toast"
 import { useAtomSet } from "@/lib/effect-atom"
-import { MapleApiAtomClient } from "@/lib/services/common/atom-client"
+import { MapleInternalAtomClient } from "@/lib/services/common/internal-atom-client"
 import { useMapleChat, type FailedSend } from "@/hooks/use-maple-chat"
 import { useTypeAnywhereFocus } from "@/hooks/use-type-anywhere-focus"
 import {
@@ -31,11 +31,12 @@ import {
 	PromptInputSubmit,
 } from "@/components/ai-elements/prompt-input"
 import { Suggestions, Suggestion } from "@/components/ai-elements/suggestion"
-import { StatusMarker } from "@/components/ai-elements/status-marker"
+import { ThinkingOrbIcon } from "@/components/ai-elements/thinking-orb-icon"
 import { Button } from "@maple/ui/components/ui/button"
 import { trackProduct } from "@/lib/analytics"
 import { makeChatApplyPayload } from "./chat-apply-payload"
 import type { AiTriageResult } from "@maple/domain/http"
+import { TurnFailureNotice } from "./turn-failure-notice"
 
 const DEFAULT_SUGGESTIONS = [
 	"What's the overall system health?",
@@ -53,7 +54,7 @@ interface ChatConversationProps {
 	investigationContext?: InvestigationContext
 	widgetFixContext?: WidgetFixContext
 	/** Render the conversation with no composer, and say why. */
-	readOnly?: false | "shared" | "resolved"
+	readOnly?: false | "shared" | "resolved" | "transcript"
 	/**
 	 * The backend already seeded this conversation with its subject (an
 	 * investigation's autonomous pass sends the snapshot server-side), so the
@@ -142,12 +143,22 @@ export function ChatConversation({
 		return base
 	}, [subjectSeededByServer, mode, investigationContext, widgetFixContext, activeContexts, referrerPath])
 
-	const { sessionId, messages, status, isLoading, historyReady, failedSends, sendMessage, stop, canStop } =
-		useMapleChat({ tabId, context })
+	const {
+		sessionId,
+		messages,
+		status,
+		error,
+		isLoading,
+		historyReady,
+		failedSends,
+		sendMessage,
+		stop,
+		canStop,
+	} = useMapleChat({ tabId, context })
 	const diagnosisMessageId = useMemo(() => findDiagnosisMessageId(messages), [messages])
 
 	// Apply an approved proposal via Maple's authenticated API (propose-then-apply).
-	const applyProposal = useAtomSet(MapleApiAtomClient.mutation("chat", "apply"), {
+	const applyProposal = useAtomSet(MapleInternalAtomClient.mutation("chat", "apply"), {
 		mode: "promiseExit",
 	})
 	const [resolvedApprovals, setResolvedApprovals] = useState<Map<string, "applied" | "denied">>(
@@ -255,6 +266,11 @@ export function ChatConversation({
 							This investigation was resolved before anything was recorded. Reopen it to pick
 							the thread back up.
 						</EmptyNotice>
+					) : readOnly === "transcript" ? (
+						<EmptyNotice title="Nothing recorded yet">
+							The agents' reasoning log appears here as the pass runs — every tool call and what
+							it returned.
+						</EmptyNotice>
 					) : isInvestigationMode ? (
 						<InvestigationLead ctx={investigationContext!} />
 					) : isWidgetFixMode ? (
@@ -263,14 +279,14 @@ export function ChatConversation({
 							propose a corrected widget JSON for you to approve.
 						</EmptyNotice>
 					) : (
-						<div className="flex flex-col items-center gap-3">
+						<div className="flex w-full min-w-0 max-w-full flex-col items-center gap-3 px-4">
 							<div className="space-y-1 text-center">
 								<h3 className="font-medium text-sm">Maple AI</h3>
 								<p className="text-muted-foreground text-sm">
 									Ask me about your traces, logs, errors, and services.
 								</p>
 							</div>
-							<Suggestions className="mt-2 justify-center">
+							<Suggestions className="mt-2 w-full justify-center">
 								{suggestions.map((s) => (
 									<Suggestion key={s} suggestion={s} onClick={() => handleSend(s)} />
 								))}
@@ -298,6 +314,9 @@ export function ChatConversation({
 							onRetry={handleSend}
 						/>
 					)}
+					{error !== undefined && failedSends.length === 0 ? (
+						<TurnFailureNotice error={error} onContinue={() => handleSend("Continue.")} />
+					) : null}
 					<PromptInput onSubmit={({ text }) => handleSend(text)}>
 						<PromptInputTextarea
 							ref={textareaRef}
@@ -330,7 +349,16 @@ export function ChatConversation({
  */
 function InvestigationLead({ ctx }: { ctx: InvestigationContext }) {
 	if (ctx.status === "investigating") {
-		return <StatusMarker>Gathering evidence…</StatusMarker>
+		// Not a `StatusMarker`: that is a full-width transcript row built to sit at
+		// the end of a thread, and the empty slot centres its child — so it stranded
+		// a left-aligned progress line in the middle of an otherwise blank pane. A
+		// thread with no turns yet is a state, and it reads like its three siblings.
+		return (
+			<EmptyNotice title="Investigating" busy>
+				Maple is gathering evidence — the Transcript tab shows what it is doing as it goes. You can
+				ask a question here without waiting for it to finish.
+			</EmptyNotice>
+		)
 	}
 	if (ctx.status === "failed") {
 		return (
@@ -366,10 +394,22 @@ function FailedSendNotice({ failed, onRetry }: { failed: FailedSend; onRetry: (t
 	)
 }
 
-function EmptyNotice({ title, children }: { title: string; children: ReactNode }) {
+function EmptyNotice({
+	title,
+	busy = false,
+	children,
+}: {
+	title: string
+	/** Something is still running behind this state — keeps the live signal. */
+	busy?: boolean
+	children: ReactNode
+}) {
 	return (
 		<div className="flex flex-col items-center justify-center gap-2 text-center">
-			<p className="text-xs uppercase tracking-[0.14em] text-muted-foreground/70">{title}</p>
+			<p className="flex items-center gap-1.5 text-xs uppercase tracking-[0.14em] text-muted-foreground/70">
+				{busy ? <ThinkingOrbIcon state="breathing" /> : null}
+				<span className={busy ? "shimmer" : undefined}>{title}</span>
+			</p>
 			<p className="max-w-sm text-sm text-muted-foreground">{children}</p>
 		</div>
 	)

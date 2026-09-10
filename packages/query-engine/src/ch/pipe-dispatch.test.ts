@@ -1,7 +1,14 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Effect, Schema } from "effect"
 import { OrgId } from "@maple/domain/http"
-import { compilePipeQuery } from "./pipe-dispatch"
+import { compilePipeQuery as lowerPipeQuery } from "./pipe-dispatch"
+
+/** Lower and compile in one step — the tests want a value, and a fixture that
+ *  will not compile should fail the test loudly. */
+const compilePipeQuery = (...args: Parameters<typeof lowerPipeQuery>) => {
+	const lowered = lowerPipeQuery(...args)
+	return lowered === undefined ? undefined : Effect.runSync(lowered)
+}
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
 
@@ -69,6 +76,34 @@ describe("compilePipeQuery", () => {
 		const result = compilePipeQuery("nonexistent_pipe", baseParams())
 		expect(result).toBeUndefined()
 	})
+
+	// `errorsOnly` is tri-state downstream: `false` means "only NON-errored
+	// spans", not "no filter". Coercing an absent `errors_only` to `false` put
+	// `StatusCode != 'Error'` in the WHERE, which made `errorRate` structurally 0
+	// and understated every count for `maple timeseries` / `maple breakdown` and
+	// the digest service.
+	for (const pipe of ["custom_traces_timeseries", "custom_traces_breakdown"]) {
+		describe(`${pipe} errors_only`, () => {
+			it("applies no status filter when errors_only is absent", () => {
+				const sql = compilePipeQuery(pipe, baseParams())!.sql
+				expect(sql).not.toContain("StatusCode != 'Error'")
+				expect(sql).not.toContain("AND StatusCode = 'Error'")
+			})
+
+			it("keeps only errored spans when errors_only is set", () => {
+				const sql = compilePipeQuery(pipe, { ...baseParams(), errors_only: "1" })!.sql
+				expect(sql).toContain("AND StatusCode = 'Error'")
+			})
+
+			it("treats a falsy errors_only value as absent", () => {
+				for (const raw of ["0", "false", ""]) {
+					const sql = compilePipeQuery(pipe, { ...baseParams(), errors_only: raw })!.sql
+					expect(sql).not.toContain("StatusCode != 'Error'")
+					expect(sql).not.toContain("AND StatusCode = 'Error'")
+				}
+			})
+		})
+	}
 
 	it("metric_attribute_values reads metric-scoped values for the given key", () => {
 		const result = compilePipeQuery("metric_attribute_values", {
@@ -146,11 +181,15 @@ describe("compilePipeQuery", () => {
 		expect(result!.sql).toContain("2024-01-02 00:00:00")
 	})
 
-	it.effect("decodeRows passes through rows for DSL-backed pipes without row schemas", () =>
+	// `list_traces` derives its row schema from the SELECT, so `decodeRows`
+	// validates rather than casting: a row missing a selected column is a decode
+	// failure here instead of an `undefined` read three layers downstream.
+	it.effect("decodeRows rejects a row missing a selected column", () =>
 		Effect.gen(function* () {
 			const result = compilePipeQuery("list_traces", baseParams())
-			const rows = [{ traceId: "abc" }]
-			expect(yield* result!.decodeRows(rows)).toEqual(rows)
+			expect(result!.rowSchemaSource).not.toBe("none")
+			const failure = yield* Effect.flip(result!.decodeRows([{ traceId: "abc" }]))
+			expect(failure.rowIndex).toBe(0)
 		}),
 	)
 

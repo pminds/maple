@@ -15,7 +15,7 @@ observability tools. See [Multi-workspace architecture](#multi-workspace-archite
 | ---------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Framework  | eve `0.25.x` (durable agent runtime, Nitro HTTP host)                                                 | filesystem-first agents                                                                                                                                                                           |
 | Host       | **Railway** container running `eve start` (long-running Node)                                         | eve's supported self-host model; edge Workers is blocked today by a workflow-world protocol gap                                                                                                   |
-| Model      | **Cloudflare Workers AI** via REST (`workers-ai-provider`), `@cf/zai-org/glm-5.2`                     | `createWorkersAI({ accountId, apiKey })` → an AI-SDK model, no Workers runtime needed; streams structured tool calls, 256K window (see Notes)                                                     |
+| Model      | **OpenRouter** via REST (`@openrouter/ai-sdk-provider`), `z-ai/glm-5.3-flash:nitro`                   | `createOpenRouter({ apiKey })` → an AI-SDK model; streams structured tool calls (see Notes)                                                                                                       |
 | Durability | **`@workflow/world-postgres`** (`5.0.0-beta.27`) + Railway Postgres                                   | protocol-compatible with eve's vendored `@workflow/*` 5.0.0-beta line                                                                                                                             |
 | Slack      | **self-managed, multi-workspace** (`slackChannel()` + custom `webhookVerifier` + per-team `botToken`) | one public app across many workspaces; static signing secret verifies inbound, per-team bot token resolved from the Maple API — see [Multi-workspace architecture](#multi-workspace-architecture) |
 | Maple      | **resolve endpoint** (`/internal/slack/workspaces/:teamId`) + **MCP** (`/mcp`)                        | per-team install lookup (TTL-cached) and observability tools scoped per org                                                                                                                       |
@@ -28,7 +28,7 @@ Key routes (all served by the one container): `POST /eve/v1/session`, `GET /eve/
 
 ```
 agent/
-  agent.ts            # model (Workers AI) + workflow world selection
+  agent.ts            # model (OpenRouter) + workflow world selection
   instructions.md     # system prompt (Slack-adapted port of the web chat's SYSTEM_PROMPT)
   instructions/maple-app-url.ts # injects MAPLE_APP_BASE_URL for deep links at session start
   instrumentation.ts  # OTel NodeSDK export to Maple's ingest (maple-slack-agent service)
@@ -41,8 +41,14 @@ agent/
   channels/eve.ts     # auth policy for the browser/API routes
   connections/maple.ts # Maple MCP connection (per-workspace API key auth + approval gate)
   tools/render_chart.ts # renders a PNG chart in-process and posts it into the thread
+  tools/read_channel_history.ts # on-demand read of the channel's recent top-level messages
   tools/{bash,glob,grep,read_file,write_file,web_fetch,web_search}.ts
                       # `disableTool()` sentinels — see Framework tools below
+  lib/thread-context.ts # full-thread turn context (renders Block Kit / alert cards too)
+  lib/channel-context.ts # channel turn context for a mention that starts its own thread
+  lib/slack-context-format.ts # shared renderer for both (blocks/attachments + attribution)
+  lib/turn-time.ts    # per-turn `<current_time>` block (nothing else dates the prompt)
+  lib/bot-identity.ts # per-team bot user id learned from the webhook envelope
   lib/chart.ts        # pure SVG chart renderer + unicode-sparkline fallback
   lib/slack-upload.ts # Slack external-upload flow (files.getUploadURLExternal → complete)
   lib/env.ts          # shared is-this-deployed predicate (route auth + token fallback)
@@ -68,7 +74,7 @@ railway.json          # DOCKERFILE builder, /eve/v1/health healthcheck
 
 ```bash
 cd apps/slack-agent
-cp .env.local.example .env.local   # fill in CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN
+cp .env.local.example .env.local   # fill in OPENROUTER_API_KEY
 bun install
 bun run dev                        # eve terminal UI — chat with the agent, test tools
 ```
@@ -132,10 +138,10 @@ oauth_config:
             - chat:write # post replies
             - chat:write.public # post in channels the bot isn't a member of
             - channels:read # resolve public channel metadata
-            - channels:history
+            - channels:history # thread + channel context, follow-ups (no mpim:history — group DMs opt out)
             - files:write # upload rendered chart images (render_chart tool)
             - groups:read # resolve private channel metadata
-            - groups:history # thread context + follow-ups in private channels
+            - groups:history # thread + channel context + follow-ups in private channels
             - im:history # read DM history (message.im)
             - im:read # resolve DM conversation metadata
             - im:write # open/DM the user
@@ -147,8 +153,9 @@ settings:
         bot_events:
             - app_mention
             - message.im
-            # Thread follow-ups without re-mentioning the bot: replies in threads the
-            # bot is engaged in are promoted to app_mention by the webhookVerifier
+            # Thread follow-ups without re-mentioning the bot: candidate thread
+            # replies are promoted to app_mention by the webhookVerifier, and
+            # confirmed (or dropped) after the 200 by the mention handler
             # (agent/lib/thread-follow-up.ts). Only channels the bot is a member of
             # deliver these events.
             - message.channels
@@ -199,7 +206,7 @@ variables in (d), since two of them embed the URL.
 
 **d. Set service variables:**
 
-- `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`
+- `OPENROUTER_API_KEY`
 - `SLACK_SIGNING_SECRET` — per-app/static; HMAC-verifies every inbound webhook.
 - `MAPLE_API_BASE_URL` — the Maple API base (e.g. `https://api.maple.dev`). **Also needed at build
   time**: it forms the Maple MCP connection URL, which eve bakes into its manifest at build (like
@@ -282,11 +289,25 @@ Both should show a green **Verified ✓** next to the field once saved. Event Su
 `app_mention`, `message.im`, `message.channels`, and `message.groups` listed under _Subscribe to bot
 events_ — the manifest from step 1 sets these, so they should already be there. The two channel
 message events power thread follow-ups: once the bot has been mentioned (or replied) in a thread,
-further replies in that thread reach it without a new `@mention` — but only while the engagement is
-**recent**: within 30 minutes and within the last 15 messages of the thread (see
-`agent/lib/thread-follow-up.ts`). Past either bound, replies pass through untouched and the user
-@-mentions the bot again. Unbounded, one mention would turn every later reply by anyone into a full
-agent turn, forever.
+further replies in that thread reach it without a new `@mention` — but only while the thread is
+still **alive** (nobody has touched it for less than 24 hours) and the bot is still within its
+**last 15 messages**. Past either bound the reply is dropped, everyone who spoke in the thread gets
+a DM saying so, and one `@mention` brings the bot back (`agent/lib/thread-follow-up.ts`,
+`agent/lib/disengage-notice.ts`). Unbounded, one mention would turn every later reply by anyone into
+a full agent turn, forever.
+
+The decision deliberately does **not** happen in the webhook verifier — that is the only awaited work
+before eve's 200, so anything it fetches is spent out of Slack's ~3s delivery budget. Promotion there
+is parse-only and optimistic; the mention handler confirms it afterwards, against the thread it loads
+for turn context anyway.
+
+Being engaged in a thread is necessary but not sufficient: a confirmed follow-up still passes a
+**relevance gate** — one tiny RESPOND/PASS classifier call (`agent/lib/follow-up-relevance.ts`,
+model via `OPENROUTER_GATE_MODEL`) asking whether the reply is actually directed at the bot. Humans
+talking to each other in a thread the bot answered once no longer trigger a turn for every message;
+the pass is silent (no reaction, no reply), and the next message that _is_ for the bot gets
+answered. Real `@mentions` and DMs skip the gate — an explicit address answers the question itself —
+and the gate fails open, so a classifier outage means an extra answer, never a silent drop.
 
 Changing a request URL does **not** require reinstalling the app; only changing _scopes_ does. (If
 you did edit scopes, the sidebar shows a yellow reinstall banner — follow it, and note that
@@ -337,12 +358,13 @@ eve's native idiom:
 - **Modes → skills:** the web chat's dashboard-builder and investigate modes are progressive-
   disclosure skills (`agent/skills/dashboard-builder/`, `agent/skills/incident-investigation/`)
   the model loads via `load_skill`. Alert context comes from the Slack thread (Maple delivers
-  alert notifications into Slack), not from a request payload.
+  alert notifications into Slack), not from a request payload — including the alert card itself,
+  which `agent/lib/thread-context.ts` renders out of its Block Kit attachment (see Notes).
 - **Approvals — both sides now interrupt, by different mechanisms:** the web chat stops the turn on
   a gated tool and emits a `tool-call` with `proposed: true` and no result
-  (`apps/api/src/chat/agent.ts`); the user approves and `POST /api/chat/apply` performs the
+  (`apps/api/src/chat/agent.ts`); the user approves and `POST /internal/chat/apply` performs the
   mutation, which is then recorded back into the transcript as that call's result. (Under Flue this
-  was propose-then-apply with a fabricated `proposed` marker as the tool's *output*, because Flue's
+  was propose-then-apply with a fabricated `proposed` marker as the tool's _output_, because Flue's
   event stream had no human-in-the-loop primitive; that marker no longer exists.) eve has native
   HITL: `agent/lib/approval.ts` gates the same `MUTATING_TOOL_NAMES` set behind a Slack
   approve/deny card, and **on approve the real MCP tool executes** with the workspace's
@@ -352,7 +374,7 @@ eve's native idiom:
   source of truth for both.
 - **Telemetry:** `agent/instrumentation.ts` exports AI SDK spans to Maple's ingest as service
   `maple-slack-agent` when `MAPLE_INGEST_KEY` is set (no-op otherwise), with `service.version` +
-  `deployment.commit_sha` from Railway's `RAILWAY_GIT_COMMIT_SHA` so releases show up in the
+  `vcs.ref.head.revision` from Railway's `RAILWAY_GIT_COMMIT_SHA` so releases show up in the
   commit-hover UI. Model inputs/outputs are never recorded; Slack team/channel/thread/user land as
   `maple.slack.*` span attributes (omitted rather than empty-string when absent).
   `agent/hooks/outcome-log.ts` logs turn outcomes + tool failures unconditionally, through
@@ -361,7 +383,7 @@ eve's native idiom:
 - **Deliberately not ported:** page context and the widget-fix entry point (web-only payloads —
   the surgical fix _rules_ live in the dashboard-builder skill, with `get_dashboard` standing in
   for the attached widget JSON), the `submit_diagnosis` tool (the thread reply _is_ the report),
-  and the headless triage agent (`apps/api/src/workflows/triage-agent.ts`).
+  and the autonomous investigation agents.
 - **Beyond parity — chart images:** the authored `render_chart` tool renders a time-series
   chart in-process (hand-rolled SVG → `@resvg/resvg-js`, no headless browser or external chart
   service) and posts it into the thread via Slack's external-upload flow with the per-team bot
@@ -464,50 +486,70 @@ and **activate public distribution** so the app can be installed into any worksp
 ## Notes
 
 - **Model must support tool calling _while streaming_.** eve's harness is tool-driven and always
-  streams, and that second half is the constraint that actually bites. Several Workers AI models
-  parse tool calls only on non-streaming requests; streamed, they emit the model's raw tool-call
-  JSON as ordinary text deltas, which the agent then posts into Slack verbatim:
+  streams, and that second half is the constraint that actually bites. Some models/providers parse
+  tool calls only on non-streaming requests; streamed, they emit the model's raw tool-call JSON as
+  ordinary text deltas, which the agent then posts into Slack verbatim:
 
     ```
     {"type": "function", "name": "ask_question", "parameters": {"prompt": "…", "allowFreeform": "true"}}
     ```
 
-    `@cf/meta/llama-3.3-70b-instruct-fp8-fast` (the previous default) has exactly this bug — it
-    returns a proper `tool_calls` array non-streaming, but streams the JSON as text. It also
-    stringifies non-string arguments (`"allowFreeform": "true"`) even in the structured form.
-    `@cf/zai-org/glm-5.2` (the current default) streams OpenAI-shaped incremental `delta.tool_calls`
-    chunks — name and id on the first, argument fragments keyed by `index` after — terminated by
-    `finish_reason: "tool_calls"`, which `workers-ai-provider` maps correctly. (The provider does have
-    a text-salvage path for leaked tool calls, but it only engages for a _forced_ tool choice — eve
-    uses auto, so it never fires here.)
+    (We hit exactly this on Workers AI's `@cf/meta/llama-3.3-70b-instruct-fp8-fast` before moving
+    to OpenRouter — proper `tool_calls` array non-streaming, JSON-as-text when streamed.)
 
-    Both `@cf/zai-org/glm-5.2` and `@cf/openai/gpt-oss-120b` are verified good. Workers AI prices
-    them very differently, so the choice is a real trade-off:
-
-    | Model                       | Context | $/M in | $/M out |
-    | --------------------------- | ------- | ------ | ------- |
-    | `@cf/zai-org/glm-5.2`       | 256K    | 1.40   | 4.40    |
-    | `@cf/openai/gpt-oss-120b`   | 128K    | 0.35   | 0.75    |
-    | `@cf/zai-org/glm-4.7-flash` | 128K    | 0.06   | 0.40    |
-
-    We're on GLM-5.2 for headroom as Maple domain tools land — reasoning over traces and spans is a
-    harder job than the generic tools here, and long Slack threads benefit from the 256K window. If
-    spend becomes the concern before the tools get hard, gpt-oss-120b handled the current toolset
-    identically at roughly a fifth the output cost.
-
-    Before switching `WORKERS_AI_MODEL`, check the streaming shape directly:
+    The current default is `z-ai/glm-5.3-flash:nitro` via OpenRouter. `:nitro` routes to the
+    fastest providers rather than all of them, so the pool serving it is narrower and the streamed
+    tool-call shape is worth re-checking after any provider shift. When switching `OPENROUTER_MODEL`
+    — or before trusting a new default — verify the streaming shape directly:
 
     ```bash
-    curl "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/ai/run/<model>" \
-      -H "authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' \
-      -d '{"stream":true,"messages":[{"role":"user","content":"what time is it in Tokyo?"}],
+    curl https://openrouter.ai/api/v1/chat/completions \
+      -H "authorization: Bearer $OPENROUTER_API_KEY" -H 'content-type: application/json' \
+      -d '{"model":"<model>","stream":true,"messages":[{"role":"user","content":"what time is it in Tokyo?"}],
            "tools":[{"type":"function","function":{"name":"get_time","description":"Get the time in a timezone.",
            "parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]}'
     ```
 
-    The SSE must carry `delta.tool_calls`, not a JSON blob inside `response`. Also set
-    `WORKERS_AI_CONTEXT_WINDOW` to the new model's window.
+    The SSE must carry `delta.tool_calls`, not a JSON blob inside the text content. Also set
+    `OPENROUTER_CONTEXT_WINDOW` to the new model's window.
 
+- **Thread context is ours, not `slackChannel({ threadContext })`.** Every mention and DM ships the
+  whole thread transcript with the turn, rendered by `agent/lib/thread-context.ts` and returned as
+  the mention result's `context` from `onAppMention` / `onDirectMessage`. eve's built-in option
+  couldn't carry an alert thread — the case that matters most, since the user is replying to
+  something Maple posted rather than opening a topic. It reads a message's content from `text`
+  alone, and Maple's alert notifications have none: the blocks ride inside a colored attachment
+  (`apps/api/src/services/alerts/AlertDeliveryDispatch.ts`), so the model saw an empty
+  `<content></content>`. Worse, `since: "last-agent-reply"` counted the alert as the agent's own
+  reply (eve's `isMe` is `bot_id !== undefined` — any bot) and cut context off _after_ it, dropping
+  the alert entirely. The user had to hand the bot a recap of the alert it had just sent. Ours
+  falls back to blocks/attachments for content, keeps the full thread (which also survives a
+  session lost to a redeploy), and attributes speakers with the workspace's real bot user id from
+  `agent/lib/bot-identity.ts` so a third-party app in the channel isn't quoted back as the agent.
+- **A mention that isn't in a thread gets the channel instead.** Maple posts alert cards to a
+  channel; people answer them by writing a new channel message ("the ship is sinking @Maple"), not
+  by replying inside a card's thread. That mention is its own thread root, so the thread transcript
+  is one message long — the user's own. `agent/lib/channel-context.ts` fills the gap with the
+  channel's last few top-level messages (`conversations.history`) as `<slack_channel_context>`,
+  rendered by the same code, on the same `waitUntil` path, degrading the same way. The trigger is
+  structural (`threadTs === ts`), not a model judgment call: the model cannot ask for context it
+  has never been shown a trace of. Inside a thread the same fetch is available on demand as the
+  `read_channel_history` tool. `conversations.history` returns top-level messages only, so the two
+  surfaces never quote the same message twice. Scope-wise this is free — `channels:history` /
+  `groups:history` / `im:history` are already installed. `mpim:history` is not requested, so a
+  group DM answers `missing_scope`; that degrades to a note telling the model not to retry, and
+  adding the scope would make every existing install report missing scopes until reinstalled.
+- **Every turn carries the clock.** Nothing else in the prompt dates it: eve injects no current
+  date, `instructions.md` is compiled at build time, and dynamic instructions resolve on
+  `session.started` — which for Slack is the _first_ mention in a thread, since sessions are keyed
+  `channelId:threadTs`. The model's only temporal signal was the `message_ts` values in the
+  transcript, and it read the oldest as "about now", so "chart that now" an hour into an alert
+  thread came back anchored to when the alert fired. `agent/lib/turn-time.ts` appends a
+  `<current_time>` block (now in UTC + unix seconds, plus the thread's age) to each turn's
+  `context`, and `instructions.md` § Time says the last one is now. Deliberately turn `context`
+  rather than a `turn.started` dynamic instruction: instructions lower into the system prompt, and
+  a value that changes every turn would invalidate the prompt cache at its first token and
+  re-ingest the whole conversation each turn.
 - **Auth:** `agent/channels/eve.ts` fails closed in deployed environments (`RAILWAY_ENVIRONMENT_NAME`
   set, or `NODE_ENV=production`): the browser/API routes always require HTTP Basic there. With
   `ROUTE_AUTH_BASIC_PASSWORD` set that's your stable credential; without it, a random per-boot

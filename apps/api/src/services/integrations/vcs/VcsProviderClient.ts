@@ -3,6 +3,7 @@ import type {
 	BranchUpsertInput,
 	CommitUpsertInput,
 	GitCommitSha,
+	PullRequestSummary,
 	RepoUpsertInput,
 	VcsCommitFetch,
 	VcsInstallation,
@@ -10,6 +11,7 @@ import type {
 	VcsProviderError,
 	VcsProviderId,
 	VcsRateLimitedError,
+	VcsRepositoryBlockedError,
 	VcsRepositoryRef,
 	VcsRepoUnavailableError,
 	VcsSyncJob,
@@ -17,7 +19,6 @@ import type {
 	VcsWebhookSignatureError,
 } from "@maple/domain/http"
 
-// ---------------------------------------------------------------------------
 // The single typed seam between the vendor-agnostic core and a VCS provider.
 //
 // Everything ABOVE this port (queue, orchestrator, webhook router, repo, tables)
@@ -25,7 +26,6 @@ import type {
 // (GithubProvider, GithubAppClient, GitHub schemas) is provider-specific and
 // never imports the vcs_* tables. The registry is the only place a provider id
 // is wired to an implementation.
-// ---------------------------------------------------------------------------
 
 export interface VcsWebhookRequest {
 	readonly headers: Record<string, string | undefined>
@@ -66,7 +66,11 @@ export interface VcsProviderClient {
 		installation: VcsInstallation,
 	) => Effect.Effect<
 		ReadonlyArray<RepoUpsertInput>,
-		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRateLimitedError
+		| VcsProviderError
+		| VcsInstallationGoneError
+		| VcsRepoUnavailableError
+		| VcsRepositoryBlockedError
+		| VcsRateLimitedError
 	>
 
 	/**
@@ -98,7 +102,10 @@ export interface VcsProviderClient {
 		installation: VcsInstallation,
 		repo: VcsRepositoryRef,
 		opts: { readonly sinceMs: number; readonly untilMs?: number; readonly branch: string },
-	) => Effect.Effect<VcsCommitFetch, VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError>
+	) => Effect.Effect<
+		VcsCommitFetch,
+		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRepositoryBlockedError
+	>
 
 	/**
 	 * All branch names of a repo (never the commits on them), normalized. `truncated`
@@ -111,7 +118,11 @@ export interface VcsProviderClient {
 		repo: VcsRepositoryRef,
 	) => Effect.Effect<
 		{ readonly branches: ReadonlyArray<BranchUpsertInput>; readonly truncated: boolean },
-		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRateLimitedError
+		| VcsProviderError
+		| VcsInstallationGoneError
+		| VcsRepoUnavailableError
+		| VcsRepositoryBlockedError
+		| VcsRateLimitedError
 	>
 
 	/**
@@ -126,7 +137,42 @@ export interface VcsProviderClient {
 		sha: GitCommitSha,
 	) => Effect.Effect<
 		Option.Option<CommitUpsertInput>,
-		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError
+		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRepositoryBlockedError
+	>
+
+	/**
+	 * The repository's most recently updated pull requests, newest first,
+	 * normalized. Bounded to `limit` and deliberately NOT paginated: this feeds a
+	 * picker, and the PR that fixes a live issue is recent by construction.
+	 */
+	readonly fetchPullRequests: (
+		installation: VcsInstallation,
+		repo: VcsRepositoryRef,
+		opts: { readonly limit: number },
+	) => Effect.Effect<
+		ReadonlyArray<PullRequestSummary>,
+		| VcsProviderError
+		| VcsInstallationGoneError
+		| VcsRepoUnavailableError
+		| VcsRepositoryBlockedError
+		| VcsRateLimitedError
+	>
+
+	/**
+	 * One pull request by number, normalized. `Option.none` means "no such PR in
+	 * this repo" (404 — expected, not a failure), matching `fetchCommit`.
+	 */
+	readonly fetchPullRequest: (
+		installation: VcsInstallation,
+		repo: VcsRepositoryRef,
+		number: number,
+	) => Effect.Effect<
+		Option.Option<PullRequestSummary>,
+		| VcsProviderError
+		| VcsInstallationGoneError
+		| VcsRepoUnavailableError
+		| VcsRepositoryBlockedError
+		| VcsRateLimitedError
 	>
 
 	/** Search source within one repository visible to this installation. */
@@ -137,7 +183,11 @@ export interface VcsProviderClient {
 		opts: { readonly path?: string; readonly limit: number },
 	) => Effect.Effect<
 		ReadonlyArray<VcsCodeSearchMatch>,
-		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRateLimitedError
+		| VcsProviderError
+		| VcsInstallationGoneError
+		| VcsRepoUnavailableError
+		| VcsRepositoryBlockedError
+		| VcsRateLimitedError
 	>
 
 	/** Fetch a UTF-8 source file. `Option.none` is an expected missing path/ref. */
@@ -148,6 +198,6 @@ export interface VcsProviderClient {
 		ref: string,
 	) => Effect.Effect<
 		Option.Option<VcsSourceFile>,
-		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError
+		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRepositoryBlockedError
 	>
 }

@@ -1,6 +1,6 @@
 import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
 import { Schema } from "effect"
-import { Authorization } from "./current-tenant"
+import { SessionAuthorization } from "./current-tenant"
 
 /**
  * Apply an approval-gated AI chat proposal.
@@ -34,7 +34,7 @@ export class ChatApplyResponse extends Schema.Class<ChatApplyResponse>("ChatAppl
 	isError: Schema.optionalKey(Schema.Boolean),
 }) {}
 
-export class ChatToolNotFoundError extends Schema.TaggedErrorClass<ChatToolNotFoundError>()(
+export class ChatToolNotFoundError extends Schema.TaggedError<ChatToolNotFoundError>()(
 	"@maple/http/errors/ChatToolNotFoundError",
 	{
 		tool: Schema.String,
@@ -43,7 +43,7 @@ export class ChatToolNotFoundError extends Schema.TaggedErrorClass<ChatToolNotFo
 	{ httpApiStatus: 404 },
 ) {}
 
-export class ChatToolNotApplicableError extends Schema.TaggedErrorClass<ChatToolNotApplicableError>()(
+export class ChatToolNotApplicableError extends Schema.TaggedError<ChatToolNotApplicableError>()(
 	"@maple/http/errors/ChatToolNotApplicableError",
 	{
 		tool: Schema.String,
@@ -52,7 +52,7 @@ export class ChatToolNotApplicableError extends Schema.TaggedErrorClass<ChatTool
 	{ httpApiStatus: 400 },
 ) {}
 
-export class ChatToolInvalidInputError extends Schema.TaggedErrorClass<ChatToolInvalidInputError>()(
+export class ChatToolInvalidInputError extends Schema.TaggedError<ChatToolInvalidInputError>()(
 	"@maple/http/errors/ChatToolInvalidInputError",
 	{
 		tool: Schema.String,
@@ -61,13 +61,27 @@ export class ChatToolInvalidInputError extends Schema.TaggedErrorClass<ChatToolI
 	{ httpApiStatus: 400 },
 ) {}
 
+export class ChatToolExecutionError extends Schema.TaggedError<ChatToolExecutionError>()(
+	"@maple/http/errors/ChatToolExecutionError",
+	{
+		tool: Schema.String,
+		message: Schema.String,
+	},
+	{ httpApiStatus: 500 },
+) {}
+
 export class ChatApiGroup extends HttpApiGroup.make("chat")
 	.add(
 		HttpApiEndpoint.post("apply", "/apply", {
 			payload: ChatApplyRequest,
 			success: ChatApplyResponse,
-			error: [ChatToolNotFoundError, ChatToolNotApplicableError, ChatToolInvalidInputError],
+			error: [
+				ChatToolNotFoundError,
+				ChatToolNotApplicableError,
+				ChatToolInvalidInputError,
+				ChatToolExecutionError,
+			],
 		}),
 	)
-	.prefix("/api/chat")
-	.middleware(Authorization) {}
+	.prefix("/internal/chat")
+	.middleware(SessionAuthorization) {}

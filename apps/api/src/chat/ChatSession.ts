@@ -21,22 +21,37 @@
  * its own lifetime, so hosting the turn here is what actually makes it survive. It also removes
  * every cross-process hop: appending an event is a method call, not a stub RPC.
  *
- * Startup-CPU note (Cloudflare error 10021): this class is exported from `worker.ts`, whose module
- * scope Cloudflare evaluates during upload validation. It must therefore import nothing from the
- * app service graph at module scope — hence `@maple/domain/chat-session` types being the only
- * import, and `./turn-runner` (which pulls in the whole graph) arriving through a dynamic import
- * inside the method that needs it, exactly as `worker.ts` does for the route graph.
+ * A plain class over the object's state and env rather than a `DurableObject` subclass: the Durable
+ * Object itself is `ChatSessionObject` at the bottom of this file, alchemy's Effect-native form, which
+ * the api Worker's init yields (binding, namespace and the entry's class export all derive from it)
+ * and which builds one of these per activation and drives its methods over RPC.
+ *
+ * Startup-CPU note (Cloudflare error 10021): this class is reachable from `worker.ts`, whose
+ * module scope Cloudflare evaluates during upload validation. It must therefore import nothing
+ * from the app service graph at module scope — hence `@maple/domain/chat-session` types being the
+ * only import, and `./turn-runner` (which pulls in the whole graph) arriving through a dynamic
+ * import inside the method that needs it, exactly as `worker.ts` does for the route graph.
  */
-import { DurableObject } from "cloudflare:workers"
+import * as Cloudflare from "alchemy/Cloudflare"
+import { Effect } from "effect"
 import {
 	decodeChatEventPayload,
 	encodeChatEventPayload,
 	type ChatEvent,
 	type ChatEventInput,
 	type ChatMessage,
+	type ChatTaskRef,
+	type ChatTaskState,
 	type ChatToolCall,
 	type ChatTurnTenantEncoded,
 } from "@maple/domain/chat-session"
+import type { ChatSessionStub } from "./session"
+
+/** What the class reads off its Durable Object state: the SQLite handle and the object's own `waitUntil`. */
+interface ChatSessionState {
+	readonly storage: { readonly sql: SqlStorage }
+	waitUntil(promise: Promise<unknown>): void
+}
 
 /** SQLite row shapes. `SqlStorage.exec` requires an index signature on its row type. */
 interface EventRow extends Record<string, SqlStorageValue> {
@@ -101,8 +116,9 @@ const RETRY_HINT = "retry: 1000\n\n"
  * the `diagnosis_timeout` ceiling the triage path already uses.
  */
 const TURN_STALE_MS = 15 * 60 * 1000
+const CHAT_TURN_FAILED = "Maple couldn't complete this response."
 
-export class ChatSession extends DurableObject<Record<string, unknown>> {
+export class ChatSession {
 	private readonly sql: SqlStorage
 
 	/**
@@ -114,10 +130,12 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 	 * into. Reader and writer are different requests but the *same object*, so the writer can simply
 	 * tap the reader on the shoulder.
 	 */
-	private waiters: Array<() => void> = []
+	private waiters = new Set<() => void>()
 
-	constructor(ctx: DurableObjectState, env: Record<string, unknown>) {
-		super(ctx, env)
+	constructor(
+		private readonly ctx: ChatSessionState,
+		private readonly env: Record<string, unknown>,
+	) {
 		this.sql = ctx.storage.sql
 		this.sql.exec(SCHEMA)
 		// Sessions created before the watchdog columns existed (local dev only — the class has
@@ -129,6 +147,27 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 				// Already present.
 			}
 		}
+	}
+
+	/**
+	 * The most recent compaction, if the conversation has been summarized.
+	 *
+	 * A targeted reverse scan rather than a second full fold: `history()` already walks every row,
+	 * and this is read once per turn by `toLlmMessages`. `LIMIT 1` on a descending scan stops at the
+	 * newest compaction, which by definition is near the end of the log.
+	 */
+	compaction(): { summary: string; throughSeq: number } | undefined {
+		const rows = this.sql
+			.exec<EventRow>(
+				"SELECT seq, created_at, payload FROM events WHERE payload LIKE ? ORDER BY seq DESC LIMIT 1",
+				'%"type":"compaction"%',
+			)
+			.toArray()
+		const row = rows[0]
+		if (!row) return undefined
+		const event = decodeChatEventPayload(row.payload, row.seq)
+		if (event.type !== "compaction") return undefined
+		return { summary: event.summary, throughSeq: event.throughSeq }
 	}
 
 	/** Highest assigned seq, i.e. the cursor a client that has read everything holds. */
@@ -209,9 +248,9 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 
 	/** Wake every parked subscriber. Cheap and unconditional — the list is empty when nobody reads. */
 	private notify(): void {
-		if (this.waiters.length === 0) return
+		if (this.waiters.size === 0) return
 		const parked = this.waiters
-		this.waiters = []
+		this.waiters = new Set()
 		for (const wake of parked) wake()
 	}
 
@@ -219,15 +258,17 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 	private waitForAppend(timeoutMs: number): Promise<boolean> {
 		return new Promise<boolean>((resolve) => {
 			let settled = false
+			const wake = () => settle(true)
 			const settle = (appended: boolean) => {
 				if (settled) return
 				settled = true
 				resolve(appended)
 			}
-			this.waiters.push(() => settle(true))
-			// A timed-out waiter is left in the list; its closure is a no-op once settled, and
-			// `notify` clears the array wholesale on the next append.
-			void scheduler.wait(timeoutMs).then(() => settle(false))
+			this.waiters.add(wake)
+			void scheduler.wait(timeoutMs).then(() => {
+				this.waiters.delete(wake)
+				settle(false)
+			})
 		})
 	}
 
@@ -275,7 +316,11 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 					await writer.write(encoder.encode(frameChatEvent(event)))
 					position = event.seq
 				}
-				if (events.some((event) => event.type === "turn-end")) break
+				// Only the *conversation's* turn ending closes the stream. A sub-agent's `turn-end`
+				// is tagged with `task` and merely closes its card — treating it as terminal would
+				// cut the connection the moment the first delegated search finished, and the rest of
+				// the parent's answer would only arrive on the client's next reconnect.
+				if (events.some((event) => event.type === "turn-end" && event.task === undefined)) break
 				// The idle budget is spent on silence only: a batch that went out resets it, so a
 				// long turn streams over one connection instead of being recycled mid-answer.
 				if (!(await this.waitForAppend(SUBSCRIBE_IDLE_MS))) break
@@ -370,7 +415,7 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 	/**
 	 * Drive one turn to completion, appending events as they are produced.
 	 *
-	 * Everything heavy — the Effect runtime, the service graph, `@maple/llm` — is behind this
+	 * Everything heavy — the Effect runtime, the service graph, `@opencode-ai/ai` — is behind this
 	 * dynamic import so none of it is evaluated at module scope. Failures are recorded as a
 	 * terminal event rather than thrown: the log is what the client reads, so a turn that dies
 	 * silently is indistinguishable from one that hung.
@@ -384,12 +429,13 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 			const { runChatSessionTurn } = await import("./turn-runner")
 			await runChatSessionTurn({ session: this, sessionId, env: this.env, messageId, tenant })
 		} catch (cause) {
+			console.error("[chat.turn] Failed to start turn runner", cause)
 			if (this.holdsTurn(messageId)) {
 				this.append({
 					type: "turn-end",
 					messageId,
 					reason: "error",
-					error: cause instanceof Error ? cause.message : "The chat turn failed to start.",
+					error: CHAT_TURN_FAILED,
 				})
 			}
 		} finally {
@@ -405,33 +451,8 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 	 * message that issued them and are completed in place by their result.
 	 */
 	history(): ReadonlyArray<ChatMessage> {
-		// A mutable mirror of `ChatMessage`. The fold concatenates deltas and completes tool calls
-		// in place; building it against the readonly wire type would force a copy per delta, which
-		// is exactly the shape that used to desynchronise `byId` from `messages`.
-		type Draft = {
-			id: string
-			role: ChatMessage["role"]
-			text: string
-			toolCalls: Array<ChatToolCall>
-			createdAt: number
-		}
-		const messages: Array<Draft> = []
-		const byId = new Map<string, Draft>()
-
-		const openAssistant = (id: string, createdAt: number) => {
-			const existing = byId.get(id)
-			if (existing) return existing
-			const message = {
-				id,
-				role: "assistant" as const,
-				text: "",
-				toolCalls: [] as Array<ChatToolCall>,
-				createdAt,
-			}
-			byId.set(id, message)
-			messages.push(message)
-			return message
-		}
+		const top = makeTranscript()
+		const nested = new Map<string, Transcript>()
 
 		const rows = this.sql
 			.exec<EventRow>("SELECT seq, created_at, payload FROM events ORDER BY seq ASC")
@@ -439,58 +460,217 @@ export class ChatSession extends DurableObject<Record<string, unknown>> {
 
 		for (const row of rows) {
 			const event = decodeChatEventPayload(row.payload, row.seq)
-			switch (event.type) {
-				case "user-message": {
-					const message = {
-						id: event.id,
-						role: "user" as const,
-						text: event.text,
-						toolCalls: [] as Array<ChatToolCall>,
-						createdAt: row.created_at,
-					}
-					byId.set(event.id, message)
-					messages.push(message)
-					break
-				}
-				case "turn-start":
-					openAssistant(event.messageId, row.created_at)
-					break
-				case "text-delta": {
-					// Mutate in place. Replacing the array slot with a copy left `byId` pointing at
-					// an object no longer in `messages`, so the *next* delta opened a brand-new
-					// assistant message — a 400-token reply folded into ~400 one-token messages, in
-					// what the browser rendered and in what the model was replayed on the next turn.
-					const message = openAssistant(event.messageId, row.created_at)
-					message.text += event.text
-					break
-				}
-				case "tool-call": {
-					const message = openAssistant(event.messageId, row.created_at)
-					message.toolCalls.push({
-						id: event.callId,
-						name: event.name,
-						input: event.input,
-						...(event.proposed === true ? { proposed: true } : {}),
-					} as ChatToolCall)
-					break
-				}
-				case "tool-result": {
-					const message = openAssistant(event.messageId, row.created_at)
-					const index = message.toolCalls.findIndex((call) => call.id === event.callId)
-					if (index >= 0) {
-						message.toolCalls[index] = {
-							...message.toolCalls[index],
-							output: event.output,
-							...(event.isError === true ? { isError: true } : {}),
-						} as ChatToolCall
-					}
-					break
-				}
-				case "turn-end":
-					break
+
+			// A task-tagged event belongs to a sub-agent's transcript, which hangs off the parent's
+			// `task` tool call — not to the top-level conversation. Routing it here is what keeps a
+			// fan-out of sub-agents from appearing as a dozen stray assistant messages, in the
+			// browser *and* in what `toLlmMessages` replays to the model on the next turn.
+			if (event.type !== "user-message" && event.type !== "compaction" && event.task !== undefined) {
+				foldTaskEvent(top, nested, event, event.task, row.created_at)
+				continue
 			}
+
+			foldInto(top, event, row.created_at)
 		}
 
-		return messages
+		return top.messages
 	}
 }
+
+/**
+ * A mutable mirror of `ChatMessage`.
+ *
+ * The fold concatenates deltas and completes tool calls in place; building it against the readonly
+ * wire type would force a copy per delta, which is exactly the shape that used to desynchronise
+ * `byId` from `messages`.
+ */
+interface Draft {
+	id: string
+	role: ChatMessage["role"]
+	text: string
+	toolCalls: Array<ChatToolCall>
+	createdAt: number
+	startSeq: number
+}
+
+interface Transcript {
+	readonly messages: Array<Draft>
+	readonly byId: Map<string, Draft>
+}
+
+const makeTranscript = (): Transcript => ({ messages: [], byId: new Map() })
+
+const openAssistant = (transcript: Transcript, id: string, createdAt: number, startSeq: number): Draft => {
+	const existing = transcript.byId.get(id)
+	if (existing) return existing
+	const message: Draft = { id, role: "assistant", text: "", toolCalls: [], createdAt, startSeq }
+	transcript.byId.set(id, message)
+	transcript.messages.push(message)
+	return message
+}
+
+/**
+ * Fold one event into a transcript.
+ *
+ * Extracted so the top-level conversation and a sub-agent's nested transcript are folded by
+ * *literally the same code* — two implementations of "concatenate deltas, settle tool calls in
+ * place" would drift, and the nested one is the harder to notice when it does.
+ */
+const foldInto = (transcript: Transcript, event: ChatEvent, createdAt: number): void => {
+	const open = (messageId: string) => openAssistant(transcript, messageId, createdAt, event.seq)
+	switch (event.type) {
+		case "user-message": {
+			const message: Draft = {
+				id: event.id,
+				role: "user",
+				text: event.text,
+				toolCalls: [],
+				createdAt,
+				startSeq: event.seq,
+			}
+			transcript.byId.set(event.id, message)
+			transcript.messages.push(message)
+			break
+		}
+		case "turn-start":
+			open(event.messageId)
+			break
+		case "text-delta": {
+			// Mutate in place. Replacing the array slot with a copy left `byId` pointing at an
+			// object no longer in `messages`, so the *next* delta opened a brand-new assistant
+			// message — a 400-token reply folded into ~400 one-token messages, in what the browser
+			// rendered and in what the model was replayed on the next turn.
+			open(event.messageId).text += event.text
+			break
+		}
+		case "tool-call": {
+			const message = open(event.messageId)
+			message.toolCalls.push({
+				id: event.callId,
+				name: event.name,
+				input: event.input,
+				...(event.proposed === true ? { proposed: true } : undefined),
+			} as ChatToolCall)
+			break
+		}
+		case "tool-result": {
+			const message = open(event.messageId)
+			const index = message.toolCalls.findIndex((call) => call.id === event.callId)
+			if (index >= 0) {
+				message.toolCalls[index] = {
+					...message.toolCalls[index],
+					output: event.output,
+					...(event.isError === true ? { isError: true } : undefined),
+				} as ChatToolCall
+			}
+			break
+		}
+		case "turn-retry": {
+			// Undo the text of the attempt that failed. The clamp is not defensive noise:
+			// `Stream.takeWhile(holdsTurn)` in `turn-runner.ts` can drop appends between a delta and
+			// the retraction that accounts for it, so `retractChars` can legitimately exceed what
+			// actually landed.
+			const message = open(event.messageId)
+			message.text = message.text.slice(0, Math.max(0, message.text.length - event.retractChars))
+			break
+		}
+		// Inert for display. Unlike opencode — where the transcript and the model input are the same
+		// list — a Maple user scrolling back must still see what they actually said. Only
+		// `toLlmMessages` reads a compaction, through `ChatSession.compaction()`.
+		case "compaction":
+			break
+		case "turn-end":
+			break
+	}
+}
+
+/** Terminal reason → the status the UI shows on the sub-agent's card. */
+const TASK_STATUS: Record<string, ChatTaskState["status"]> = {
+	stop: "completed",
+	error: "error",
+	aborted: "aborted",
+	"max-steps": "aborted",
+} satisfies Record<string, ChatTaskState["status"]>
+
+/**
+ * Route one sub-agent event into the transcript hanging off its parent's `task` tool call.
+ *
+ * **Deny by default.** If the parent message or the parent tool call is not found, the event is
+ * dropped. That is the guarantee that a malformed or out-of-order child event cannot corrupt the
+ * parent conversation — and it costs nothing in practice, because the parent's `tool-call`
+ * announcement is appended strictly before the tool's `execute` runs.
+ */
+const foldTaskEvent = (
+	top: Transcript,
+	/** Nested transcripts by task call id, owned by the enclosing `history()` call. */
+	nested: Map<string, Transcript>,
+	event: ChatEvent,
+	ref: ChatTaskRef,
+	createdAt: number,
+): void => {
+	const parent = top.byId.get(ref.parentMessageId)
+	if (!parent) return
+	const index = parent.toolCalls.findIndex((call) => call.id === ref.id)
+	if (index < 0) return
+
+	const child = nested.get(ref.id) ?? makeTranscript()
+	nested.set(ref.id, child)
+	foldInto(child, event, createdAt)
+
+	// `ChatToolCall` is the readonly wire type, so the call is rebuilt rather than mutated. Keying
+	// the nested transcript by task id rather than by object identity is what makes that safe.
+	parent.toolCalls[index] = {
+		...parent.toolCalls[index]!,
+		task: {
+			id: ref.id,
+			agent: ref.agent,
+			status: event.type === "turn-end" ? (TASK_STATUS[event.reason] ?? "completed") : "running",
+			// The nested drafts are structurally `ChatSubMessage` already — a sub-agent cannot nest
+			// further, so no `task` field is ever present on them.
+			messages: child.messages,
+		},
+	} as ChatToolCall
+}
+
+/** The stub's surface with each method's Promise lifted to the Effect alchemy runs per RPC call. */
+type EffectRpc<Stub> = {
+	readonly [K in keyof Stub]: Stub[K] extends (...args: infer Args) => Promise<infer Result>
+		? (...args: Args) => Effect.Effect<Result>
+		: never
+}
+
+/**
+ * The session's methods, one Effect each. alchemy runs the Effect per RPC call and hands its value
+ * back as-is — a `ReadableStream` included, which Workers RPC carries by reference — so
+ * `ChatSessionStub` stays what a caller sees.
+ */
+export const chatSessionRpc = (session: ChatSession) =>
+	({
+		cursor: () => Effect.sync(() => session.cursor()),
+		running: () => Effect.sync(() => session.running()),
+		history: () => Effect.sync(() => session.history()),
+		since: (cursor) => Effect.sync(() => session.since(cursor)),
+		subscribe: (cursor) => Effect.sync(() => session.subscribe(cursor)),
+		append: (event) => Effect.sync(() => session.append(event)),
+		beginTurn: (input) => Effect.sync(() => session.beginTurn(input)),
+		holdsTurn: (messageId) => Effect.sync(() => session.holdsTurn(messageId)),
+		endTurn: (messageId) => Effect.sync(() => session.endTurn(messageId)),
+		abort: () => Effect.sync(() => session.abort()),
+	}) satisfies EffectRpc<ChatSessionStub>
+
+/**
+ * One activation, in alchemy's two phases: the outer Effect resolves the state and env (it also
+ * runs at plan time, against a mock state, so it must not touch storage), the inner one builds the
+ * session inside the object's `blockConcurrencyWhile` — the schema statements have run before the
+ * first call reaches it, hibernation wakes included.
+ */
+export const activateChatSession = Effect.map(
+	Effect.all([Cloudflare.DurableObjectState, Cloudflare.WorkerEnvironment]),
+	([state, env]) => Effect.sync(() => chatSessionRpc(new ChatSession(state.raw, env))),
+)
+
+/** The Durable Object: one per `"<orgId>:<tabId>"`, SQLite-backed, bound to the api Worker as `ChatSession`. */
+export default class ChatSessionObject extends Cloudflare.DurableObject<ChatSessionObject>()(
+	"ChatSession",
+	activateChatSession,
+) {}

@@ -1,9 +1,10 @@
+// BOUNDARY: This module owns unparsed external values and narrows them before domain use.
 /**
  * Reaching a chat session's Durable Object.
  *
  * This module is deliberately tiny and dependency-free: it is imported by `ai-triage-enqueue` and
  * `InvestigationService`, which are themselves reachable from the MCP tool registry, so anything
- * heavy here would close an import cycle back through `chat/agent.ts`.
+ * heavy here would close an import cycle back through `chat/loop`.
  *
  * Starting a turn is now a single `beginTurn` call. Under Flue there were two very different paths
  * into the same conversation — the browser POSTed to `/agents/maple-chat/:id` on the chat-flue
@@ -56,12 +57,12 @@ export const isChatSessionNamespace = (value: unknown): value is ChatSessionName
 	typeof (value as { get?: unknown }).get === "function" &&
 	typeof (value as { idFromName?: unknown }).idFromName === "function"
 
-/** Resolve the `CHAT_SESSION` binding off a worker env record, or `undefined` if it is missing. */
+/** Resolve the `ChatSession` binding (the Durable Object's alchemy name) off a worker env record, or `undefined` if it is missing. */
 export const chatSessionStub = (
 	env: Record<string, unknown>,
 	sessionId: string,
 ): ChatSessionStub | undefined => {
-	const namespace = env.CHAT_SESSION
+	const namespace = env.ChatSession
 	if (!isChatSessionNamespace(namespace)) return undefined
 	return namespace.get(namespace.idFromName(sessionId))
 }

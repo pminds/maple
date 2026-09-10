@@ -9,6 +9,8 @@
  *                        env-level self-hosted read endpoint
  * - `chdb`             — the embedded chDB engine behind the local `maple` binary
  */
+import { Option, Schema } from "effect"
+
 export type WarehouseBackendKind = "tinybird" | "tinybird-gateway" | "clickhouse" | "chdb"
 
 export interface TinybirdBackendConfig {
@@ -51,14 +53,15 @@ export interface WarehouseTargetIdentity {
  * (host only), so a config carrying `https://api.tinybird.co` has to reduce to
  * the same string or the two sides land on different nodes again.
  */
+const decodeUrl = Schema.decodeUnknownOption(Schema.URLFromString)
+
 const hostOf = (urlOrHost: string): string => {
 	const trimmed = urlOrHost.trim()
 	if (trimmed === "") return ""
-	try {
-		return new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`).host
-	} catch {
-		return trimmed
-	}
+	const parsed = decodeUrl(trimmed.includes("://") ? trimmed : `https://${trimmed}`)
+	// Not a URL even with a scheme bolted on — a bare identifier, or a config
+	// typo. Pass it through so the two sides still agree on the same node.
+	return Option.isSome(parsed) ? parsed.value.host : trimmed
 }
 
 export const warehouseTargetIdentity = (config: ResolvedWarehouseConfig): WarehouseTargetIdentity =>
@@ -74,8 +77,8 @@ export const warehouseTargetIdentity = (config: ResolvedWarehouseConfig): Wareho
 export const warehouseTargetAttributes = (config: ResolvedWarehouseConfig): Record<string, string> => {
 	const { namespace, address } = warehouseTargetIdentity(config)
 	return {
-		...(namespace === "" ? {} : { "db.namespace": namespace }),
-		...(address === "" ? {} : { "server.address": address }),
+		...(!(namespace === "") ? { "db.namespace": namespace } : undefined),
+		...(!(address === "") ? { "server.address": address } : undefined),
 	}
 }
 
@@ -90,10 +93,17 @@ export interface WarehouseBackendDialect {
 	 */
 	readonly stripTinybirdRestrictedSettings: boolean
 	/**
-	 * The official ClickHouse client rejects a trailing `FORMAT …`/`;` (it sets
-	 * the format itself); Tinybird's `/v0/sql` requires them.
+	 * Where the wire format is declared. The official ClickHouse client sets it
+	 * per request and rejects a statement that carries its own `FORMAT` clause;
+	 * Tinybird's `/v0/sql` has no such channel and reads it from the statement.
+	 * The executor applies this so no driver has to re-derive it from SQL text.
 	 */
-	readonly normalizeSqlForClient: boolean
+	readonly wireFormat: "in-statement" | "out-of-band"
+	/**
+	 * The format a driver reading `wireFormat: "in-statement"` expects, applied
+	 * by the executor when the statement does not already name one.
+	 */
+	readonly statementFormat: string | undefined
 	/**
 	 * OTel database-system identity. chDB implements the ClickHouse interface,
 	 * so its system remains `clickhouse` even though the logical peer is `chdb`.
@@ -112,6 +122,16 @@ export interface WarehouseBackendDialect {
 	 * SQL-catalog e2e sweep enforces.
 	 */
 	readonly unquote64BitIntegers: boolean
+	/**
+	 * True when this backend runs the schema *we* deploy, so its columns and
+	 * skip indices are known at compile time and capability probing is both
+	 * unnecessary and — on Tinybird — impossible (`system.*` answers `403`
+	 * through the SDK and takes ~2.2s through the gateway). BYO ClickHouse is
+	 * the user's own cluster and must still be inspected live; `chdb` applies
+	 * the same generated schema but is cheap to probe and can lag a migration,
+	 * so it keeps the live answer too.
+	 */
+	readonly managedSchema: boolean
 }
 
 /** Single source of truth for per-backend behavior. */
@@ -120,37 +140,45 @@ export const BackendDialect: Record<WarehouseBackendKind, WarehouseBackendDialec
 		driver: "tinybird-sdk",
 		dbClient: "tinybird-sdk",
 		stripTinybirdRestrictedSettings: true,
-		normalizeSqlForClient: false,
+		wireFormat: "in-statement",
+		statementFormat: "FORMAT JSON",
 		dbSystemName: "tinybird",
 		peerService: "tinybird",
 		// The SDK's /v0/sql JSON already returns 64-bit ints as numbers.
 		unquote64BitIntegers: false,
+		managedSchema: true,
 	},
 	"tinybird-gateway": {
 		driver: "clickhouse-web",
 		dbClient: "clickhouse",
 		stripTinybirdRestrictedSettings: true,
-		normalizeSqlForClient: true,
+		wireFormat: "out-of-band",
+		statementFormat: undefined,
 		dbSystemName: "clickhouse",
 		peerService: "clickhouse",
 		unquote64BitIntegers: true,
+		managedSchema: true,
 	},
 	clickhouse: {
 		driver: "clickhouse-web",
 		dbClient: "clickhouse",
 		stripTinybirdRestrictedSettings: false,
-		normalizeSqlForClient: true,
+		wireFormat: "out-of-band",
+		statementFormat: undefined,
 		dbSystemName: "clickhouse",
 		peerService: "clickhouse",
 		unquote64BitIntegers: true,
+		managedSchema: false,
 	},
 	chdb: {
 		driver: "clickhouse-web",
 		dbClient: "clickhouse",
 		stripTinybirdRestrictedSettings: false,
-		normalizeSqlForClient: true,
+		wireFormat: "out-of-band",
+		statementFormat: undefined,
 		dbSystemName: "clickhouse",
 		peerService: "chdb",
 		unquote64BitIntegers: true,
+		managedSchema: false,
 	},
-}
+} satisfies Record<WarehouseBackendKind, WarehouseBackendDialect>

@@ -46,7 +46,7 @@ import {
 } from "@/components/icons"
 import { useApiKeyMutationSync, useApiKeysList } from "@/hooks/use-api-keys"
 import { useIsOrgAdmin } from "@/hooks/use-is-org-admin"
-import { formatBackendError } from "@/lib/error-messages"
+import { displayError } from "@/lib/error-messages"
 import { MapleApiV2AtomClient } from "@/lib/services/common/v2-atom-client"
 import { CreateApiKeyDialog } from "./create-api-key-dialog"
 import { RollApiKeyDialog } from "./roll-api-key-dialog"
@@ -101,8 +101,8 @@ export function ApiKeysSection() {
 			toastManager.add({ title: "API key revoked", type: "success" })
 			void reconcileTxid(result.value.txid)
 		} else {
-			const { title, description } = formatBackendError(result)
-			toastManager.add({ title, description, type: "error" })
+			const { title, message } = displayError(result)
+			toastManager.add({ title, description: message, type: "error" })
 		}
 		setIsRevoking(false)
 		setRevokeOpen(false)
@@ -143,7 +143,7 @@ export function ApiKeysSection() {
 					)}
 					<div className="flex-1" />
 					<a
-						href="https://maple.dev/docs"
+						href="https://maple.dev/docs/api"
 						target="_blank"
 						rel="noopener noreferrer"
 						className="text-muted-foreground hover:text-foreground text-xs transition-colors"

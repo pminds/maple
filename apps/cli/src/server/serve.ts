@@ -1,24 +1,39 @@
+// BOUNDARY: This module intentionally carries opaque values; callers decode them before domain use.
 // The local Maple server: OTLP/HTTP ingest + a raw SQL query API + the bundled
 // SPA, all on one port, backed by an embedded chDB. Replaces the Rust
 // `apps/ingest/src/bin/local.rs`. `maple start` calls `startServer`.
 
-import { Effect, Schema, type Scope } from "effect"
+import { Effect, Predicate, Schema, type Scope } from "effect"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import { gunzipSync } from "node:zlib"
 import { TelemetryLayer } from "../core/telemetry"
 import { isLoopbackHostname } from "../lib/local-address"
 import { MAPLE_VERSION } from "../version"
-import { acquireChdb, ChdbError, type Chdb } from "./chdb"
+import {
+	acquireChdb,
+	type Chdb,
+	ChdbError,
+	configureRawTelemetryRetentionDays,
+	readRawTelemetryRetentionDays,
+	rawTelemetryTtlStatements,
+} from "./chdb"
 import { buildInsertStatements } from "./inserts"
 import { encodeLogs, encodeMetrics, encodeTraces, type EncodedBatch, OtlpFieldError } from "./otlp/encode"
-import { decodeLogsRequest, decodeMetricsRequest, decodeTraceRequest } from "./otlp/proto"
+import {
+	decodeLogsRequest,
+	decodeMetricsRequest,
+	decodeTraceRequest,
+	encodeExportResponse,
+} from "./otlp/proto"
 import { CURRENT_LOCAL_SCHEMA, LOCAL_SCHEMA_SQL, SCHEMA_FINGERPRINT } from "./schema-identity"
 import { assertCurrentPhysicalSchema } from "./schema-physical"
 import { ensureStoreMarkerDurable } from "./store-version"
-
-/** Fingerprint of the schema this build bootstraps stores with. Re-exported
- * from this module for the existing archive/checkpoint metadata seam. */
-export { SCHEMA_FINGERPRINT }
+import {
+	ensureMaintenanceToken,
+	maintenanceTokenMatches,
+	RetiredDayAuthority,
+	retireLiveDayInServer,
+} from "./archives/retention"
 
 /** Resolves a request path to a static asset (the bundled SPA). Returns
  *  `undefined` to fall through to the SPA shell (client-side routing). */
@@ -36,18 +51,16 @@ export interface ServerOptions {
 	readonly port: number
 	readonly dataDir: string
 	readonly configFile?: string
+	readonly minimumRawTelemetryRetentionDays?: number
 	/** Serves the bundled SPA; omit to disable the UI (API-only). */
 	readonly assets?: AssetResolver
 }
 
-export class ServerBindError extends Schema.TaggedErrorClass<ServerBindError>()(
-	"@maple/cli/ServerBindError",
-	{
-		hostname: Schema.String,
-		port: Schema.Number,
-		message: Schema.String,
-	},
-) {}
+export class ServerBindError extends Schema.TaggedError<ServerBindError>()("@maple/cli/ServerBindError", {
+	hostname: Schema.String,
+	port: Schema.Number,
+	message: Schema.String,
+}) {}
 
 export const isBrowserOriginAllowed = (
 	requestUrl: URL,
@@ -78,7 +91,15 @@ export const isBrowserOriginAllowed = (
 
 /** Build CORS headers for an origin that has already passed
  * `isBrowserOriginAllowed`. Echoing it preserves browser OTLP ingest between
- * loopback aliases and ports without restoring wildcard CORS. */
+ * loopback aliases and ports without restoring wildcard CORS.
+ *
+ * `authorization` is allowed because every browser SDK sends
+ * `Authorization: Bearer <ingest key>` once one is configured — the same bundle
+ * that ships to production is what people point at `maple start`. Rejecting the
+ * header in preflight blocked those pages entirely (and `@maple-dev/browser`,
+ * which requires an ingest key, could never reach local mode at all). Nothing
+ * is weakened by allowing it: this listener authenticates nothing, it gates on
+ * request origin, and `/v1/*` never reads the header's value. */
 export const corsHeadersForAllowedOrigin = (
 	origin: string | null,
 ): Readonly<Record<string, string>> | undefined =>
@@ -86,7 +107,10 @@ export const corsHeadersForAllowedOrigin = (
 		? {
 				"access-control-allow-origin": origin,
 				"access-control-allow-methods": "GET, POST, OPTIONS",
-				"access-control-allow-headers": "content-type, content-encoding",
+				// `x-maple-sdk` is the SDK identity hint every browser SDK sends on
+				// every request; a listener that does not allow it fails preflight
+				// for the whole SDK.
+				"access-control-allow-headers": "content-type, content-encoding, authorization, x-maple-sdk",
 				"access-control-allow-private-network": "true",
 				vary: "Origin",
 			}
@@ -105,6 +129,45 @@ const json = (body: unknown, status = 200): Response =>
 
 const text = (body: string, status = 200, contentType = "text/plain"): Response =>
 	new Response(body, { status, headers: { "content-type": contentType } })
+
+/**
+ * A message for a thrown value of unknown shape that is never `{}` or
+ * `[object Object]`.
+ *
+ * `(error as Error).message` was the idiom here, and a throw that was not an
+ * `Error` — or was an `Error` subclass carrying its detail elsewhere — reduced to
+ * `undefined` or to an empty JSON object. Production carried 94 spans reading
+ * exactly `Error: {}` at `POST /v1/traces`: the throw survived all the way to the
+ * tracer, which fingerprinted it into one issue with no message, no type, and no
+ * stack beyond the span name. Nothing about it could be diagnosed.
+ *
+ * So every branch here must yield something a human can act on, and the last
+ * resort names the shape rather than pretending to describe it.
+ */
+export const describeThrown = (error: unknown): string => {
+	if (error instanceof Error && error.message !== "") return error.message
+	if (typeof error === "string" && error !== "") return error
+	if (error !== null && typeof error === "object") {
+		// Both reads are inside the try: `message` may be a getter that throws, and
+		// reading it outside would defeat the whole point of this function.
+		try {
+			// `in` narrows without invoking the getter; the read below is what can
+			// throw, and it is inside the try for exactly that reason.
+			if ("message" in error) {
+				const message = error.message
+				if (typeof message === "string" && message !== "") return message
+			}
+			const json = JSON.stringify(error)
+			// `{}` here means every own property was non-enumerable or unserializable
+			// (a `Response`, a class instance) — the empty object is the bug, so say so.
+			if (json !== undefined && json !== "{}") return json
+		} catch {
+			// Circular, or a getter that throws. Fall through to the constructor name.
+		}
+		return `non-serializable ${error.constructor?.name ?? "object"} thrown`
+	}
+	return `${typeof error} thrown: ${String(error)}`
+}
 
 type Signal = "traces" | "logs" | "metrics"
 
@@ -151,8 +214,25 @@ interface IngestResult {
 	readonly requestBytes: number
 }
 
-async function ingest(db: Chdb, signal: Signal, req: Request): Promise<IngestResult> {
-	const raw = new Uint8Array(await req.arrayBuffer())
+async function ingest(
+	db: Chdb,
+	authority: RetiredDayAuthority,
+	signal: Signal,
+	req: Request,
+): Promise<IngestResult> {
+	let raw: Uint8Array
+	try {
+		raw = new Uint8Array(await req.arrayBuffer())
+	} catch (error) {
+		// A client that hangs up mid-body rejects here. Unguarded, this became an
+		// Effect *defect* — no `error.type`, no 4xx suppression, and a span reading
+		// only "The connection was closed." It is a caller outcome, so 400 it.
+		return {
+			response: text(`read ${signal} body: ${describeThrown(error)}`, 400),
+			accepted: 0,
+			requestBytes: 0,
+		}
+	}
 	const requestBytes = raw.length
 	const contentType = req.headers.get("content-type") ?? ""
 	const contentEncoding = req.headers.get("content-encoding")
@@ -161,7 +241,7 @@ async function ingest(db: Chdb, signal: Signal, req: Request): Promise<IngestRes
 		decoded = decodeOtlp(signal, raw, contentType, contentEncoding)
 	} catch (error) {
 		return {
-			response: text(`decode ${signal}: ${(error as Error).message}`, 400),
+			response: text(`decode ${signal}: ${describeThrown(error)}`, 400),
 			accepted: 0,
 			requestBytes,
 		}
@@ -175,11 +255,17 @@ async function ingest(db: Chdb, signal: Signal, req: Request): Promise<IngestRes
 		const status = error instanceof OtlpFieldError ? 400 : 500
 		const stage = status === 400 ? "decode" : "encode"
 		return {
-			response: text(`${stage} ${signal}: ${(error as Error).message}`, status),
+			response: text(`${stage} ${signal}: ${describeThrown(error)}`, status),
 			accepted: 0,
 			requestBytes,
 		}
 	}
+	let rejected = 0
+	batches = batches.map((batch) => {
+		const filtered = authority.filterBatch(batch.datasource, batch.ndjson)
+		rejected += filtered.rejected
+		return { ...batch, ndjson: filtered.ndjson, rowCount: filtered.accepted }
+	})
 	let accepted = 0
 	for (const batch of batches) {
 		if (batch.rowCount === 0) continue
@@ -188,7 +274,7 @@ async function ingest(db: Chdb, signal: Signal, req: Request): Promise<IngestRes
 				db.exec(statement.sql)
 			} catch (error) {
 				return {
-					response: text(`chDB insert (${batch.datasource}): ${(error as Error).message}`, 500),
+					response: text(`chDB insert (${batch.datasource}): ${describeThrown(error)}`, 500),
 					accepted,
 					requestBytes,
 				}
@@ -196,14 +282,35 @@ async function ingest(db: Chdb, signal: Signal, req: Request): Promise<IngestRes
 			accepted += statement.rowCount
 		}
 	}
-	return { response: json({ accepted }), accepted, requestBytes }
+	const errorMessage = rejected > 0 ? "telemetry from permanently retired UTC days was rejected" : ""
+	if (contentType.includes("json")) {
+		const rejectedField =
+			signal === "traces"
+				? { rejectedSpans: rejected }
+				: signal === "logs"
+					? { rejectedLogRecords: rejected }
+					: { rejectedDataPoints: rejected }
+		return {
+			response: json(rejected > 0 ? { partialSuccess: { ...rejectedField, errorMessage } } : {}),
+			accepted,
+			requestBytes,
+		}
+	}
+	return {
+		response: new Response(encodeExportResponse(signal, rejected, errorMessage), {
+			status: 200,
+			headers: { "content-type": "application/x-protobuf" },
+		}),
+		accepted,
+		requestBytes,
+	}
 }
 
 /**
  * Strip a trailing `FORMAT <ident>` clause (optionally followed by `;`) and
  * re-append `FORMAT JSONEachRow`, so the server owns the output format. Port of
  * `force_json_each_row` from the former Rust server: callers POST `compiled.sql`
- * verbatim (`CH.compile(...)` appends `FORMAT JSON`).
+ * verbatim, and a compiled query carries its own `FORMAT JSON`.
  */
 function forceJsonEachRow(sql: string): string {
 	let s = sql.trimEnd()
@@ -228,7 +335,7 @@ interface QueryResult {
 	readonly sql: string | undefined
 }
 
-async function handleQuery(db: Chdb, req: Request): Promise<QueryResult> {
+async function handleQuery(db: Chdb, authority: RetiredDayAuthority, req: Request): Promise<QueryResult> {
 	let sql: string
 	try {
 		const body = (await req.json()) as { sql?: unknown }
@@ -240,6 +347,15 @@ async function handleQuery(db: Chdb, req: Request): Promise<QueryResult> {
 	}
 	let out: string
 	const started = performance.now()
+	const readOnly = /^\s*(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|EXISTS)\b/i.test(sql)
+	if (!readOnly && authority.hasRetiredDays()) {
+		return {
+			response: text("local SQL writes are disabled after the first UTC day is retired", 405),
+			rowCount: 0,
+			durationMs: Math.round(performance.now() - started),
+			sql,
+		}
+	}
 	try {
 		out = db.query(forceJsonEachRow(sql))
 	} catch (error) {
@@ -247,7 +363,7 @@ async function handleQuery(db: Chdb, req: Request): Promise<QueryResult> {
 		// and a 5xx would make the shared warehouse executor classify it as a
 		// transient upstream error and retry the identical query.
 		return {
-			response: text(`query failed: ${(error as Error).message}`, 400),
+			response: text(`query failed: ${describeThrown(error)}`, 400),
 			rowCount: 0,
 			durationMs: Math.round(performance.now() - started),
 			sql,
@@ -292,7 +408,13 @@ type SpanRunner = <A>(effect: Effect.Effect<A>) => Promise<A>
 // hand back to the client in `recoverResponse`. (Failing with a bare `Response`
 // recorded an empty `{}` — a `Response` has no enumerable own fields — which lost
 // the cause entirely and bucketed every failure under one "Error" fingerprint.)
-class IngestRejected extends Schema.TaggedErrorClass<IngestRejected>()("@maple/cli/IngestRejected", {
+/** A rejection out of `ingest`, carried as a typed failure so it becomes a 500
+ *  with a real message rather than an untyped defect. */
+class IngestFailed extends Schema.TaggedError<IngestFailed>()("@maple/cli/IngestFailed", {
+	message: Schema.String,
+}) {}
+
+class IngestRejected extends Schema.TaggedError<IngestRejected>()("@maple/cli/IngestRejected", {
 	response: Schema.instanceOf(Response),
 	status: Schema.Number,
 	message: Schema.String,
@@ -321,12 +443,32 @@ const recoverResponse = (self: Effect.Effect<Response, IngestRejected>): Effect.
 
 /** OTLP-ingest request as a `Server`-kind span, mirroring the Rust gateway
  *  (`apps/ingest`): `maple.signal`, item count, request size, HTTP semconv. */
-const ingestSpan = (runSpan: SpanRunner, db: Chdb, signal: Signal, req: Request): Promise<Response> =>
+const ingestSpan = (
+	runSpan: SpanRunner,
+	db: Chdb,
+	authority: RetiredDayAuthority,
+	signal: Signal,
+	req: Request,
+): Promise<Response> =>
 	runSpan(
 		recoverResponse(
 			Effect.gen(function* () {
-				const { response, accepted, requestBytes } = yield* Effect.promise(() =>
-					ingest(db, signal, req),
+				// `Effect.promise` is for promises that cannot reject, and `ingest`
+				// can: it awaits the request body and drives chDB. A rejection there
+				// became a DEFECT, which `recoverResponse`'s `Effect.match` does not
+				// catch — so it escaped as an untyped, unlabelled span error instead of
+				// the 500 the caller should have received.
+				const { response, accepted, requestBytes } = yield* Effect.tryPromise({
+					try: () => ingest(db, authority, signal, req),
+					catch: (error): IngestFailed => new IngestFailed({ message: describeThrown(error) }),
+				}).pipe(
+					Effect.catchTag("@maple/cli/IngestFailed", (error) =>
+						Effect.succeed({
+							response: text(`ingest ${signal}: ${error.message}`, 500),
+							accepted: 0,
+							requestBytes: 0,
+						}),
+					),
 				)
 				yield* Effect.annotateCurrentSpan({
 					"http.request.body.size": requestBytes,
@@ -348,19 +490,26 @@ const ingestSpan = (runSpan: SpanRunner, db: Chdb, signal: Signal, req: Request)
 	)
 
 /** `/local/query` request as a `Server`-kind span with the canonical DB attrs. */
-const querySpan = (runSpan: SpanRunner, db: Chdb, req: Request): Promise<Response> =>
+const querySpan = (
+	runSpan: SpanRunner,
+	db: Chdb,
+	authority: RetiredDayAuthority,
+	req: Request,
+): Promise<Response> =>
 	runSpan(
 		recoverResponse(
 			Effect.gen(function* () {
 				const { response, rowCount, durationMs, sql } = yield* Effect.promise(() =>
-					handleQuery(db, req),
+					handleQuery(db, authority, req),
 				)
 				yield* Effect.annotateCurrentSpan({
 					"db.system.name": "clickhouse",
 					"db.duration_ms": durationMs,
 					"result.rowCount": rowCount,
 					"http.response.status_code": response.status,
-					...(sql ? { "db.query.text": truncateSql(sql), "db.query.length": sql.length } : {}),
+					...(sql
+						? { "db.query.text": truncateSql(sql), "db.query.length": sql.length }
+						: undefined),
 				})
 				return yield* recordServerResponse(response)
 			}).pipe(
@@ -372,11 +521,132 @@ const querySpan = (runSpan: SpanRunner, db: Chdb, req: Request): Promise<Respons
 		),
 	)
 
+/** Admission closes before retirement and reopens only after all previously
+ * accepted ingest/query work has drained and the durable transition finishes. */
+export class RequestQuiescenceGate {
+	#active = 0
+	#closed = false
+	#drained: Array<() => void> = []
+
+	enter(): (() => void) | null {
+		if (this.#closed) return null
+		this.#active++
+		let released = false
+		return () => {
+			if (released) return
+			released = true
+			this.#active--
+			if (this.#active === 0) {
+				for (const resolve of this.#drained.splice(0)) resolve()
+			}
+		}
+	}
+
+	async exclusive<A>(work: () => Promise<A>): Promise<A> {
+		if (this.#closed) throw new Error("another server maintenance operation is active")
+		this.#closed = true
+		try {
+			if (this.#active > 0) await new Promise<void>((resolve) => this.#drained.push(resolve))
+			return await work()
+		} finally {
+			this.#closed = false
+		}
+	}
+}
+
+const admitted = async (gate: RequestQuiescenceGate, work: () => Promise<Response>): Promise<Response> => {
+	const leave = gate.enter()
+	if (!leave) return text("server maintenance in progress", 503)
+	try {
+		return await work()
+	} finally {
+		leave()
+	}
+}
+
+const handleRetirement = async (
+	db: Chdb,
+	authority: RetiredDayAuthority,
+	gate: RequestQuiescenceGate,
+	token: string,
+	req: Request,
+): Promise<Response> => {
+	if (!maintenanceTokenMatches(token, req.headers.get("x-maple-maintenance-token")))
+		return text("maintenance authorization required", 403)
+	let body: unknown
+	try {
+		body = await req.json()
+	} catch {
+		return text("invalid JSON body", 400)
+	}
+	if (!Predicate.isObject(body)) return text("invalid body", 400)
+	const record = body
+	const keys = Object.keys(record).sort().join(",")
+	if (keys !== "archiveDir,rangeDate,sealingLagHours") return text("invalid retirement fields", 400)
+	if (
+		typeof record.archiveDir !== "string" ||
+		typeof record.rangeDate !== "string" ||
+		typeof record.sealingLagHours !== "number"
+	)
+		return text("invalid retirement values", 400)
+	try {
+		const retired = await gate.exclusive(() =>
+			retireLiveDayInServer({
+				db,
+				authority,
+				archiveDir: record.archiveDir as string,
+				rangeDate: record.rangeDate as string,
+				sealingLagHours: record.sealingLagHours as number,
+			}),
+		)
+		return json(retired)
+	} catch (error) {
+		return text(`retirement failed: ${error instanceof Error ? error.message : String(error)}`, 409)
+	}
+}
+
+const CHECKPOINT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+/** Typed, authenticated replacement for sending BACKUP through /local/query. */
+const handleCheckpointBackup = async (db: Chdb, token: string, req: Request): Promise<Response> => {
+	if (!maintenanceTokenMatches(token, req.headers.get("x-maple-maintenance-token")))
+		return text("maintenance authorization required", 403)
+	let body: unknown
+	try {
+		body = await req.json()
+	} catch {
+		return text("invalid JSON body", 400)
+	}
+	if (!Predicate.isObject(body)) return text("invalid body", 400)
+	const record = body
+	if (Object.keys(record).sort().join(",") !== "checkpointId" || !Predicate.isString(record.checkpointId))
+		return text("invalid checkpoint fields", 400)
+	if (!CHECKPOINT_ID.test(record.checkpointId)) return text("invalid checkpoint ID", 400)
+	try {
+		db.exec(
+			`BACKUP DATABASE default TO Disk('default', 'backups/snapshots/${record.checkpointId.toLowerCase()}/backup')`,
+		)
+		return json({ checkpointId: record.checkpointId.toLowerCase() })
+	} catch (error) {
+		return text(
+			`checkpoint backup failed: ${error instanceof Error ? error.message : String(error)}`,
+			400,
+		)
+	}
+}
+
 /** The `Bun.serve` fetch handler, closed over the chDB connection. Each ingest
  *  and query request is run through `runSpan` so it leaves a trace; `/health`
  *  and `OPTIONS` are skipped (loop-prevention convention — no health-check noise). */
 const makeFetch =
-	(db: Chdb, options: ServerOptions, runSpan: SpanRunner) =>
+	(
+		db: Chdb,
+		options: ServerOptions,
+		runSpan: SpanRunner,
+		authority: RetiredDayAuthority,
+		gate: RequestQuiescenceGate,
+		maintenanceToken: string,
+	) =>
 	async (req: Request): Promise<Response> => {
 		const url = new URL(req.url)
 		const origin = req.headers.get("origin")
@@ -388,10 +658,18 @@ const makeFetch =
 		if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders })
 		if (url.pathname === "/health") return respond(text("OK"))
 		if (req.method === "POST") {
-			if (url.pathname === "/v1/traces") return respond(await ingestSpan(runSpan, db, "traces", req))
-			if (url.pathname === "/v1/logs") return respond(await ingestSpan(runSpan, db, "logs", req))
-			if (url.pathname === "/v1/metrics") return respond(await ingestSpan(runSpan, db, "metrics", req))
-			if (url.pathname === "/local/query") return respond(await querySpan(runSpan, db, req))
+			if (url.pathname === "/v1/traces")
+				return respond(await admitted(gate, () => ingestSpan(runSpan, db, authority, "traces", req)))
+			if (url.pathname === "/v1/logs")
+				return respond(await admitted(gate, () => ingestSpan(runSpan, db, authority, "logs", req)))
+			if (url.pathname === "/v1/metrics")
+				return respond(await admitted(gate, () => ingestSpan(runSpan, db, authority, "metrics", req)))
+			if (url.pathname === "/local/query")
+				return respond(await admitted(gate, () => querySpan(runSpan, db, authority, req)))
+			if (url.pathname === "/local/checkpoint/backup")
+				return respond(await admitted(gate, () => handleCheckpointBackup(db, maintenanceToken, req)))
+			if (url.pathname === "/local/retention/retire")
+				return respond(await handleRetirement(db, authority, gate, maintenanceToken, req))
 		}
 		if (req.method === "GET" && options.assets) return respond(serveAsset(options.assets, url.pathname))
 		return respond(text("not found", 404))
@@ -406,17 +684,34 @@ export const startServer = (
 	options: ServerOptions,
 ): Effect.Effect<{ readonly port: number }, ChdbError | ServerBindError, Scope.Scope> =>
 	Effect.gen(function* () {
+		const retention = yield* Effect.try({
+			try: () => {
+				const existing = readRawTelemetryRetentionDays(options.dataDir)
+				const requested = options.minimumRawTelemetryRetentionDays
+				if (requested !== undefined) rawTelemetryTtlStatements(requested)
+				if (existing !== undefined && requested !== undefined && requested < existing)
+					throw new Error(
+						`refusing to shorten persistent raw telemetry retention from ${existing} to ${requested} days`,
+					)
+				return { existing, requested, effective: requested ?? existing }
+			},
+			catch: (error) =>
+				new ChdbError({
+					message: `failed to load persistent raw telemetry retention: ${error instanceof Error ? error.message : String(error)}`,
+				}),
+		})
 		const db = yield* acquireChdb({
 			dataDir: options.dataDir,
 			schemaSql: LOCAL_SCHEMA_SQL,
 			configFile: options.configFile,
+			rawTelemetryRetentionDays: retention.effective,
 		})
 		// `CREATE ... IF NOT EXISTS` does not repair a table whose physical
 		// definition was altered out of band. Inspect the opened store before the
 		// listener is bound; a mismatch fails startup rather than allowing new
 		// query code to run against a partially old layout.
 		yield* Effect.try({
-			try: () => assertCurrentPhysicalSchema(db),
+			try: () => assertCurrentPhysicalSchema(db, retention.effective),
 			catch: (error) =>
 				new ChdbError({
 					message: `local physical-schema verification failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -438,6 +733,38 @@ export const startServer = (
 					message: `could not durably record local-store identity: ${error instanceof Error ? error.message : String(error)}`,
 				}),
 		})
+		// The ALTER statements have now been accepted by the running database.
+		// Only after that validation succeeds does a requested value become the
+		// durable configuration used by subsequent launches.
+		if (retention.requested !== undefined)
+			yield* Effect.tryPromise({
+				try: () => configureRawTelemetryRetentionDays(options.dataDir, retention.requested!),
+				catch: (error) =>
+					new ChdbError({
+						message: `failed to persist raw telemetry retention: ${error instanceof Error ? error.message : String(error)}`,
+					}),
+			})
+		const authority = yield* Effect.try({
+			try: () => {
+				const loaded = new RetiredDayAuthority(options.dataDir)
+				// Checkpoint restore may have resurrected retired rows. Replay before
+				// the listener is bound, so no restored representation is observable.
+				loaded.replay(db)
+				return loaded
+			},
+			catch: (error) =>
+				new ChdbError({
+					message: `failed to enforce retired-day authority: ${error instanceof Error ? error.message : String(error)}`,
+				}),
+		})
+		const maintenanceToken = yield* Effect.tryPromise({
+			try: () => ensureMaintenanceToken(options.dataDir),
+			catch: (error) =>
+				new ChdbError({
+					message: `failed to load maintenance token: ${error instanceof Error ? error.message : String(error)}`,
+				}),
+		})
+		const gate = new RequestQuiescenceGate()
 		// A dedicated runtime carrying the OTel tracer for per-request spans: the
 		// Bun.serve handler runs outside Effect, so each request's span effect is
 		// run through this runtime. Disposed on scope close, which flushes any
@@ -453,7 +780,7 @@ export const startServer = (
 					Bun.serve({
 						port: options.port,
 						hostname: options.hostname,
-						fetch: makeFetch(db, options, runSpan),
+						fetch: makeFetch(db, options, runSpan, authority, gate, maintenanceToken),
 					}),
 				catch: (error) =>
 					new ServerBindError({

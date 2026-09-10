@@ -1,3 +1,4 @@
+// TEST-SEAM: This focused test replaces process-global modules that have no instance-level injection seam.
 import { assert, describe, it } from "@effect/vitest"
 import { vi } from "vitest"
 
@@ -5,7 +6,11 @@ import { vi } from "vitest"
 // doesn't spin up the ManagedRuntime / atom-registry side effects.
 vi.mock("@/lib/registry", async () => {
 	const { Layer } = await import("effect")
-	return { mapleRuntime: {}, mapleApiClientLayer: Layer.empty }
+	return {
+		mapleRuntime: {},
+		mapleApiClientLayer: Layer.empty,
+		appMemoMap: Layer.makeMemoMapUnsafe(),
+	}
 })
 
 import {

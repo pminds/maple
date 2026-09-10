@@ -1,12 +1,18 @@
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Result, Schema } from "effect"
+import { Effect, Predicate, Result, Schema } from "effect"
+import { MapleApiV2 } from "./api"
 import { V2AlertDestinationCreateParams } from "./alert-destinations"
 import { V2AlertIncident } from "./alert-incidents"
 import { V2AlertRule, V2AlertRuleMutationResponse } from "./alert-rules"
 import { V2ApiKey, V2ApiKeyMutationResponse, V2ApiKeyWithSecret } from "./api-keys"
 import { V2DashboardMutation } from "./dashboards"
 import { V2ErrorIssue, V2ErrorIssueDetail } from "./error-issues"
-import { requiredScopeForRequest, scopeAllows, V2Scope } from "./auth"
+import { AuthorizationV2, requiredScopeForRoute, scopeAllows, V2Scope } from "./auth"
+import {
+	V2PlanetScaleIntegration,
+	V2PlanetScaleMetricsTokenRequest,
+	V2PlanetScaleScrapeTarget,
+} from "./integrations-planetscale"
 import {
 	decodeOffsetCursor,
 	encodeOffsetCursor,
@@ -16,7 +22,7 @@ import {
 	paginateOffsetQuery,
 	Timestamp,
 } from "./envelopes"
-import { notFound, permissionError, rateLimited, V2NotFoundError, V2RateLimitError } from "./errors"
+import { defineV2Error, V2InsufficientScope, V2RateLimited } from "./errors"
 import { encodePublicId } from "./public-id"
 import {
 	LogPublicId,
@@ -26,6 +32,66 @@ import {
 } from "./telemetry"
 
 const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e"
+
+describe("V2PlanetScaleIntegration wire format", () => {
+	it("decodes snake_case fields, ISO timestamps, and a scrp_ public ID", () => {
+		const status = Schema.decodeUnknownSync(V2PlanetScaleIntegration)({
+			object: "planetscale_integration",
+			connected: true,
+			pending_org_selection: false,
+			organization: "acme",
+			connected_by_user_id: "user_123",
+			detected_permissions: { readMetricsEndpoints: true },
+			metrics_auth: "service_token",
+			scrape_target: {
+				id: encodePublicId("scrp", UUID),
+				object: "planetscale_integration.scrape_target",
+				enabled: true,
+				scrape_interval_seconds: 60,
+				include_branches: ["main"],
+				exclude_branches: ["pr-*"],
+				last_scrape_at: "2026-08-05T12:00:00.000Z",
+				last_scrape_error: null,
+			},
+			last_inventory_at: "2026-08-05T12:00:00.000Z",
+			last_inventory_error: null,
+			revoked_at: null,
+			expires_at: null,
+		})
+		expect(status.scrape_target?.id).toBe(UUID) // decoded to the internal ID
+		expect(status.metrics_auth).toBe("service_token")
+	})
+
+	it("rejects a scrape target ID carrying the wrong prefix", () => {
+		expect(() =>
+			Schema.decodeUnknownSync(V2PlanetScaleScrapeTarget)({
+				id: encodePublicId("key", UUID),
+				object: "planetscale_integration.scrape_target",
+				enabled: true,
+				scrape_interval_seconds: 60,
+				include_branches: [],
+				exclude_branches: [],
+				last_scrape_at: null,
+				last_scrape_error: null,
+			}),
+		).toThrow()
+	})
+
+	it("requires a non-empty token id and secret", () => {
+		expect(() =>
+			Schema.decodeUnknownSync(V2PlanetScaleMetricsTokenRequest)({
+				token_id: "",
+				token_secret: "pscale_tkn_x",
+			}),
+		).toThrow()
+		expect(
+			Schema.decodeUnknownSync(V2PlanetScaleMetricsTokenRequest)({
+				token_id: "tok_1",
+				token_secret: "pscale_tkn_x",
+			}).token_id,
+		).toBe("tok_1")
+	})
+})
 
 describe("V2ApiKey wire format", () => {
 	it("encodes snake_case fields, an object type, and a key_ public ID", () => {
@@ -132,9 +198,16 @@ describe("V2ErrorIssue wire format", () => {
 		last_seen_at: "2026-07-15T01:00:00.000Z",
 		occurrence_count: 12,
 		resolved_at: null,
+		last_resolved_at: null,
+		last_regressed_at: null,
+		regression_count: 0,
+		resolved_versions: [],
 		snooze_until: null,
 		archived_at: null,
 		has_open_incident: true,
+		comment_count: 3,
+		open_pull_request_count: 1,
+		merged_pull_request_count: 0,
 	}
 
 	it("encodes the resource with snake_case fields and an iss_ public ID", () => {
@@ -161,8 +234,10 @@ describe("V2ErrorIssue wire format", () => {
 				},
 			],
 			incidents: [],
+			environments: [{ name: "production", count: 4 }],
 		})
 		expect(detail.timeseries[0]?.count).toBe(4)
+		expect(detail.environments[0]?.name).toBe("production")
 		expect(detail.sample_traces[0]?.trace_id).toBe("0123456789abcdef0123456789abcdef")
 	})
 })
@@ -183,9 +258,13 @@ describe("V2Dashboard wire format", () => {
 			widgets: [
 				{
 					id: "widget-1",
-					visualization: "line",
+					visualization: "chart",
+					// A `route` arm: the only kind that still carries an opaque params
+					// bag in v3, and therefore the only one that exercises the recursive
+					// snake_case wire convention asserted below.
 					data_source: {
-						endpoint: "queryBuilderTimeseries",
+						kind: "route",
+						endpoint: "service_overview",
 						params: { start_time: "now-1h", nested_filter: { attribute_key: "service.name" } },
 						transform: { field_map: { value: "requests" } },
 					},
@@ -195,6 +274,18 @@ describe("V2Dashboard wire format", () => {
 						list_root_only: true,
 					},
 					layout: { x: 0, y: 0, w: 6, h: 4, min_w: 2 },
+					section_id: "section-1",
+					tab_id: "tab-1",
+				},
+			],
+			// Required with a possibly-empty value, like `tags` and `variables`: the
+			// server always emits it, `[]` meaning the dashboard is one flat canvas.
+			sections: [
+				{
+					id: "section-1",
+					title: "Overview",
+					collapsed: true,
+					tabs: [{ id: "tab-1", title: "Latency" }],
 				},
 			],
 			variables: [
@@ -217,7 +308,9 @@ describe("V2Dashboard wire format", () => {
 		expect(decoded.timeRange.type).toBe("absolute")
 		expect(decoded.refreshIntervalSeconds).toBeNull()
 		expect(decoded.widgets[0]?.dataSource.transform?.fieldMap).toEqual({ value: "requests" })
-		expect(decoded.widgets[0]?.dataSource.params).toEqual({
+		const decodedSource = decoded.widgets[0]?.dataSource
+		if (decodedSource?.kind !== "route") throw new Error("expected a route data source")
+		expect(decodedSource.params).toEqual({
 			startTime: "now-1h",
 			nestedFilter: { attributeKey: "service.name" },
 		})
@@ -226,8 +319,21 @@ describe("V2Dashboard wire format", () => {
 		expect(wire.id).toMatch(/^dash_/)
 		expect(wire.time_range).toHaveProperty("start_time")
 		expect(wire.widgets[0]?.data_source.transform).toHaveProperty("field_map")
-		expect(wire.widgets[0]?.data_source.params).toHaveProperty("nested_filter.attribute_key")
+		const wireSource = wire.widgets[0]?.data_source
+		if (wireSource === undefined || !("params" in wireSource)) {
+			throw new Error("expected a route data source on the wire")
+		}
+		expect(wireSource.params).toHaveProperty("nested_filter.attribute_key")
 		expect(wire.widgets[0]?.layout).toHaveProperty("min_w")
+		// Section membership snake_cases; `tabs` is already single-word throughout.
+		expect(wire.widgets[0]).toHaveProperty("section_id", "section-1")
+		expect(wire.widgets[0]).toHaveProperty("tab_id", "tab-1")
+		expect(wire.sections[0]).toEqual({
+			id: "section-1",
+			title: "Overview",
+			collapsed: true,
+			tabs: [{ id: "tab-1", title: "Latency" }],
+		})
 		expect(wire.variables[0]).toHaveProperty("include_all")
 		const variable = wire.variables[0]
 		if (variable?.type !== "query") throw new Error("Expected a query dashboard variable")
@@ -347,6 +453,10 @@ describe("V2 alerts wire format", () => {
 			first_triggered_at: "2026-07-15T09:10:00.000Z",
 			last_triggered_at: "2026-07-15T09:40:00.000Z",
 			resolved_at: null,
+			last_resolved_at: null,
+			last_regressed_at: null,
+			regression_count: 0,
+			resolved_versions: [],
 			last_observed_value: 0.09,
 			last_sample_count: 132,
 			dedupe_key: "rule:__total__",
@@ -365,37 +475,78 @@ describe("V2 alerts wire format", () => {
 })
 
 describe("v2 error envelope", () => {
-	it("encodes exactly the Stripe envelope with no _tag", () => {
-		const error = notFound("No such api_key", "id")
-		const wire = Schema.encodeSync(V2NotFoundError)(error) as Record<string, unknown>
+	const TestNotFound = defineV2Error({
+		tag: "@maple/http/v2/TestNotFoundError",
+		status: 404,
+		code: "resource_missing",
+		title: "Not found",
+		message: "The resource does not exist.",
+		retry: "never",
+		recovery: "none",
+		identifier: "TestNotFoundError",
+	})
+
+	it("exposes the public message to Effect and telemetry without changing the wire shape", () => {
+		const error = TestNotFound.make("No such api_key", { param: "id" })
+		expect(error._tag).toBe("@maple/http/v2/TestNotFoundError")
+		expect(error.message).toBe("No such api_key")
+		expect(String(error)).toContain("No such api_key")
+	})
+
+	it("encodes the semantic tag and recovery contract inside the public envelope", () => {
+		const error = TestNotFound.make("No such api_key", { param: "id" })
+		const wire = Schema.encodeSync(TestNotFound.schema)(error) as Record<string, unknown>
 		expect(wire).toEqual({
 			error: {
+				_tag: "@maple/http/v2/TestNotFoundError",
 				type: "not_found_error",
 				code: "resource_missing",
+				title: "Not found",
 				message: "No such api_key",
+				retryable: false,
+				recovery: "none",
 				param: "id",
 			},
 		})
+		// `_tag` is part of the nested public contract, not an Effect class tag
+		// injected at the outer envelope level.
 		expect("_tag" in wire).toBe(false)
 	})
 
+	it("requires a semantic tag on every public error", () => {
+		expect(() =>
+			Schema.decodeUnknownSync(TestNotFound.schema)({
+				error: {
+					type: "not_found_error",
+					code: "resource_missing",
+					message: "gone",
+				},
+			}),
+		).toThrow()
+	})
+
 	it("omits param when not provided", () => {
-		const wire = Schema.encodeSync(V2NotFoundError)(notFound("gone")) as {
-			error: Record<string, unknown>
-		}
+		const wire = Schema.encodeSync(TestNotFound.schema)(TestNotFound.make("gone"))
 		expect("param" in wire.error).toBe(false)
 	})
 
-	it("permissionError has type permission_error", () => {
-		expect(permissionError("insufficient_scope", "nope").error.type).toBe("permission_error")
+	it("permission errors carry their declared category", () => {
+		expect(V2InsufficientScope.make("nope").error.type).toBe("permission_error")
 	})
 
 	it("rateLimited has the stable public 429 envelope", () => {
-		expect(Schema.encodeSync(V2RateLimitError)(rateLimited())).toEqual({
+		expect(
+			Schema.encodeSync(V2RateLimited.schema)(V2RateLimited.make(undefined, { retryAfterSeconds: 60 })),
+		).toEqual({
 			error: {
+				_tag: "@maple/http/v2/RateLimitError",
 				type: "rate_limit_error",
 				code: "rate_limited",
-				message: "Too many requests. Retry after 60 seconds.",
+				title: "Too many requests",
+				message: "Too many requests. Retry after the interval in the Retry-After header.",
+				retryable: true,
+				recovery: "retry",
+				retry_after_seconds: 60,
 			},
 		})
 	})
@@ -414,36 +565,36 @@ describe("scopes", () => {
 	})
 
 	it("derives the required scope from method + path", () => {
-		expect(requiredScopeForRequest("GET", "/v2/api_keys")).toEqual({
+		expect(requiredScopeForRoute("GET", "/v2/api_keys")).toEqual({
 			family: "api_keys",
 			access: "read",
 		})
-		expect(requiredScopeForRequest("GET", "/v2/api_keys/key_abc")).toEqual({
+		expect(requiredScopeForRoute("GET", "/v2/api_keys/key_abc")).toEqual({
 			family: "api_keys",
 			access: "read",
 		})
-		expect(requiredScopeForRequest("POST", "/v2/api_keys/key_abc/roll")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/api_keys/key_abc/roll")).toEqual({
 			family: "api_keys",
 			access: "write",
 		})
-		expect(requiredScopeForRequest("DELETE", "/v2/api_keys/key_abc")).toEqual({
+		expect(requiredScopeForRoute("DELETE", "/v2/api_keys/key_abc")).toEqual({
 			family: "api_keys",
 			access: "write",
 		})
 		// Namespaced groups share one family: the first path segment under /v2.
-		expect(requiredScopeForRequest("GET", "/v2/alerts/rules")).toEqual({
+		expect(requiredScopeForRoute("GET", "/v2/alerts/rules")).toEqual({
 			family: "alerts",
 			access: "read",
 		})
-		expect(requiredScopeForRequest("POST", "/v2/alerts/destinations/dest_abc/test")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/alerts/destinations/dest_abc/test")).toEqual({
 			family: "alerts",
 			access: "write",
 		})
-		expect(requiredScopeForRequest("POST", "/v2/session_replays/search")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/session_replays/search")).toEqual({
 			family: "session_replays",
 			access: "read",
 		})
-		expect(requiredScopeForRequest("POST", "/v2/session_replays/for_trace")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/session_replays/for_trace")).toEqual({
 			family: "session_replays",
 			access: "read",
 		})
@@ -457,9 +608,89 @@ describe("scopes", () => {
 			["/v2/metrics/timeseries", "metrics"],
 			["/v2/metrics/breakdown", "metrics"],
 		] as const) {
-			expect(requiredScopeForRequest("POST", path)).toEqual({ family, access: "read" })
+			expect(requiredScopeForRoute("POST", path)).toEqual({ family, access: "read" })
 		}
-		expect(requiredScopeForRequest("GET", "/api/api-keys")).toBeNull()
+		// Every /v2/integrations/<provider> group shares one family, and the two
+		// PlanetScale proxies are POSTs only because their filters need a body.
+		expect(requiredScopeForRoute("GET", "/v2/integrations/planetscale")).toEqual({
+			family: "integrations",
+			access: "read",
+		})
+		expect(requiredScopeForRoute("POST", "/v2/integrations/planetscale/metrics_token")).toEqual({
+			family: "integrations",
+			access: "write",
+		})
+		expect(requiredScopeForRoute("DELETE", "/v2/integrations/planetscale")).toEqual({
+			family: "integrations",
+			access: "write",
+		})
+		for (const path of [
+			"/v2/integrations/planetscale/query_insights",
+			"/v2/integrations/planetscale/events",
+		]) {
+			expect(requiredScopeForRoute("POST", path)).toEqual({
+				family: "integrations",
+				access: "read",
+			})
+		}
+		expect(requiredScopeForRoute("GET", "/api/api-keys")).toBeNull()
+	})
+
+	// The derivation only ever sees the router's matched route template, and it
+	// classifies path parameters exactly like a concrete id.
+	it("derives the scope from a route template with path parameters", () => {
+		expect(requiredScopeForRoute("GET", "/v2/api_keys/:keyId")).toEqual({
+			family: "api_keys",
+			access: "read",
+		})
+		expect(requiredScopeForRoute("POST", "/v2/api_keys/:keyId/roll")).toEqual({
+			family: "api_keys",
+			access: "write",
+		})
+		expect(requiredScopeForRoute("POST", "/v2/dashboards/templates/:templateId/preview")).toEqual({
+			family: "dashboards",
+			access: "read",
+		})
+	})
+
+	// The fail-closed half of the contract: a scope-protected route the
+	// derivation cannot classify is a 500, so every declared one must classify.
+	it("classifies every scope-protected v2 route template", () => {
+		let checked = 0
+		for (const group of Object.values(MapleApiV2.groups)) {
+			for (const endpoint of Object.values(group.endpoints)) {
+				const scoped = Array.from(endpoint.middlewares).some(
+					(middleware) =>
+						Predicate.hasProperty(middleware, "key") &&
+						Predicate.isString(middleware.key) &&
+						middleware.key === AuthorizationV2.key,
+				)
+				if (!scoped) continue
+				checked += 1
+				expect(
+					requiredScopeForRoute(endpoint.method, endpoint.path),
+					`${endpoint.method} ${endpoint.path}`,
+				).not.toBeNull()
+			}
+		}
+		expect(checked).toBeGreaterThan(50)
+	})
+
+	// These are the shapes the router normalizes away before matching. They must
+	// stay unclassifiable so the caller fails closed instead of skipping the
+	// check — see the enforcement test in apps/api/src/routes/v2.
+	it("refuses to classify non-canonical paths", () => {
+		for (const path of [
+			"/V2/api_keys",
+			"/v2/API_KEYS",
+			"/v2/%61pi_keys",
+			"/v2//api_keys",
+			"/v2/api_keys;x",
+			"/v2/",
+			"/v2",
+		]) {
+			expect(requiredScopeForRoute("POST", path)).toBeNull()
+		}
 	})
 
 	it("enforces the scope matrix", () => {
@@ -478,11 +709,11 @@ describe("scopes", () => {
 	})
 
 	it("treats alert preview as a read-only POST", () => {
-		expect(requiredScopeForRequest("POST", "/v2/alerts/rules/preview")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/alerts/rules/preview")).toEqual({
 			family: "alerts",
 			access: "read",
 		})
-		expect(requiredScopeForRequest("POST", "/v2/alerts/rules/test")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/alerts/rules/test")).toEqual({
 			family: "alerts",
 			access: "write",
 		})
@@ -491,16 +722,16 @@ describe("scopes", () => {
 	// Template preview builds the dashboard without saving it, so a read key
 	// must reach it; instantiate right next to it must not.
 	it("treats template preview as a read-only POST but instantiate as a write", () => {
-		expect(requiredScopeForRequest("POST", "/v2/dashboards/templates/dtpl_abc/preview")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/dashboards/templates/dtpl_abc/preview")).toEqual({
 			family: "dashboards",
 			access: "read",
 		})
-		expect(requiredScopeForRequest("POST", "/v2/dashboards/templates/dtpl_abc/instantiate")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/dashboards/templates/dtpl_abc/instantiate")).toEqual({
 			family: "dashboards",
 			access: "write",
 		})
 		// The pattern must not open up nested or lookalike paths.
-		expect(requiredScopeForRequest("POST", "/v2/dashboards/templates/dtpl_abc/preview/apply")).toEqual({
+		expect(requiredScopeForRoute("POST", "/v2/dashboards/templates/dtpl_abc/preview/apply")).toEqual({
 			family: "dashboards",
 			access: "write",
 		})

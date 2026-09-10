@@ -1,7 +1,7 @@
 import { Effect, Option } from "effect"
 import * as CH from "@maple/query-engine/ch"
 import type { TenantContext } from "@/services/auth/AuthService"
-import type { WarehouseQueryServiceShape } from "@/services/warehouse/WarehouseQueryService"
+import type { WarehouseQueryServiceApi } from "@/services/warehouse/WarehouseQueryService"
 
 import { formatWarehouseDateTime } from "@maple/query-engine"
 /**
@@ -22,7 +22,7 @@ import { formatWarehouseDateTime } from "@maple/query-engine"
  * is recoverable on the next tick; resolving a live incident is not.
  *
  * The verdict maths is pure and lives at the bottom of this file (mirroring the
- * split in services/anomaly/state-machine.ts) so the interesting decisions are
+ * split in services/alerts/incident-hysteresis.ts) so the interesting decisions are
  * testable without standing up a warehouse.
  */
 
@@ -77,13 +77,23 @@ export type ServiceWindowPair = readonly [
  * dependency legible, and it keeps `WarehouseQueryService` out of the R channel
  * of callers that already resolved the service inside their own closure.
  */
-export type LivenessWarehouse = Pick<WarehouseQueryServiceShape, "compiledQuery" | "compiledQueryFirst">
+export type LivenessWarehouse = Pick<
+	WarehouseQueryServiceApi,
+	"compiledQuery" | "compiledQueryFirst" | "warmRoute"
+>
 
 export interface LivenessProbeInput {
 	readonly warehouse: LivenessWarehouse
 	readonly tenant: TenantContext
 	/** Services the subject is scoped to. Empty probes the org as a whole. */
 	readonly serviceNames: ReadonlyArray<string>
+	/**
+	 * Deployment environments the alert is scoped to. Empty means unscoped.
+	 * Only honoured on the per-service path: without it, staging traffic for
+	 * the same service satisfies the probe while production is dark — exactly
+	 * the gap the probe exists to veto.
+	 */
+	readonly environments: ReadonlyArray<string>
 	/** The quiet window being interpreted as recovery. */
 	readonly windowStartMs: number
 	readonly windowEndMs: number
@@ -91,10 +101,6 @@ export interface LivenessProbeInput {
 	readonly baselineStartMs: number
 	readonly baselineEndMs: number
 }
-
-// ---------------------------------------------------------------------------
-// I/O
-// ---------------------------------------------------------------------------
 
 const EMPTY_TOTALS: ServiceWindowTotals = { spanCount: 0, estimatedSpanCount: 0 }
 
@@ -108,19 +114,24 @@ const probeServiceWindow = (
 	warehouse: LivenessWarehouse,
 	tenant: TenantContext,
 	serviceName: string,
+	deploymentEnv: string | null,
 	startMs: number,
 	endMs: number,
 ): Effect.Effect<ServiceWindowTotals | null, never> =>
 	Effect.gen(function* () {
+		const scopedEnv = Option.fromNullOr(deploymentEnv)
 		const compiled = CH.compile(
-			CH.serviceLivenessQuery(),
+			CH.serviceLivenessQuery(Option.isSome(scopedEnv) ? { scopeToEnvironment: true } : {}),
 			{
 				orgId: tenant.orgId,
 				serviceName,
+				...Option.match(scopedEnv, {
+					onNone: () => ({}),
+					onSome: (deploymentEnv) => ({ deploymentEnv }),
+				}),
 				startTime: formatWarehouseDateTime(startMs),
 				endTime: formatWarehouseDateTime(endMs),
 			},
-			{ rowSchema: CH.serviceLivenessRowSchema },
 		)
 		const row = yield* warehouse.compiledQueryFirst(tenant, compiled, {
 			profile: "list",
@@ -141,15 +152,11 @@ const probeOrgWindow = (
 	endMs: number,
 ): Effect.Effect<number | null, never> =>
 	Effect.gen(function* () {
-		const compiled = CH.compileUnion(
-			CH.orgTelemetryPulseQuery(),
-			{
-				orgId: tenant.orgId,
-				startTime: formatWarehouseDateTime(startMs),
-				endTime: formatWarehouseDateTime(endMs),
-			},
-			{ rowSchema: CH.telemetryPulseRowSchema },
-		)
+		const compiled = CH.compileUnion(CH.orgTelemetryPulseQuery(), {
+			orgId: tenant.orgId,
+			startTime: formatWarehouseDateTime(startMs),
+			endTime: formatWarehouseDateTime(endMs),
+		})
 		const rows = yield* warehouse.compiledQuery(tenant, compiled, {
 			profile: "list",
 			context: "telemetryLivenessPulse",
@@ -167,6 +174,11 @@ export const probeLiveness: (input: LivenessProbeInput) => Effect.Effect<Livenes
 	const { warehouse, tenant, serviceNames } = input
 	const { windowStartMs, windowEndMs, baselineStartMs, baselineEndMs } = input
 
+	// Both branches fan out (the service branch to 4×2 concurrent probes), so warm
+	// the route once up front rather than letting the first wave race for it.
+	// `warmRoute` never fails, which keeps this probe's `never` error channel.
+	yield* warehouse.warmRoute(tenant)
+
 	const result =
 		serviceNames.length === 0
 			? verdictForOrgTotals(
@@ -179,15 +191,33 @@ export const probeLiveness: (input: LivenessProbeInput) => Effect.Effect<Livenes
 					)),
 				)
 			: verdictForServiceTotals(
+					// One pair per (service, environment): `verdictForServiceTotals`
+					// already vetoes when ANY baseline-active pair goes dark, so an
+					// env-scoped rule cannot have a production gap papered over by
+					// staging traffic on the same service.
 					yield* Effect.forEach(
-						serviceNames,
-						(serviceName): Effect.Effect<ServiceWindowPair, never> =>
+						serviceNames.flatMap(
+							(
+								serviceName,
+							): ReadonlyArray<{
+								readonly serviceName: string
+								readonly deploymentEnv: string | null
+							}> =>
+								input.environments.length === 0
+									? [{ serviceName, deploymentEnv: null }]
+									: input.environments.map((deploymentEnv) => ({
+											serviceName,
+											deploymentEnv,
+										})),
+						),
+						({ serviceName, deploymentEnv }): Effect.Effect<ServiceWindowPair, never> =>
 							Effect.all(
 								[
 									probeServiceWindow(
 										warehouse,
 										tenant,
 										serviceName,
+										deploymentEnv,
 										windowStartMs,
 										windowEndMs,
 									),
@@ -195,6 +225,7 @@ export const probeLiveness: (input: LivenessProbeInput) => Effect.Effect<Livenes
 										warehouse,
 										tenant,
 										serviceName,
+										deploymentEnv,
 										baselineStartMs,
 										baselineEndMs,
 									),
@@ -210,16 +241,16 @@ export const probeLiveness: (input: LivenessProbeInput) => Effect.Effect<Livenes
 		"maple.liveness.reason": result.reason,
 		"maple.liveness.observed_count": result.observedCount,
 		"maple.liveness.baseline_count": result.baselineCount,
-		...(result.ratio != null ? { "maple.liveness.volume_ratio": result.ratio } : {}),
-		...(result.samplingDelta != null ? { "maple.liveness.sampling_delta": result.samplingDelta } : {}),
+		...(result.ratio != null ? { "maple.liveness.volume_ratio": result.ratio } : undefined),
+		...(result.samplingDelta != null
+			? { "maple.liveness.sampling_delta": result.samplingDelta }
+			: undefined),
 	})
 
 	return result
 })
 
-// ---------------------------------------------------------------------------
 // Pure verdict logic
-// ---------------------------------------------------------------------------
 
 const verdict = (
 	dataFlowing: boolean,

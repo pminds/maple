@@ -58,8 +58,8 @@ fields the message doesn't show.
    correlated failure patterns.
 4. Use compare_periods or service_map when you suspect a regression or an
    upstream/downstream cause.
-5. When telemetry exposes `vcs.repository.url.full`, `deployment.commit_sha`,
-   or `vcs.ref.head.revision`, use the connected-source tools to test
+5. When telemetry exposes `vcs.repository.url.full` or `vcs.ref.head.revision`,
+   use the connected-source tools to test
    code-level hypotheses: list_source_repositories only when the repo is
    ambiguous, search_source_code with exact observed symbols/messages, then
    read_source_file at the deployed revision. Code that merely looks suspicious
@@ -85,8 +85,11 @@ act in 15 seconds. Target shape, roughly 6 lines:
   never invented, linked to their Maple detail pages.
 - One line for the first action to take, if it's clear.
 
-Say "cause unknown" plainly when it's inconclusive, and claim high confidence
-only when independent signals agree.
+Say "cause unknown" plainly when it's inconclusive — but never on its own. An
+unknown with nothing behind it reads identically to not having looked, so name
+at least two causes you actually checked and the evidence that eliminated each,
+and drop your confidence to match. Claim high confidence only when independent
+signals agree.
 
 Hold everything else — the full timeline, the hypotheses you ruled out, the
 secondary evidence — and close with a short offer to expand. Do NOT emit

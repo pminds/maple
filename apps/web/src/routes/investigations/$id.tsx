@@ -1,23 +1,40 @@
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router"
-import { Exit, Option, Schema } from "effect"
-import { Result, useAtomRefresh, useAtomSet, useAtomValue } from "@/lib/effect-atom"
+import type { ReactNode } from "react"
+import { createFileRoute, Link } from "@tanstack/react-router"
+import { Option, Schema } from "effect"
 
-import { decodeInvestigationRef } from "@/components/chat/investigation-context"
+import { INVESTIGATION_TABS } from "@/components/investigations/investigation-tabs"
+import { ProvenanceCanvasLoading } from "@/components/investigations/flow/provenance-loading"
 import { InvestigationView } from "@/components/investigations/investigation-view"
 import { ErrorState } from "@/components/common/error-state"
 import { DashboardLayout } from "@/components/layout/dashboard-layout"
-import { useMountEffect } from "@/hooks/use-mount-effect"
-import { useIntervalRefresh } from "@/hooks/use-interval-refresh"
-import { MapleApiV2AtomClient } from "@/lib/services/common/v2-atom-client"
+import { useInvestigation } from "@/hooks/use-investigation"
+import { retryOrgCollections } from "@/lib/collections/org-collections"
 import { Button } from "@maple/ui/components/ui/button"
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@maple/ui/components/ui/empty"
 import { Skeleton } from "@maple/ui/components/ui/skeleton"
 import { InvestigationId } from "@maple/domain/http"
-import { useState } from "react"
 
 const SearchSchema = Schema.Struct({
-	/** One-release redirect shim for legacy encoded resource URLs. */
-	r: Schema.optional(Schema.String),
+	/**
+	 * The open tab. Absent means Overview, so the canonical URL for an
+	 * investigation stays clean and a link to Evidence survives a reload.
+	 */
+	tab: Schema.optional(Schema.Literals(INVESTIGATION_TABS)),
+	/**
+	 * The open proposed-action detail, by index into the report's actions, so the
+	 * panel is linkable and survives a reload.
+	 *
+	 * Written as a number by `navigate`, which the router serialises as JSON — so
+	 * the address bar reads `?action=1`. Typing it as `Schema.String` instead put
+	 * `?action=%221%22` in the URL, which round-trips but is not a link anyone
+	 * would write by hand.
+	 *
+	 * `Unknown` rather than `Number` because `validateSearch` is a throwing
+	 * boundary: `?action=abc` against a number schema takes down the whole route
+	 * behind an error boundary, and a mangled query string should cost the panel,
+	 * not the investigation. The view narrows it.
+	 */
+	action: Schema.optional(Schema.Unknown),
 })
 
 export const Route = createFileRoute("/investigations/$id")({
@@ -29,227 +46,132 @@ const decodeInvestigationId = Schema.decodeUnknownOption(InvestigationId)
 
 function InvestigationPage() {
 	const { id: rawId } = Route.useParams()
-	const { r } = Route.useSearch()
-	// `InvestigationId` is a branded UUID. Decoding it with the throwing variant
-	// took down the whole route on any other shape — including the legacy encoded
-	// ids the `?r=` migration below exists to rescue, which made that path
-	// unreachable.
+	const { tab, action } = Route.useSearch()
+	// A malformed branded UUID is a normal not-found result, not a route error.
 	const decoded = decodeInvestigationId(rawId)
-	if (Option.isNone(decoded)) {
-		const legacyRef = r ? decodeInvestigationRef(r) : undefined
-		return legacyRef ? <LegacyInvestigationRedirect legacyId={rawId} /> : <NotFoundShell />
-	}
-	return <InvestigationDetail id={decoded.value} legacyRef={r} rawId={rawId} />
+	if (Option.isNone(decoded)) return <NotFoundShell />
+	return <InvestigationDetail action={action} id={decoded.value} tab={tab} />
 }
 
+/**
+ * The page's data is an ElectricSQL shape, not a fetch.
+ *
+ * It used to poll `/v2/investigations/:id` every 3s while a run was in flight,
+ * which put a three-second floor under every transition the provenance canvas
+ * draws — a lane going `checking`, a progress note, the verdict landing. The two
+ * shapes (`investigations` + its lens lanes) are recombined into the same
+ * `V2Investigation` this view already took, so nothing below here changed.
+ */
 function InvestigationDetail({
+	action,
 	id,
-	legacyRef,
-	rawId,
+	tab,
 }: {
+	action: unknown
 	id: InvestigationId
-	legacyRef: string | undefined
-	rawId: string
+	tab: (typeof INVESTIGATION_TABS)[number] | undefined
 }) {
-	const query = MapleApiV2AtomClient.query("investigations", "retrieve", {
-		params: { id },
-		reactivityKeys: ["investigations", `investigation:${id}`],
-	})
-	const result = useAtomValue(query)
-	const refresh = useAtomRefresh(query)
-	const isInvestigating = Result.isSuccess(result) && result.value.status === "investigating"
-	useIntervalRefresh(refresh, { intervalMs: 3_000, enabled: isInvestigating })
+	const sync = useInvestigation(id)
 
-	return Result.builder(result)
-		.onInitial(() => <LoadingShell />)
-		.onError((error) => {
-			if (legacyRef && decodeInvestigationRef(legacyRef)) {
-				return <LegacyInvestigationRedirect legacyId={rawId} />
-			}
-			// Only a real "no such investigation" is a dead end. A dropped request or
-			// a restarting API is not, and telling someone their investigation is gone
-			// when it isn't sends them looking for a problem that doesn't exist.
-			return isNotFound(error) ? (
-				<NotFoundShell />
-			) : (
-				<LoadFailureShell error={error} onRetry={refresh} />
+	switch (sync.state) {
+		case "loading":
+			return <LoadingShell />
+		// The shape synced and this org has no such row. Unlike a dropped request,
+		// this IS a dead end — the sync is authoritative about what the org holds.
+		case "missing":
+			return <NotFoundShell />
+		// The stream gave up (or never loaded) — a transport problem, not a missing
+		// investigation. Telling someone their investigation is gone when it isn't
+		// sends them looking for a problem that doesn't exist, so this stays a retry.
+		case "failed":
+			return (
+				<LoadFailureShell
+					error={new Error("The live connection to this investigation was lost")}
+					onRetry={retryOrgCollections}
+				/>
 			)
-		})
-		.onSuccess((investigation) => <InvestigationView investigation={investigation} onRefresh={refresh} />)
-		.render()
-}
-
-/** The v2 API answers a missing investigation with a tagged not-found error. */
-const isNotFound = (error: unknown): boolean =>
-	typeof error === "object" &&
-	error !== null &&
-	"_tag" in error &&
-	typeof error._tag === "string" &&
-	error._tag.toLowerCase().includes("notfound")
-
-function LoadFailureShell({ error, onRetry }: { error: unknown; onRetry: () => void }) {
-	return (
-		<DashboardLayout.Root>
-			<DashboardLayout.Breadcrumbs
-				items={[{ label: "Investigations", href: "/investigations" }, { label: "Unavailable" }]}
-			/>
-			<DashboardLayout.Body>
-				<DashboardLayout.Content>
-					<DashboardLayout.Sticky>
-						<DashboardLayout.Header title="Investigation" />
-					</DashboardLayout.Sticky>
-					<DashboardLayout.Scroll>
-						<ErrorState
-							error={error}
-							title="This investigation could not be loaded"
-							onRetry={onRetry}
-						/>
-					</DashboardLayout.Scroll>
-				</DashboardLayout.Content>
-			</DashboardLayout.Body>
-		</DashboardLayout.Root>
-	)
-}
-
-function LegacyInvestigationRedirect({ legacyId }: { legacyId: string }) {
-	const navigate = useNavigate()
-	const create = useAtomSet(MapleApiV2AtomClient.mutation("investigations", "create"), {
-		mode: "promiseExit",
-	})
-	const [failed, setFailed] = useState(false)
-	const migrate = () => {
-		setFailed(false)
-		void create({
-			payload: {
-				subject: {
-					type: "freeform",
-					title: "Migrated investigation",
-					prompt: `Continue the legacy incident investigation for ${legacyId}.`,
-					context_refs: [{ legacy_id: legacyId }],
-				},
-				snapshot: {
-					title: "Migrated investigation",
-					scope: null,
-					status: "open",
-					severity: null,
-					facts: [{ label: "Legacy resource", value: legacyId }],
-					references: [],
-					incidentStartedAt: null,
-					incidentEndedAt: null,
-				},
-			},
-			reactivityKeys: ["investigations"],
-		}).then((result) => {
-			if (Exit.isSuccess(result)) {
-				void navigate({
-					to: "/investigations/$id",
-					params: { id: result.value.id },
-					replace: true,
-				})
-			} else {
-				setFailed(true)
-			}
-		})
+		case "ready":
+			return (
+				<InvestigationView
+					action={action}
+					investigation={sync.investigation}
+					tab={tab ?? "overview"}
+				/>
+			)
 	}
-	useMountEffect(migrate)
-	if (failed) {
-		return (
-			<MutationFailureShell
-				title="Investigation migration failed"
-				description="The legacy investigation could not be migrated."
-				onRetry={migrate}
-			/>
-		)
-	}
-	return <LoadingShell label="Migrating investigation…" />
 }
 
-function MutationFailureShell({
+/**
+ * Every non-success state wears the same chrome — breadcrumbs, a sticky header,
+ * a scrolling body — and four hand-copied versions of it drifted apart the moment
+ * anything about the shell changed. Only the trail label, the title and the body
+ * differ, so those are the parameters.
+ */
+function InvestigationShell({
+	trail,
 	title,
-	description,
-	onRetry,
+	children,
 }: {
+	trail: string
 	title: string
-	description: string
-	onRetry: () => void
+	children: ReactNode
 }) {
 	return (
 		<DashboardLayout.Root>
 			<DashboardLayout.Breadcrumbs
-				items={[{ label: "Investigations", href: "/investigations" }, { label: "Error" }]}
+				items={[{ label: "Investigations", href: "/investigations" }, { label: trail }]}
 			/>
 			<DashboardLayout.Body>
 				<DashboardLayout.Content>
 					<DashboardLayout.Sticky>
 						<DashboardLayout.Header title={title} />
 					</DashboardLayout.Sticky>
-					<DashboardLayout.Scroll>
-						<Empty>
-							<EmptyHeader>
-								<EmptyTitle>{title}</EmptyTitle>
-								<EmptyDescription>{description}</EmptyDescription>
-							</EmptyHeader>
-							<Button variant="outline" size="sm" onClick={onRetry}>
-								Try again
-							</Button>
-						</Empty>
-					</DashboardLayout.Scroll>
+					<DashboardLayout.Scroll>{children}</DashboardLayout.Scroll>
 				</DashboardLayout.Content>
 			</DashboardLayout.Body>
 		</DashboardLayout.Root>
 	)
 }
 
+function LoadFailureShell({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+	return (
+		<InvestigationShell trail="Unavailable" title="Investigation">
+			<ErrorState error={error} title="This investigation could not be loaded" onRetry={onRetry} />
+		</InvestigationShell>
+	)
+}
+
+/**
+ * The header rows are bars, but the canvas is not: it is the page's lead widget,
+ * and a grey block standing in for it told the reader nothing about what was
+ * coming. The ghost draws the chain it is about to be replaced by.
+ */
 function LoadingShell({ label = "Loading investigation…" }: { label?: string }) {
 	return (
-		<DashboardLayout.Root>
-			<DashboardLayout.Breadcrumbs
-				items={[{ label: "Investigations", href: "/investigations" }, { label: "…" }]}
-			/>
-			<DashboardLayout.Body>
-				<DashboardLayout.Content>
-					<DashboardLayout.Sticky>
-						<DashboardLayout.Header title={label} />
-					</DashboardLayout.Sticky>
-					<DashboardLayout.Scroll>
-						<div className="mx-auto w-full max-w-4xl space-y-4">
-							<Skeleton className="h-4 w-32" />
-							<Skeleton className="h-8 w-3/4" />
-							<Skeleton className="h-56 w-full" />
-						</div>
-					</DashboardLayout.Scroll>
-				</DashboardLayout.Content>
-			</DashboardLayout.Body>
-		</DashboardLayout.Root>
+		<InvestigationShell trail="…" title={label}>
+			<div className="mx-auto w-full max-w-4xl space-y-4">
+				<Skeleton className="h-4 w-32" />
+				<Skeleton className="h-8 w-3/4" />
+				<ProvenanceCanvasLoading />
+			</div>
+		</InvestigationShell>
 	)
 }
 
 function NotFoundShell() {
 	return (
-		<DashboardLayout.Root>
-			<DashboardLayout.Breadcrumbs
-				items={[{ label: "Investigations", href: "/investigations" }, { label: "Missing" }]}
-			/>
-			<DashboardLayout.Body>
-				<DashboardLayout.Content>
-					<DashboardLayout.Sticky>
-						<DashboardLayout.Header title="Investigation not found" />
-					</DashboardLayout.Sticky>
-					<DashboardLayout.Scroll>
-						<Empty>
-							<EmptyHeader>
-								<EmptyTitle>This investigation is unavailable</EmptyTitle>
-								<EmptyDescription>
-									It may have been removed, or it belongs to a different organization.
-								</EmptyDescription>
-							</EmptyHeader>
-							<Button variant="outline" size="sm" render={<Link to="/investigations" />}>
-								View investigations
-							</Button>
-						</Empty>
-					</DashboardLayout.Scroll>
-				</DashboardLayout.Content>
-			</DashboardLayout.Body>
-		</DashboardLayout.Root>
+		<InvestigationShell trail="Missing" title="Investigation not found">
+			<Empty>
+				<EmptyHeader>
+					<EmptyTitle>This investigation is unavailable</EmptyTitle>
+					<EmptyDescription>
+						It may have been removed, or it belongs to a different organization.
+					</EmptyDescription>
+				</EmptyHeader>
+				<Button variant="outline" size="sm" render={<Link to="/investigations" />}>
+					View investigations
+				</Button>
+			</Empty>
+		</InvestigationShell>
 	)
 }

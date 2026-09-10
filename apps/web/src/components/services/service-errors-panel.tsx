@@ -4,7 +4,7 @@ import { Skeleton } from "@maple/ui/components/ui/skeleton"
 
 import { SeverityBadge } from "@/components/errors/severity-badge"
 import { Result, useAtomValue } from "@/lib/effect-atom"
-import { MapleApiV2AtomClient } from "@/lib/services/common/v2-atom-client"
+import { retainedQueryV2 } from "@/lib/services/common/v2-atom-client"
 import { buildServiceOpenIssuesQuery, errorIssueFromV2 } from "@/lib/services/error-issues"
 import { formatNumber } from "@maple/ui/lib/format"
 import { SectionCard } from "./section-card"
@@ -27,7 +27,9 @@ function PanelFrame({ children, detailLimited }: { children: React.ReactNode; de
 					{detailLimited && (
 						<span className="text-[11px] text-muted-foreground">Latest 90 days</span>
 					)}
-					<Link to="/errors/issues" className="text-xs text-primary hover:underline">
+					{/* `/errors/issues` now 302s to `/errors` and rewrites the time range
+					    to 7d on the way through. Link to the hub directly. */}
+					<Link to="/errors" className="text-xs text-primary hover:underline">
 						View all →
 					</Link>
 				</div>
@@ -114,7 +116,7 @@ export function ServiceErrorsPanel({
 		? new Date(Date.parse(effectiveEndTime) - 90 * 24 * 60 * 60 * 1000).toISOString()
 		: effectiveStartTime
 	const result = useAtomValue(
-		MapleApiV2AtomClient.query("errorIssues", "list", {
+		retainedQueryV2("errorIssues", "list", {
 			query: buildServiceOpenIssuesQuery(serviceName, {
 				environment,
 				startTime: detailStartTime,

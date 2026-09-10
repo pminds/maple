@@ -24,13 +24,13 @@ import {
 	channelPickerView,
 	resolveSearchQuery,
 } from "@/components/alerts/slack-channel-search"
-import { MapleApiAtomClient } from "@/lib/services/common/atom-client"
-import { MapleApiV2AtomClient } from "@/lib/services/common/v2-atom-client"
-import { v2ErrorInfo } from "@/lib/error-messages"
+import { MapleApiAtomClient, retainedQuery } from "@/lib/services/common/atom-client"
+import { MapleApiV2AtomClient, retainedQueryV2 } from "@/lib/services/common/v2-atom-client"
+import { displayError, publicError } from "@/lib/error-messages"
 import { disabledResultAtom } from "@/lib/services/atoms/disabled-result-atom"
 import { Result, useAtomRefresh, useAtomSet, useAtomValue } from "@/lib/effect-atom"
 import type { HazelChannelsListResponse } from "@maple/domain/http"
-import type { V2SlackChannelList } from "@maple/domain/http/v2"
+import type { V2SlackChannelList, V2TelegramChat } from "@maple/domain/http/v2"
 import { Exit, Option } from "effect"
 import { Link } from "@tanstack/react-router"
 import { useEffect, useMemo, useState } from "react"
@@ -68,6 +68,7 @@ import { MultiSelectCombobox } from "@maple/ui/components/multi-select-combobox"
 import { cn } from "@maple/ui/lib/utils"
 import { useOrganization } from "@clerk/clerk-react"
 import { isClerkAuthEnabled } from "@/lib/services/common/auth-mode"
+import { currentReturnPath } from "@/components/integrations/integration-connect"
 
 interface DestinationDialogProps {
 	open: boolean
@@ -86,6 +87,19 @@ interface DestinationDialogProps {
  */
 const isValidPagerDutyKey = (key: string): boolean => /^[A-Za-z0-9]{32}$/.test(key.trim())
 
+/**
+ * Mirrors `TELEGRAM_BOT_TOKEN_PATTERN` on the server. Only gates the "Detect
+ * chats" button — the server re-checks, and it owns the message shown on save.
+ */
+const isValidTelegramToken = (token: string): boolean => /^\d{5,}:[A-Za-z0-9_-]{30,}$/.test(token.trim())
+
+const TELEGRAM_CHAT_TYPE_LABELS = {
+	private: "Direct message",
+	group: "Group",
+	supergroup: "Group",
+	channel: "Channel",
+} satisfies Record<V2TelegramChat["type"], string>
+
 function isFormReady(form: DestinationFormState, isEditing: boolean): boolean {
 	if (form.name.trim().length === 0) return false
 	switch (form.type) {
@@ -98,6 +112,13 @@ function isFormReady(form: DestinationFormState, isEditing: boolean): boolean {
 		// stored one.
 		case "discord":
 			return isEditing || form.webhookUrl.trim().length > 0
+		case "telegram":
+			// The chat id is not a secret and is never returned, so editing always
+			// requires it; the token may stay blank to keep the stored one.
+			return (
+				form.telegramChatId.trim().length > 0 &&
+				(isEditing || form.telegramBotToken.trim().length > 0)
+			)
 		case "pagerduty":
 			// Editing with a blank key keeps the stored one; otherwise require a
 			// well-formed routing key.
@@ -284,11 +305,11 @@ function HazelOAuthFields({
 	isEditing: boolean
 }) {
 	const statusResult = useAtomValue(
-		MapleApiAtomClient.query("integrations", "hazelStatus", {
+		retainedQuery("integrations", "hazelStatus", {
 			reactivityKeys: ["hazelIntegrationStatus"],
 		}),
 	)
-	const organizationsAtom = MapleApiAtomClient.query("integrations", "hazelOrganizations", {
+	const organizationsAtom = retainedQuery("integrations", "hazelOrganizations", {
 		reactivityKeys: ["hazelIntegrationStatus", "hazelOrganizations"],
 	})
 	const organizationsResult = useAtomValue(organizationsAtom)
@@ -296,7 +317,7 @@ function HazelOAuthFields({
 	const orgIdForChannels = form.hazelOrganizationId.trim()
 	const channelsAtom =
 		orgIdForChannels.length > 0
-			? MapleApiAtomClient.query("integrations", "hazelChannels", {
+			? retainedQuery("integrations", "hazelChannels", {
 					params: { organizationId: orgIdForChannels },
 					reactivityKeys: ["hazelIntegrationStatus", "hazelChannels", orgIdForChannels],
 				})
@@ -351,7 +372,7 @@ function HazelOAuthFields({
 		const popup = window.open("", "maple-hazel-connect", "popup,width=520,height=640")
 		setBusy(true)
 		const result = await startConnect({
-			payload: new HazelStartConnectRequest({ returnTo: window.location.href }),
+			payload: new HazelStartConnectRequest({ returnTo: currentReturnPath() }),
 			reactivityKeys: ["hazelIntegrationStatus"],
 		})
 		setBusy(false)
@@ -450,7 +471,6 @@ function HazelOAuthFields({
 							hazelOrganizationId: value ?? "",
 							hazelOrganizationName: org?.name ?? "",
 							hazelOrganizationLogoUrl: org?.logoUrl ?? null,
-							// Reset channel when org changes.
 							hazelChannelId: "",
 							hazelChannelName: "",
 						}))
@@ -560,7 +580,7 @@ function SlackBotFields({
 	isEditing: boolean
 }) {
 	const statusResult = useAtomValue(
-		MapleApiV2AtomClient.query("slackIntegration", "status", {
+		retainedQueryV2("slackIntegration", "status", {
 			reactivityKeys: ["slackIntegration"],
 		}),
 	)
@@ -577,7 +597,7 @@ function SlackBotFields({
 	const installed = status?.installed === true
 
 	const channelsAtom = installed
-		? MapleApiV2AtomClient.query("slackIntegration", "channels", {
+		? retainedQueryV2("slackIntegration", "channels", {
 				reactivityKeys: ["slackIntegration", "slackChannels"],
 			})
 		: disabledResultAtom<V2SlackChannelList>()
@@ -636,10 +656,10 @@ function SlackBotFields({
 	// `GET /v2/integrations/slack/channels` is admin-gated (`requireAdmin`), so a
 	// regular member gets a 403 that no amount of retrying will clear. The v2
 	// envelope ({ error: { type, code, message } }) survives into the Result's
-	// cause, and `v2ErrorInfo` unwraps it — branch on the closed `type` enum, never
+	// cause, and `publicError` unwraps it — branch on the closed `type` enum, never
 	// on the human-readable message.
 	const channelsPermissionDenied =
-		Result.isFailure(channelsResult) && v2ErrorInfo(channelsResult.cause)?.type === "permission_error"
+		Result.isFailure(channelsResult) && publicError(channelsResult.cause)?.type === "permission_error"
 	// Requires no prior success, matching the `statusFailed` rule below: if we
 	// already have channels in hand (a role change mid-edit), keep the picker
 	// rather than yanking the user's selection away.
@@ -902,6 +922,99 @@ function FieldHelper({ provider }: { provider: DestinationProvider }) {
 	)
 }
 
+/**
+ * Turns "read a negative integer out of a raw `getUpdates` payload" into
+ * picking a chat by name — the step where this setup otherwise fails.
+ *
+ * Only ever additive to the field: the manual input stays editable, because
+ * Telegram keeps updates for about 24 hours and a bot with a webhook cannot be
+ * inspected at all, so discovery legitimately comes back empty for setups that
+ * are perfectly valid.
+ */
+function TelegramChatPicker({
+	botToken,
+	onSelect,
+}: {
+	botToken: string
+	onSelect: (chatId: string) => void
+}) {
+	const [chats, setChats] = useState<ReadonlyArray<V2TelegramChat> | null>(null)
+	const [error, setError] = useState<string | null>(null)
+	const [busy, setBusy] = useState(false)
+	const detect = useAtomSet(MapleApiV2AtomClient.mutation("alertDestinations", "telegramChats"), {
+		mode: "promiseExit",
+	})
+
+	const tokenReady = isValidTelegramToken(botToken)
+
+	const runDetect = async () => {
+		setBusy(true)
+		setError(null)
+		setChats(null)
+		const result = await detect({ payload: { bot_token: botToken.trim() } })
+		setBusy(false)
+		if (Exit.isSuccess(result)) {
+			const found = result.value.chats
+			setChats(found)
+			// One chat is the common case — the bot was just added to a single
+			// group. Skip the pointless list of one and fill the field.
+			if (found.length === 1 && found[0] !== undefined) onSelect(found[0].id)
+			return
+		}
+		setError(displayError(result.cause).message)
+	}
+
+	return (
+		<div className="space-y-2">
+			<div className="flex items-center justify-between gap-2">
+				<Label htmlFor="destination-telegram-chat" className="text-xs">
+					Chat ID
+				</Label>
+				<Button
+					type="button"
+					variant="ghost"
+					size="sm"
+					className="h-6 px-2 text-[11px]"
+					disabled={!tokenReady || busy}
+					onClick={() => void runDetect()}
+					title={
+						tokenReady
+							? undefined
+							: "Enter the bot token first — detection reads the bot's chats."
+					}
+				>
+					{busy ? <LoaderIcon size={12} className="mr-1 animate-spin" /> : null}
+					{busy ? "Detecting…" : "Detect chats"}
+				</Button>
+			</div>
+			{error !== null ? <p className="text-[11px] text-destructive">{error}</p> : null}
+			{chats !== null && chats.length === 0 ? (
+				<p className="text-[11px] text-muted-foreground">
+					No recent chats. Add the bot to the group or channel (or send it a message), then detect
+					again. Telegram only keeps the last 24 hours.
+				</p>
+			) : null}
+			{chats !== null && chats.length > 0 ? (
+				<div className="space-y-1 rounded-md border border-border/60 p-1">
+					{chats.map((chat) => (
+						<button
+							key={chat.id}
+							type="button"
+							onClick={() => onSelect(chat.id)}
+							className="flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted"
+						>
+							<span className="truncate">{chat.title}</span>
+							<span className="shrink-0 text-[10px] text-muted-foreground">
+								{TELEGRAM_CHAT_TYPE_LABELS[chat.type]}
+							</span>
+						</button>
+					))}
+				</div>
+			) : null}
+		</div>
+	)
+}
+
 export function DestinationDialog({
 	open,
 	onOpenChange,
@@ -1049,6 +1162,66 @@ export function DestinationDialog({
 										then copy the URL.
 									</p>
 								</div>
+							)}
+
+							{form.type === "telegram" && (
+								<>
+									<div className="space-y-1.5">
+										<Label htmlFor="destination-telegram-token" className="text-xs">
+											Bot token
+										</Label>
+										<Input
+											id="destination-telegram-token"
+											type="password"
+											autoComplete="off"
+											value={form.telegramBotToken}
+											onChange={(event) =>
+												onFormChange((current) => ({
+													...current,
+													telegramBotToken: event.target.value,
+												}))
+											}
+											placeholder={
+												isEditing
+													? "Leave blank to keep current token"
+													: "123456789:ABC-DEF..."
+											}
+											className="font-mono text-xs"
+										/>
+										<p className="text-[11px] text-muted-foreground">
+											In Telegram: message @BotFather, send <code>/newbot</code>, then
+											copy the token it replies with.
+										</p>
+									</div>
+									<div className="space-y-1.5">
+										<TelegramChatPicker
+											botToken={form.telegramBotToken}
+											onSelect={(chatId) =>
+												onFormChange((current) => ({
+													...current,
+													telegramChatId: chatId,
+												}))
+											}
+										/>
+										<Input
+											id="destination-telegram-chat"
+											value={form.telegramChatId}
+											onChange={(event) =>
+												onFormChange((current) => ({
+													...current,
+													telegramChatId: event.target.value,
+												}))
+											}
+											placeholder="-1001234567890 or @mychannel"
+											className="font-mono text-xs"
+										/>
+										<p className="text-[11px] text-muted-foreground">
+											Add the bot to the chat, then hit <strong>Detect chats</strong> —
+											or enter the id by hand. Maple checks the bot can reach it when
+											you save.
+										</p>
+									</div>
+								</>
 							)}
 
 							{form.type === "webhook" && (
